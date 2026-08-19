@@ -4,6 +4,7 @@
   "app.subtitle": "Suite de réparation et migration de profils Windows - Julien Bombled",
   "app.version": "2026.819.0",
   "app.license": "Apache-2.0",
+  "about.title": "À propos",
   "nav.dashboard": "Inventaire & Santé",
   "nav.repair": "Réparation transactionnelle",
   "nav.migration": "Migration de profil",
@@ -15,6 +16,7 @@
   "common.none": "Aucune sélection",
   "common.confirm": "Confirmer",
   "common.cancel": "Annuler",
+  "common.close": "Fermer",
   "common.error_prefix": "Erreur :",
   "status.ready": "Prêt",
   "status.scanning": "Analyse des profils...",
@@ -31,6 +33,7 @@
   "status.export_success": "Journal exporté vers {path}",
   "status.audit_cleared": "Affichage du journal effacé ; historique durable conservé",
   "status.refresh_failed": "{success} ; échec du rafraîchissement de l'inventaire : {error}",
+  "status.close_blocked_repair": "Une réparation de profil est en cours. Attendez la fin de la vérification ou du rollback avant de fermer WinProfile.",
   "dashboard.scan_btn": "Analyser les profils",
   "dashboard.total_profiles": "Total profils",
   "dashboard.healthy_profiles": "Sains",
@@ -105,5 +108,6 @@
   "error.profile_not_selected": "Sélectionnez d'abord un profil.",
   "error.no_repair_action": "Sélectionnez au moins une action de réparation.",
   "error.migration_scope": "Sélectionnez au moins un périmètre de migration et une destination.",
+  "error.migration_source_loaded": "Le profil source est actuellement chargé. Déconnectez l'utilisateur avant de démarrer la migration.",
   "error.operation_busy": "Une autre opération est déjà en cours."
 }

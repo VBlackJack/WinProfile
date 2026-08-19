@@ -16,18 +16,13 @@
 
 #![windows_subsystem = "windows"]
 
-mod controller;
-mod state;
-
 use std::sync::Arc;
 
+use app_ui::{AppController, AppStrings, MainWindow};
 use audit_journal::{AuditLogger, SnapshotEngine};
-use controller::AppController;
 use core_profiles::{t, I18nManager};
 use platform_win32::is_process_elevated;
-use slint::ComponentHandle;
-
-slint::include_modules!();
+use slint::{CloseRequestResponse, ComponentHandle};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -43,6 +38,17 @@ fn main() -> anyhow::Result<()> {
     main_window.set_status_message(t("status.ready").into());
     main_window.set_is_elevated(is_process_elevated()?);
     controller.refresh_audit_logs(&main_window);
+
+    {
+        let controller = Arc::clone(&controller);
+        let weak = main_window.as_weak();
+        main_window.window().on_close_requested(move || {
+            weak.upgrade()
+                .map_or(CloseRequestResponse::HideWindow, |ui| {
+                    controller.handle_close_requested(&ui)
+                })
+        });
+    }
 
     {
         let controller = Arc::clone(&controller);
@@ -206,6 +212,8 @@ fn load_translations(ui: &MainWindow) {
     strings.set_audit_target(t("audit.column.target").into());
     strings.set_audit_result(t("audit.column.result").into());
     strings.set_audit_details(t("audit.column.details").into());
+    strings.set_about(t("about.title").into());
+    strings.set_close(t("common.close").into());
     strings.set_confirm(t("common.confirm").into());
     strings.set_cancel(t("common.cancel").into());
 }

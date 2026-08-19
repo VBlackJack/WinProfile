@@ -4,6 +4,7 @@
   "app.subtitle": "Windows User Profile Repair & Migration Suite - Julien Bombled",
   "app.version": "2026.819.0",
   "app.license": "Apache-2.0",
+  "about.title": "About",
   "nav.dashboard": "Inventory & Health",
   "nav.repair": "Transactional Repair",
   "nav.migration": "Profile Migration",
@@ -15,6 +16,7 @@
   "common.none": "None selected",
   "common.confirm": "Confirm",
   "common.cancel": "Cancel",
+  "common.close": "Close",
   "common.error_prefix": "Error:",
   "status.ready": "Ready",
   "status.scanning": "Scanning profiles...",
@@ -31,6 +33,7 @@
   "status.export_success": "Audit exported to {path}",
   "status.audit_cleared": "Audit display cleared; durable journal preserved",
   "status.refresh_failed": "{success}; inventory refresh failed: {error}",
+  "status.close_blocked_repair": "A profile repair is still running. Wait for verification or rollback to finish before closing WinProfile.",
   "dashboard.scan_btn": "Scan Profiles",
   "dashboard.total_profiles": "Total Profiles",
   "dashboard.healthy_profiles": "Healthy",
@@ -105,5 +108,6 @@
   "error.profile_not_selected": "Select a profile first.",
   "error.no_repair_action": "Select at least one repair action.",
   "error.migration_scope": "Select at least one migration scope and a destination.",
+  "error.migration_source_loaded": "The source profile is currently loaded. Sign the user out before starting the migration.",
   "error.operation_busy": "Another operation is already running."
 }

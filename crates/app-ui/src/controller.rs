@@ -15,7 +15,7 @@
  */
 
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use audit_journal::{AuditEntry, AuditLogger, AuditStatus, SnapshotEngine};
@@ -27,18 +27,113 @@ use platform_win32::{
     duplicate_trustedinstaller_token, get_active_console_session, is_process_elevated,
     launch_process_with_token,
 };
-use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
+use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, VecModel, Weak};
 
 use crate::state::{audit_entry_to_slint, user_profile_to_slint};
 use crate::{AuditLogEntry, MainWindow, ProfileEntry};
 
 const CONFIRM_REPAIR: i32 = 0;
 const CONFIRM_TRUSTED_INSTALLER: i32 = 1;
+const MIGRATION_SOURCE_LOADED_ERROR: &str = "error.migration_source_loaded";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum OperationKind {
+    Idle = 0,
+    Scan = 1,
+    Repair = 2,
+    Migration = 3,
+    TrustedInstaller = 4,
+    Export = 5,
+    Unknown = u8::MAX,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosePolicy {
+    Allow,
+    Block,
+    CancelMigration,
+}
+
+impl OperationKind {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            value if value == Self::Idle as u8 => Self::Idle,
+            value if value == Self::Scan as u8 => Self::Scan,
+            value if value == Self::Repair as u8 => Self::Repair,
+            value if value == Self::Migration as u8 => Self::Migration,
+            value if value == Self::TrustedInstaller as u8 => Self::TrustedInstaller,
+            value if value == Self::Export as u8 => Self::Export,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn close_policy(self) -> ClosePolicy {
+        match self {
+            Self::Repair | Self::Unknown => ClosePolicy::Block,
+            Self::Migration => ClosePolicy::CancelMigration,
+            Self::Idle | Self::Scan | Self::TrustedInstaller | Self::Export => ClosePolicy::Allow,
+        }
+    }
+}
+
+struct OperationState {
+    active: AtomicU8,
+    close_after_finish: AtomicBool,
+}
+
+impl OperationState {
+    fn new() -> Self {
+        Self {
+            active: AtomicU8::new(OperationKind::Idle as u8),
+            close_after_finish: AtomicBool::new(false),
+        }
+    }
+
+    fn try_begin(&self, operation: OperationKind) -> bool {
+        self.active
+            .compare_exchange(
+                OperationKind::Idle as u8,
+                operation as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn active_operation(&self) -> OperationKind {
+        OperationKind::from_raw(self.active.load(Ordering::Acquire))
+    }
+
+    fn request_close_after_finish(&self) {
+        self.close_after_finish.store(true, Ordering::Release);
+    }
+
+    fn cancel_if_close_deferred(&self, cancellation: &AtomicBool) {
+        if self.close_after_finish.load(Ordering::Acquire) {
+            cancellation.store(true, Ordering::Release);
+        }
+    }
+
+    fn finish(&self) -> bool {
+        self.active
+            .store(OperationKind::Idle as u8, Ordering::Release);
+        self.close_after_finish.swap(false, Ordering::AcqRel)
+    }
+}
+
+fn validate_migration_source(loaded: bool) -> Result<(), &'static str> {
+    if loaded {
+        Err(MIGRATION_SOURCE_LOADED_ERROR)
+    } else {
+        Ok(())
+    }
+}
 
 pub struct AppController {
     snapshot_engine: Arc<SnapshotEngine>,
     audit_logger: Arc<AuditLogger>,
-    operation_in_progress: AtomicBool,
+    operation_state: OperationState,
     migration_cancellation: Mutex<Option<Arc<AtomicBool>>>,
 }
 
@@ -47,14 +142,14 @@ impl AppController {
         Self {
             snapshot_engine,
             audit_logger,
-            operation_in_progress: AtomicBool::new(false),
+            operation_state: OperationState::new(),
             migration_cancellation: Mutex::new(None),
         }
     }
 
     /// Starts a complete profile scan on a worker thread.
     pub fn scan_profiles(self: &Arc<Self>, ui: &MainWindow) {
-        if !self.begin_operation(ui) {
+        if !self.begin_operation(ui, OperationKind::Scan) {
             return;
         }
         ui.set_status_message(t("status.scanning").into());
@@ -107,9 +202,9 @@ impl AppController {
             ui.set_selected_username(profile.username.clone());
             ui.set_selected_anomalies(profile.anomalies.clone());
             ui.set_selected_loaded(profile.loaded);
-            ui.set_repair_fix_bak(profile.is_bak);
-            ui.set_repair_reset_state(profile.health_type != 0);
-            ui.set_repair_unlock_hive(false);
+            ui.set_repair_fix_bak(profile.suggest_fix_bak);
+            ui.set_repair_reset_state(profile.suggest_reset_state);
+            ui.set_repair_unlock_hive(profile.suggest_unlock_hive);
         }
     }
 
@@ -148,7 +243,7 @@ impl AppController {
 
     /// Executes the selected repair plan on a worker thread.
     pub fn execute_repair(self: &Arc<Self>, ui: &MainWindow, dry_run: bool) {
-        if !require_elevation(ui) || !self.begin_operation(ui) {
+        if !require_elevation(ui) || !self.begin_operation(ui, OperationKind::Repair) {
             return;
         }
         let plan = RepairPlan {
@@ -209,7 +304,11 @@ impl AppController {
 
     /// Starts a verified, cancellable migration on a worker thread.
     pub fn start_migration(self: &Arc<Self>, ui: &MainWindow) {
-        if !require_elevation(ui) || !self.begin_operation(ui) {
+        if let Err(message_key) = validate_migration_source(ui.get_selected_loaded()) {
+            ui.set_status_message(t(message_key).into());
+            return;
+        }
+        if !require_elevation(ui) || !self.begin_operation(ui, OperationKind::Migration) {
             return;
         }
         let plan = MigrationPlan {
@@ -231,7 +330,12 @@ impl AppController {
 
         let cancellation = Arc::new(AtomicBool::new(false));
         match self.migration_cancellation.lock() {
-            Ok(mut slot) => *slot = Some(Arc::clone(&cancellation)),
+            Ok(mut slot) => {
+                // The close handler takes the same mutex before recording a deferred close.
+                // Checking the flag before publishing the token therefore closes both race orders.
+                self.operation_state.cancel_if_close_deferred(&cancellation);
+                *slot = Some(Arc::clone(&cancellation));
+            }
             Err(_) => {
                 self.finish_operation();
                 ui.set_operation_busy(false);
@@ -275,7 +379,7 @@ impl AppController {
                 }
             }
             let audit_entries = controller.audit_logger.get_entries();
-            controller.finish_operation();
+            let close_after_operation = controller.finish_operation();
             if let Err(error) = weak.upgrade_in_event_loop(move |ui| {
                 ui.set_operation_busy(false);
                 ui.set_migration_running(false);
@@ -305,6 +409,11 @@ impl AppController {
                     }
                 }
                 apply_audit_result(&ui, audit_entries);
+                if close_after_operation {
+                    if let Err(error) = ui.hide() {
+                        eprintln!("failed to close the window after migration rollback: {error}");
+                    }
+                }
             }) {
                 eprintln!("failed to queue migration result: {error}");
             }
@@ -324,9 +433,34 @@ impl AppController {
         }
     }
 
+    /// Coordinates a window close request with any active destructive transaction.
+    pub fn handle_close_requested(&self, ui: &MainWindow) -> CloseRequestResponse {
+        let operation = self.operation_state.active_operation();
+        match operation.close_policy() {
+            ClosePolicy::Allow => CloseRequestResponse::HideWindow,
+            ClosePolicy::Block => {
+                ui.set_status_message(t("status.close_blocked_repair").into());
+                CloseRequestResponse::KeepWindowShown
+            }
+            ClosePolicy::CancelMigration => {
+                match self.migration_cancellation.lock() {
+                    Ok(slot) => {
+                        self.operation_state.request_close_after_finish();
+                        if let Some(cancellation) = slot.as_ref() {
+                            cancellation.store(true, Ordering::Release);
+                        }
+                        ui.set_status_message(t("status.cancelling").into());
+                    }
+                    Err(_) => set_error(ui, "migration cancellation state is unavailable"),
+                }
+                CloseRequestResponse::KeepWindowShown
+            }
+        }
+    }
+
     /// Launches an audited TrustedInstaller console on a worker thread.
     pub fn launch_ti_console(self: &Arc<Self>, ui: &MainWindow) {
-        if !require_elevation(ui) || !self.begin_operation(ui) {
+        if !require_elevation(ui) || !self.begin_operation(ui, OperationKind::TrustedInstaller) {
             return;
         }
         ui.set_status_message(t("status.launching_ti").into());
@@ -391,7 +525,7 @@ impl AppController {
 
     /// Exports the durable audit file without blocking the UI thread.
     pub fn export_audit(self: &Arc<Self>, ui: &MainWindow) {
-        if !self.begin_operation(ui) {
+        if !self.begin_operation(ui, OperationKind::Export) {
             return;
         }
         let controller = Arc::clone(self);
@@ -434,12 +568,8 @@ impl AppController {
         apply_audit_result(ui, self.audit_logger.get_entries());
     }
 
-    fn begin_operation(&self, ui: &MainWindow) -> bool {
-        if self
-            .operation_in_progress
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+    fn begin_operation(&self, ui: &MainWindow, operation: OperationKind) -> bool {
+        if !self.operation_state.try_begin(operation) {
             ui.set_status_message(t("error.operation_busy").into());
             return false;
         }
@@ -447,8 +577,8 @@ impl AppController {
         true
     }
 
-    fn finish_operation(&self) {
-        self.operation_in_progress.store(false, Ordering::Release);
+    fn finish_operation(&self) -> bool {
+        self.operation_state.finish()
     }
 }
 
@@ -534,4 +664,87 @@ fn apply_audit_result(ui: &MainWindow, result: Result<Vec<AuditEntry>, audit_jou
 
 fn set_error(ui: &MainWindow, error: &str) {
     ui.set_status_message(format!("{} {error}", t("common.error_prefix")).into());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_policy_blocks_repair_and_unknown_state() {
+        assert_eq!(OperationKind::Repair.close_policy(), ClosePolicy::Block);
+        assert_eq!(OperationKind::Unknown.close_policy(), ClosePolicy::Block);
+    }
+
+    #[test]
+    fn close_policy_cancels_migration_before_closing() {
+        assert_eq!(
+            OperationKind::Migration.close_policy(),
+            ClosePolicy::CancelMigration
+        );
+    }
+
+    #[test]
+    fn close_policy_allows_non_transactional_operations() {
+        for operation in [
+            OperationKind::Idle,
+            OperationKind::Scan,
+            OperationKind::TrustedInstaller,
+            OperationKind::Export,
+        ] {
+            assert_eq!(operation.close_policy(), ClosePolicy::Allow);
+        }
+    }
+
+    #[test]
+    fn operation_state_blocks_repair_until_finish() {
+        let state = OperationState::new();
+
+        assert!(state.try_begin(OperationKind::Repair));
+        assert!(!state.try_begin(OperationKind::Scan));
+        assert_eq!(state.active_operation().close_policy(), ClosePolicy::Block);
+        assert!(!state.finish());
+        assert_eq!(state.active_operation().close_policy(), ClosePolicy::Allow);
+        assert!(state.try_begin(OperationKind::Scan));
+    }
+
+    #[test]
+    fn operation_state_defers_migration_close_until_finish() {
+        let state = OperationState::new();
+
+        assert!(state.try_begin(OperationKind::Migration));
+        assert_eq!(
+            state.active_operation().close_policy(),
+            ClosePolicy::CancelMigration
+        );
+        state.request_close_after_finish();
+        assert!(state.finish());
+        assert_eq!(state.active_operation().close_policy(), ClosePolicy::Allow);
+        assert!(
+            !state.finish(),
+            "the deferred close request must be consumed"
+        );
+    }
+
+    #[test]
+    fn deferred_close_cancels_a_migration_token_installed_after_the_request() {
+        let state = OperationState::new();
+        let cancellation = AtomicBool::new(false);
+
+        assert!(state.try_begin(OperationKind::Migration));
+        state.request_close_after_finish();
+        state.cancel_if_close_deferred(&cancellation);
+
+        assert!(cancellation.load(Ordering::Acquire));
+        assert!(state.finish());
+    }
+
+    #[test]
+    fn migration_source_must_be_offline() {
+        assert_eq!(validate_migration_source(false), Ok(()));
+        assert_eq!(
+            validate_migration_source(true),
+            Err(MIGRATION_SOURCE_LOADED_ERROR)
+        );
+    }
 }

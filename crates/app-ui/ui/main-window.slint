@@ -15,7 +15,7 @@
  */
 
 import { DraculaTheme } from "theme.slint";
-import { Button, CheckBox, LineEdit, ListView, ProgressIndicator } from "std-widgets.slint";
+import { AboutSlint, Button, CheckBox, LineEdit, ListView, ProgressIndicator } from "std-widgets.slint";
 
 export struct ProfileEntry {
     sid: string,
@@ -27,6 +27,9 @@ export struct ProfileEntry {
     health_type: int,
     loaded: bool,
     is_bak: bool,
+    suggest_fix_bak: bool,
+    suggest_reset_state: bool,
+    suggest_unlock_hive: bool,
     state_raw: string,
     anomalies: string,
 }
@@ -101,6 +104,8 @@ export global AppStrings {
     in-out property <string> audit-target;
     in-out property <string> audit-result;
     in-out property <string> audit-details;
+    in-out property <string> about;
+    in-out property <string> close;
     in-out property <string> confirm;
     in-out property <string> cancel;
 }
@@ -160,6 +165,8 @@ export component MainWindow inherits Window {
     in-out property <int> confirmation-kind: -1;
     in-out property <string> confirmation-title;
     in-out property <string> confirmation-message;
+    in-out property <bool> about-visible: false;
+    property <bool> modal-visible: root.confirmation-visible || root.about-visible;
 
     callback scan-profiles();
     callback select-profile(int);
@@ -193,6 +200,11 @@ export component MainWindow inherits Window {
                     HorizontalLayout {
                         alignment: end;
                         spacing: DraculaTheme.spacing-md;
+                        Button {
+                            text: AppStrings.about;
+                            enabled: !root.operation-busy && !root.modal-visible;
+                            clicked => { root.about-visible = true; }
+                        }
                         Rectangle {
                             height: 30px;
                             background: root.is-elevated ? #214a38 : #512c35;
@@ -213,7 +225,7 @@ export component MainWindow inherits Window {
                         }
                         Button {
                             text: AppStrings.scan;
-                            enabled: !root.operation-busy;
+                            enabled: !root.operation-busy && !root.modal-visible;
                             primary: true;
                             clicked => { root.scan-profiles(); }
                         }
@@ -229,11 +241,11 @@ export component MainWindow inherits Window {
                     padding-right: DraculaTheme.spacing-lg;
                     spacing: DraculaTheme.spacing-sm;
                     alignment: start;
-                    Button { text: AppStrings.nav-dashboard; checked: root.active-tab == 0; clicked => { root.active-tab = 0; } }
-                    Button { text: AppStrings.nav-repair; checked: root.active-tab == 1; clicked => { root.active-tab = 1; } }
-                    Button { text: AppStrings.nav-migration; checked: root.active-tab == 2; clicked => { root.active-tab = 2; } }
-                    Button { text: AppStrings.nav-maintenance; checked: root.active-tab == 3; clicked => { root.active-tab = 3; } }
-                    Button { text: AppStrings.nav-logs; checked: root.active-tab == 4; clicked => { root.active-tab = 4; } }
+                    Button { text: AppStrings.nav-dashboard; checked: root.active-tab == 0; enabled: !root.modal-visible; clicked => { root.active-tab = 0; } }
+                    Button { text: AppStrings.nav-repair; checked: root.active-tab == 1; enabled: !root.modal-visible; clicked => { root.active-tab = 1; } }
+                    Button { text: AppStrings.nav-migration; checked: root.active-tab == 2; enabled: !root.modal-visible; clicked => { root.active-tab = 2; } }
+                    Button { text: AppStrings.nav-maintenance; checked: root.active-tab == 3; enabled: !root.modal-visible; clicked => { root.active-tab = 3; } }
+                    Button { text: AppStrings.nav-logs; checked: root.active-tab == 4; enabled: !root.modal-visible; clicked => { root.active-tab = 4; } }
                 }
             }
 
@@ -294,7 +306,7 @@ export component MainWindow inherits Window {
                                         Text { text: profile.profile_path; color: DraculaTheme.cyan; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
                                         Text { text: profile.status_text; color: profile.health_type == 0 ? DraculaTheme.green : (profile.health_type == 1 ? DraculaTheme.orange : DraculaTheme.red); font-weight: 600; width: 190px; vertical-alignment: center; overflow: elide; }
                                         Text { text: profile.loaded ? AppStrings.yes : AppStrings.no; color: profile.loaded ? DraculaTheme.yellow : DraculaTheme.text-secondary; width: 58px; vertical-alignment: center; }
-                                        Button { text: AppStrings.select; width: 90px; enabled: !root.operation-busy; clicked => { root.select-profile(idx); } }
+                                        Button { text: AppStrings.select; width: 90px; enabled: !root.operation-busy && !root.modal-visible; clicked => { root.select-profile(idx); } }
                                     }
                                 }
                             }
@@ -328,20 +340,20 @@ export component MainWindow inherits Window {
                                 }
                             }
                             Text { text: AppStrings.repair-pipeline; color: DraculaTheme.text-secondary; font-size: 12px; wrap: word-wrap; }
-                            CheckBox { text: AppStrings.fix-bak; checked <=> root.repair-fix-bak; enabled: !root.operation-busy; }
-                            CheckBox { text: AppStrings.reset-state; checked <=> root.repair-reset-state; enabled: !root.operation-busy; }
-                            CheckBox { text: AppStrings.unlock-hive; checked <=> root.repair-unlock-hive; enabled: !root.operation-busy; }
+                            CheckBox { text: AppStrings.fix-bak; checked <=> root.repair-fix-bak; enabled: !root.operation-busy && !root.modal-visible; }
+                            CheckBox { text: AppStrings.reset-state; checked <=> root.repair-reset-state; enabled: !root.operation-busy && !root.modal-visible; }
+                            CheckBox { text: AppStrings.unlock-hive; checked <=> root.repair-unlock-hive; enabled: !root.operation-busy && !root.modal-visible; }
                             HorizontalLayout {
                                 spacing: DraculaTheme.spacing-md;
                                 Button {
                                     text: AppStrings.dry-run;
-                                    enabled: root.is-elevated && !root.operation-busy && root.selected-sid != "" && !root.selected-loaded;
+                                    enabled: root.is-elevated && !root.operation-busy && !root.modal-visible && root.selected-sid != "" && !root.selected-loaded && (root.repair-fix-bak || root.repair-reset-state || root.repair-unlock-hive);
                                     clicked => { root.execute-dry-run(); }
                                 }
                                 Button {
                                     text: AppStrings.execute-repair;
                                     primary: true;
-                                    enabled: root.is-elevated && !root.operation-busy && root.selected-sid != "" && !root.selected-loaded;
+                                    enabled: root.is-elevated && !root.operation-busy && !root.modal-visible && root.selected-sid != "" && !root.selected-loaded && (root.repair-fix-bak || root.repair-reset-state || root.repair-unlock-hive);
                                     clicked => { root.request-repair(); }
                                 }
                             }
@@ -377,12 +389,12 @@ export component MainWindow inherits Window {
                                     text <=> root.migration-target-path;
                                     placeholder-text: AppStrings.migration-placeholder;
                                     accessible-label: AppStrings.migration-target;
-                                    enabled: !root.operation-busy;
+                                    enabled: !root.operation-busy && !root.modal-visible;
                                     horizontal-stretch: 1;
                                 }
                             }
-                            CheckBox { text: AppStrings.include-roaming; checked <=> root.migration-include-roaming; enabled: !root.operation-busy; }
-                            CheckBox { text: AppStrings.include-docs; checked <=> root.migration-include-docs; enabled: !root.operation-busy; }
+                            CheckBox { text: AppStrings.include-roaming; checked <=> root.migration-include-roaming; enabled: !root.operation-busy && !root.modal-visible; }
+                            CheckBox { text: AppStrings.include-docs; checked <=> root.migration-include-docs; enabled: !root.operation-busy && !root.modal-visible; }
                             Text { text: root.migration-status; color: DraculaTheme.text-secondary; font-weight: 600; }
                             ProgressIndicator { progress: root.migration-progress; height: 14px; }
                             HorizontalLayout {
@@ -390,12 +402,12 @@ export component MainWindow inherits Window {
                                 Button {
                                     text: AppStrings.start-migration;
                                     primary: true;
-                                    enabled: root.is-elevated && !root.operation-busy && root.selected-path != "" && root.migration-target-path != "" && (root.migration-include-roaming || root.migration-include-docs);
+                                    enabled: root.is-elevated && !root.operation-busy && !root.modal-visible && root.selected-path != "" && !root.selected-loaded && root.migration-target-path != "" && (root.migration-include-roaming || root.migration-include-docs);
                                     clicked => { root.start-migration(); }
                                 }
                                 Button {
                                     text: AppStrings.cancel-migration;
-                                    enabled: root.migration-running;
+                                    enabled: root.migration-running && !root.modal-visible;
                                     clicked => { root.cancel-migration(); }
                                 }
                             }
@@ -419,7 +431,7 @@ export component MainWindow inherits Window {
                             Button {
                                 text: AppStrings.launch-ti;
                                 primary: true;
-                                enabled: root.is-elevated && !root.operation-busy;
+                                enabled: root.is-elevated && !root.operation-busy && !root.modal-visible;
                                 clicked => { root.request-ti-console(); }
                             }
                         }
@@ -434,8 +446,8 @@ export component MainWindow inherits Window {
                         Text { text: AppStrings.audit-title; color: DraculaTheme.yellow; font-size: 17px; font-weight: 700; vertical-alignment: center; }
                         HorizontalLayout {
                             spacing: DraculaTheme.spacing-sm;
-                            Button { text: AppStrings.clear-audit; enabled: !root.operation-busy; clicked => { root.clear-audit-logs(); } }
-                            Button { text: AppStrings.export-audit; enabled: !root.operation-busy; clicked => { root.export-audit-json(); } }
+                            Button { text: AppStrings.clear-audit; enabled: !root.operation-busy && !root.modal-visible; clicked => { root.clear-audit-logs(); } }
+                            Button { text: AppStrings.export-audit; enabled: !root.operation-busy && !root.modal-visible; clicked => { root.export-audit-json(); } }
                         }
                     }
                     Rectangle {
@@ -497,31 +509,85 @@ export component MainWindow inherits Window {
 
         if root.confirmation-visible: Rectangle {
             background: #aa000000;
-            VerticalLayout {
-                alignment: center;
-                Rectangle {
-                    width: 580px;
-                    height: 260px;
-                    background: DraculaTheme.card-bg;
-                    border-radius: DraculaTheme.border-radius;
-                    border-width: 2px;
-                    border-color: DraculaTheme.orange;
-                    VerticalLayout {
-                        padding: DraculaTheme.spacing-lg;
-                        spacing: DraculaTheme.spacing-md;
-                        Text { text: root.confirmation-title; color: DraculaTheme.orange; font-size: 18px; font-weight: 700; }
-                        Text { text: root.confirmation-message; color: DraculaTheme.foreground; wrap: word-wrap; vertical-stretch: 1; }
-                        HorizontalLayout {
-                            alignment: end;
+            FocusScope {
+                forward-focus: confirmation-cancel;
+                init => { self.focus(); }
+                key-pressed(event) => {
+                    if event.text == Key.Escape {
+                        root.confirmation-visible = false;
+                        root.confirmation-kind = -1;
+                        return accept;
+                    }
+                    return reject;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 580px;
+                        height: 260px;
+                        background: DraculaTheme.card-bg;
+                        border-radius: DraculaTheme.border-radius;
+                        border-width: 2px;
+                        border-color: DraculaTheme.orange;
+                        accessible-role: groupbox;
+                        accessible-label: root.confirmation-title;
+                        VerticalLayout {
+                            padding: DraculaTheme.spacing-lg;
                             spacing: DraculaTheme.spacing-md;
-                            Button { text: AppStrings.cancel; clicked => { root.confirmation-visible = false; root.confirmation-kind = -1; } }
-                            Button {
-                                text: AppStrings.confirm;
-                                primary: true;
-                                clicked => {
-                                    root.confirmation-visible = false;
-                                    root.confirm-action(root.confirmation-kind);
-                                    root.confirmation-kind = -1;
+                            Text { text: root.confirmation-title; color: DraculaTheme.orange; font-size: 18px; font-weight: 700; }
+                            Text { text: root.confirmation-message; color: DraculaTheme.foreground; wrap: word-wrap; vertical-stretch: 1; }
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: DraculaTheme.spacing-md;
+                                confirmation-cancel := Button { text: AppStrings.cancel; clicked => { root.confirmation-visible = false; root.confirmation-kind = -1; } }
+                                Button {
+                                    text: AppStrings.confirm;
+                                    primary: true;
+                                    clicked => {
+                                        root.confirmation-visible = false;
+                                        root.confirm-action(root.confirmation-kind);
+                                        root.confirmation-kind = -1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.about-visible: Rectangle {
+            background: #aa000000;
+            FocusScope {
+                forward-focus: about-close;
+                init => { self.focus(); }
+                key-pressed(event) => {
+                    if event.text == Key.Escape {
+                        root.about-visible = false;
+                        return accept;
+                    }
+                    return reject;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 420px;
+                        height: 250px;
+                        background: DraculaTheme.card-bg;
+                        border-radius: DraculaTheme.border-radius;
+                        border-width: 2px;
+                        border-color: DraculaTheme.purple;
+                        accessible-role: groupbox;
+                        accessible-label: AppStrings.about;
+                        VerticalLayout {
+                            padding: DraculaTheme.spacing-lg;
+                            spacing: DraculaTheme.spacing-md;
+                            AboutSlint { horizontal-stretch: 1; vertical-stretch: 1; }
+                            HorizontalLayout {
+                                alignment: end;
+                                about-close := Button {
+                                    text: AppStrings.close;
+                                    clicked => { root.about-visible = false; }
                                 }
                             }
                         }

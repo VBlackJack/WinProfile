@@ -15,10 +15,34 @@
  */
 
 use audit_journal::{AuditEntry, AuditStatus};
-use core_profiles::models::{ProfileHealth, UserProfile};
+use core_profiles::models::{ProfileAnomaly, ProfileHealth, UserProfile};
 
 // Slint generated types
 use crate::{AuditLogEntry, ProfileEntry};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RepairSuggestions {
+    fix_bak: bool,
+    reset_state: bool,
+    unlock_hive: bool,
+}
+
+fn repair_suggestions(profile: &UserProfile) -> RepairSuggestions {
+    RepairSuggestions {
+        fix_bak: profile
+            .anomalies
+            .iter()
+            .any(|anomaly| matches!(anomaly, ProfileAnomaly::BakSuffix)),
+        reset_state: profile
+            .anomalies
+            .iter()
+            .any(|anomaly| matches!(anomaly, ProfileAnomaly::DirtyStateMask(_))),
+        unlock_hive: profile
+            .anomalies
+            .iter()
+            .any(|anomaly| matches!(anomaly, ProfileAnomaly::LockedNtUserDat(_))),
+    }
+}
 
 pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
     let health_type = match profile.health {
@@ -44,6 +68,7 @@ pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
         .map(|a| a.localized_description())
         .collect::<Vec<_>>()
         .join("; ");
+    let suggestions = repair_suggestions(profile);
 
     ProfileEntry {
         sid: profile.sid.clone().into(),
@@ -55,6 +80,9 @@ pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
         health_type,
         loaded: profile.loaded,
         is_bak: profile.is_bak,
+        suggest_fix_bak: suggestions.fix_bak,
+        suggest_reset_state: suggestions.reset_state,
+        suggest_unlock_hive: suggestions.unlock_hive,
         state_raw: format!("0x{:04X}", profile.state_mask).into(),
         anomalies: anomalies.into(),
     }
@@ -79,5 +107,67 @@ pub fn audit_entry_to_slint(entry: &AuditEntry) -> AuditLogEntry {
         status: status_str.into(),
         status_type,
         details: entry.details.clone().into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_with_anomalies(anomalies: Vec<ProfileAnomaly>) -> UserProfile {
+        UserProfile {
+            sid: "S-1-5-21-1000".to_string(),
+            canonical_sid: "S-1-5-21-1000".to_string(),
+            username: "TestUser".to_string(),
+            domain: "TEST".to_string(),
+            profile_path: "C:\\Users\\TestUser".to_string(),
+            loaded: false,
+            is_bak: false,
+            state_mask: 0,
+            ref_count: 0,
+            guid: None,
+            ntuser_exists: true,
+            usrclass_exists: true,
+            disk_size_bytes: 0,
+            anomalies,
+            health: ProfileHealth::Healthy,
+        }
+    }
+
+    #[test]
+    fn exact_anomalies_enable_only_matching_repair_suggestions() {
+        let profile = profile_with_anomalies(vec![
+            ProfileAnomaly::BakSuffix,
+            ProfileAnomaly::DirtyStateMask(0x100),
+            ProfileAnomaly::LockedNtUserDat(vec!["process.exe".to_string()]),
+        ]);
+
+        assert_eq!(
+            repair_suggestions(&profile),
+            RepairSuggestions {
+                fix_bak: true,
+                reset_state: true,
+                unlock_hive: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unrelated_warnings_do_not_enable_destructive_repair_suggestions() {
+        let mut profile = profile_with_anomalies(vec![
+            ProfileAnomaly::MissingDirectory("C:\\Users\\Missing".to_string()),
+            ProfileAnomaly::SidResolutionFailure("lookup failed".to_string()),
+            ProfileAnomaly::FilesystemScanFailure("access denied".to_string()),
+        ]);
+        profile.health = ProfileHealth::Warning;
+
+        assert_eq!(
+            repair_suggestions(&profile),
+            RepairSuggestions {
+                fix_bak: false,
+                reset_state: false,
+                unlock_hive: false,
+            }
+        );
     }
 }
