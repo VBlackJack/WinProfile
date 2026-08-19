@@ -1,29 +1,32 @@
 # Changelog
 
-## 2026.819.0 - Unreleased remediation
+All notable changes to this project are documented in this file.
 
-### Security
+## [2026.819.0] - 2026-08-19
 
-- Embedded a mandatory administrator manifest for GNU and MSVC builds.
-- Replaced unsafe raw predefined registry handles with a typed root selector.
-- Restored every enabled token privilege and rejected unavailable privileges.
-- Removed the invalid generic ACL reset and the non-service broker implementation.
-- Made TrustedInstaller service, token, session, environment, and process failures fail closed.
+### Added
 
-### Reliability
+- Added Windows profile discovery with explicit anomaly reporting.
+- Added transactional profile repair with registry snapshots, postcondition verification, and rollback.
+- Added cancellable, non-overwriting profile migration with per-file SHA-256 verification.
+- Added a bounded, durable JSON-lines audit journal with verified exports and rotation.
+- Added English and French user interfaces with catalog parity validation.
+- Added pinned Rust tooling, regression tests, CI quality gates, and MSVC packaging.
 
-- Added mandatory registry snapshots, non-destructive key renames, verification, and rollback.
-- Added transactional, cancellable, non-overwriting migration with SHA-256 verification.
-- Made scanner degradation visible instead of silently skipping unreadable state.
-- Serialized and bounded the durable audit journal and implemented verified export.
-- Moved long-running operations off the Slint event loop.
+### Changed
 
-### User experience
+- Moved scanning, repair, migration, export, and token acquisition off the Slint event loop.
+- Replaced raw predefined registry handles with typed roots and scoped privilege guards.
+- Made destructive actions require elevation, explicit selection, and confirmation.
+- Marked CI package artifacts as unsigned build evidence until the release signing workflow succeeds.
 
-- Added keyboard-operable navigation, virtualized lists, explicit confirmations, safe defaults, and migration cancellation.
-- Externalized user-facing text into parity-validated English and French catalogs.
-- Increased secondary-text contrast and corrected status localization.
+### Fixed
 
-### Engineering
+- Prevented partial registry repair and migration results from being reported as successful.
+- Preserved canonical profile keys during `.bak` repair instead of deleting them.
+- Rejected unavailable token privileges, invalid console sessions, reparse points, overlapping migration roots, and existing destination files.
+- Made scanner, audit, Restart Manager, localization, and TrustedInstaller failures visible and fail closed.
+- Removed the unsafe generic ACL reset and the incomplete named-pipe broker.
+- Added keyboard-operable navigation, virtualized lists, migration cancellation, and accessible labels.
 
-- Added regression tests, a tracked lockfile, pinned Rust toolchain, CI gates, and architecture documentation.
+[2026.819.0]: https://github.com/VBlackJack/WinProfile/releases/tag/v2026.819.0
