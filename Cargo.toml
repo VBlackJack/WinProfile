@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/platform-win32",
+    "crates/audit-journal",
+    "crates/broker-protocol",
+    "crates/core-profiles",
+    "crates/broker-service",
+    "crates/app-ui",
+    "tests",
+]
+
+[workspace.package]
+version = "2026.819.0"
+authors = ["Julien Bombled"]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/jbombled/winprofile"
+homepage = "https://github.com/jbombled/winprofile"
+description = "Windows User Profile Repair & Migration Suite (Rust / Slint UI)"
+
+[workspace.dependencies]
+# Internal workspace crates
+platform-win32 = { path = "crates/platform-win32" }
+audit-journal = { path = "crates/audit-journal" }
+broker-protocol = { path = "crates/broker-protocol" }
+core-profiles = { path = "crates/core-profiles" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging & Diagnostics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "chrono"] }
+
+# Error Handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Time & Utilities
+chrono = { version = "0.4", features = ["serde"] }
+
+# Slint UI
+slint = "1.9"
+slint-build = "1.9"
+
+# Windows API Low-level bindings
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Services",
+    "Win32_System_RestartManager",
+    "Win32_System_Memory",
+    "Win32_System_Environment",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_RemoteDesktop",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+codegen-units = 1
+strip = false

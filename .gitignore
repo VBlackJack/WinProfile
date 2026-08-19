@@ -1,0 +1,15 @@
+# Build outputs
+/target
+Cargo.lock
+
+# IDE and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local build tools and artifacts
+tools/
+local/
+.claude/
+*.log
