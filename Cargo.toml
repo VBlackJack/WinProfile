@@ -17,8 +17,8 @@ version = "2026.819.0"
 authors = ["Julien Bombled"]
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/jbombled/winprofile"
-homepage = "https://github.com/jbombled/winprofile"
+repository = "https://github.com/VBlackJack/WinProfile"
+homepage = "https://github.com/VBlackJack/WinProfile"
 description = "Windows User Profile Repair & Migration Suite (Rust / Slint UI)"
 
 [workspace.dependencies]
