@@ -43,6 +43,7 @@ pub use security::{
 };
 pub use tokens::{
     duplicate_trustedinstaller_token, ensure_trustedinstaller_service_running,
-    find_process_id_by_name, get_active_console_session, launch_process_with_token, TokenError,
-    TokenResult, MAXIMUM_ALLOWED,
+    find_process_id_by_name, get_requesting_process_session, launch_process_with_token,
+    trustedinstaller_console_launch_spec, LaunchedProcess, ProcessLaunchSpec, TokenError,
+    TokenResult, TrustedInstallerLaunchToken, MAXIMUM_ALLOWED,
 };

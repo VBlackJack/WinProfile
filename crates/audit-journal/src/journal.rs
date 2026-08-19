@@ -155,6 +155,12 @@ impl AuditLogger {
             .file_lock
             .lock()
             .map_err(|_| AuditError::FileLockPoisoned)?;
+        // Acquire every fallible in-process guard before the durable append. Once
+        // sync_data succeeds, only infallible buffer updates remain and Ok is guaranteed.
+        let mut buffer = self
+            .memory_buffer
+            .lock()
+            .map_err(|_| AuditError::BufferPoisoned)?;
         self.rotate_if_needed(entry_bytes)?;
 
         let mut file = OpenOptions::new()
@@ -165,10 +171,6 @@ impl AuditLogger {
         file.flush()?;
         file.sync_data()?;
 
-        let mut buffer = self
-            .memory_buffer
-            .lock()
-            .map_err(|_| AuditError::BufferPoisoned)?;
         if self.max_memory_entries > 0 && buffer.len() >= self.max_memory_entries {
             buffer.pop_front();
         }
@@ -302,4 +304,60 @@ fn load_recent_entries(path: &Path, max_memory: usize) -> AuditResult<VecDeque<A
         }
     }
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let suffix = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "winprofile-audit-poison-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn poisoned_display_buffer_prevents_durable_append() {
+        let test_directory = TestDirectory::new();
+        let log_path = test_directory.0.join("audit.jsonl");
+        let logger =
+            AuditLogger::with_limits(Some(log_path.clone()), 10, 4096, 1).expect("create logger");
+        let buffer = Arc::clone(&logger.memory_buffer);
+        let poison_result = std::panic::catch_unwind(move || {
+            let _guard = buffer.lock().expect("acquire buffer lock");
+            panic!("poison buffer for test");
+        });
+        assert!(poison_result.is_err());
+
+        let result = logger.log(
+            "test",
+            "tester",
+            "audit",
+            AuditStatus::Success,
+            "must not be appended",
+        );
+
+        assert!(matches!(result, Err(AuditError::BufferPoisoned)));
+        assert!(
+            !log_path.exists(),
+            "an error result must not conceal a durable append"
+        );
+    }
 }

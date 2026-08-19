@@ -21,6 +21,6 @@ license.workspace = true
 description = "Encapsulated safe Win32 RAII wrappers, security, registry and restart manager"
 
 [dependencies]
-windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem"] }
+windows-sys = { workspace = true, features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_System_SystemInformation"] }
 thiserror.workspace = true
 tracing.workspace = true

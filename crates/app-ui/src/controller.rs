@@ -17,6 +17,7 @@
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use audit_journal::{AuditEntry, AuditLogger, AuditStatus, SnapshotEngine};
 use core_profiles::{
@@ -24,10 +25,11 @@ use core_profiles::{
     ProfileRepairEngine, ProfileScanner, RepairPlan,
 };
 use platform_win32::{
-    duplicate_trustedinstaller_token, get_active_console_session, is_process_elevated,
-    launch_process_with_token,
+    duplicate_trustedinstaller_token, get_requesting_process_session, is_process_elevated,
+    launch_process_with_token, trustedinstaller_console_launch_spec, LaunchedProcess,
 };
 use slint::{CloseRequestResponse, ComponentHandle, Model, ModelRc, VecModel, Weak};
+use thiserror::Error;
 
 use crate::state::{audit_entry_to_slint, user_profile_to_slint};
 use crate::{AuditLogEntry, MainWindow, ProfileEntry};
@@ -35,6 +37,13 @@ use crate::{AuditLogEntry, MainWindow, ProfileEntry};
 const CONFIRM_REPAIR: i32 = 0;
 const CONFIRM_TRUSTED_INSTALLER: i32 = 1;
 const MIGRATION_SOURCE_LOADED_ERROR: &str = "error.migration_source_loaded";
+const TI_REQUEST_OPERATION: &str = "LaunchTrustedInstallerConsoleRequested";
+const TI_TERMINAL_OPERATION: &str = "LaunchTrustedInstallerConsole";
+const TI_AUDIT_ACTOR: &str = "WinProfile-Admin";
+const TI_AUDIT_TARGET: &str = "Windows system command interpreter";
+const TI_REQUEST_DETAIL: &str = "TrustedInstaller console launch request accepted";
+const TI_TERMINATION_EXIT_CODE: u32 = 1;
+const TI_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -55,6 +64,139 @@ enum ClosePolicy {
     CancelMigration,
 }
 
+#[derive(Error, Debug)]
+enum TrustedInstallerLaunchError {
+    #[error("TrustedInstaller launch request audit failed before process acquisition: {0}")]
+    RequestAudit(String),
+    #[error("TrustedInstaller process launch failed: {0}")]
+    Launch(String),
+    #[error(
+        "TrustedInstaller process launch failed: {launch_error}; FAILED audit also failed: {audit_error}"
+    )]
+    LaunchAndFailureAudit {
+        launch_error: String,
+        audit_error: String,
+    },
+    #[error(
+        "TrustedInstaller SUCCESS audit failed for PID {pid}: {audit_error}; process was terminated and reaped"
+    )]
+    TerminalAuditCompensated { pid: u32, audit_error: String },
+    #[error(
+        "TrustedInstaller SUCCESS audit failed for PID {pid}: {audit_error}; compensation failed: {compensation_error}"
+    )]
+    TerminalAuditCompensationFailed {
+        pid: u32,
+        audit_error: String,
+        compensation_error: String,
+    },
+}
+
+trait TrustedInstallerAudit {
+    fn record(&self, operation: &str, status: AuditStatus, details: String) -> Result<(), String>;
+}
+
+impl TrustedInstallerAudit for AuditLogger {
+    fn record(&self, operation: &str, status: AuditStatus, details: String) -> Result<(), String> {
+        self.log(operation, TI_AUDIT_ACTOR, TI_AUDIT_TARGET, status, details)
+            .map_err(|error| error.to_string())
+    }
+}
+
+trait ManagedTrustedInstallerProcess {
+    fn pid(&self) -> u32;
+    fn terminate(&self) -> Result<(), String>;
+    fn wait_for_exit(&self) -> Result<(), String>;
+}
+
+impl ManagedTrustedInstallerProcess for LaunchedProcess {
+    fn pid(&self) -> u32 {
+        LaunchedProcess::pid(self)
+    }
+
+    fn terminate(&self) -> Result<(), String> {
+        LaunchedProcess::terminate(self, TI_TERMINATION_EXIT_CODE)
+            .map_err(|error| error.to_string())
+    }
+
+    fn wait_for_exit(&self) -> Result<(), String> {
+        LaunchedProcess::wait_for_exit(self, TI_TERMINATION_TIMEOUT)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn execute_trustedinstaller_launch<A, L, P>(
+    audit: &A,
+    launcher: L,
+) -> Result<u32, TrustedInstallerLaunchError>
+where
+    A: TrustedInstallerAudit,
+    L: FnOnce() -> Result<(P, u32), String>,
+    P: ManagedTrustedInstallerProcess,
+{
+    audit
+        .record(
+            TI_REQUEST_OPERATION,
+            AuditStatus::Success,
+            TI_REQUEST_DETAIL.to_string(),
+        )
+        .map_err(TrustedInstallerLaunchError::RequestAudit)?;
+
+    let (process, session_id) = match launcher() {
+        Ok(launched) => launched,
+        Err(launch_error) => {
+            let audit_result = audit.record(
+                TI_TERMINAL_OPERATION,
+                AuditStatus::Failed,
+                launch_error.clone(),
+            );
+            return match audit_result {
+                Ok(()) => Err(TrustedInstallerLaunchError::Launch(launch_error)),
+                Err(audit_error) => Err(TrustedInstallerLaunchError::LaunchAndFailureAudit {
+                    launch_error,
+                    audit_error,
+                }),
+            };
+        }
+    };
+
+    let pid = process.pid();
+    let terminal_audit = audit.record(
+        TI_TERMINAL_OPERATION,
+        AuditStatus::Success,
+        format!("Spawned PID {pid} in session {session_id}"),
+    );
+    let audit_error = match terminal_audit {
+        Ok(()) => return Ok(pid),
+        Err(error) => error,
+    };
+
+    let terminate_error = process.terminate().err();
+    let wait_error = process.wait_for_exit().err();
+    drop(process);
+
+    match (terminate_error, wait_error) {
+        (None, None) => {
+            Err(TrustedInstallerLaunchError::TerminalAuditCompensated { pid, audit_error })
+        }
+        (terminate_error, wait_error) => {
+            let mut failures = Vec::new();
+            if let Some(error) = terminate_error {
+                failures.push(format!("terminate: {error}"));
+            }
+            if let Some(error) = wait_error {
+                failures.push(format!("wait: {error}"));
+            }
+            Err(
+                TrustedInstallerLaunchError::TerminalAuditCompensationFailed {
+                    pid,
+                    audit_error,
+                    compensation_error: failures.join("; "),
+                },
+            )
+        }
+    }
+}
+
 impl OperationKind {
     fn from_raw(value: u8) -> Self {
         match value {
@@ -70,9 +212,9 @@ impl OperationKind {
 
     fn close_policy(self) -> ClosePolicy {
         match self {
-            Self::Repair | Self::Unknown => ClosePolicy::Block,
+            Self::Repair | Self::TrustedInstaller | Self::Unknown => ClosePolicy::Block,
             Self::Migration => ClosePolicy::CancelMigration,
-            Self::Idle | Self::Scan | Self::TrustedInstaller | Self::Export => ClosePolicy::Allow,
+            Self::Idle | Self::Scan | Self::Export => ClosePolicy::Allow,
         }
     }
 }
@@ -467,42 +609,19 @@ impl AppController {
         let controller = Arc::clone(self);
         let weak = ui.as_weak();
         std::thread::spawn(move || {
-            let result = get_active_console_session().and_then(|session_id| {
-                duplicate_trustedinstaller_token(session_id).and_then(|token| {
-                    launch_process_with_token(
-                        &token,
-                        "cmd.exe /k title TrustedInstaller Elevated Console",
-                        None,
-                    )
-                    .map(|pid| (pid, session_id))
+            let audited_result =
+                execute_trustedinstaller_launch(controller.audit_logger.as_ref(), || {
+                    let launch_spec = trustedinstaller_console_launch_spec()
+                        .map_err(|error| error.to_string())?;
+                    let session_id =
+                        get_requesting_process_session().map_err(|error| error.to_string())?;
+                    let token =
+                        duplicate_trustedinstaller_token().map_err(|error| error.to_string())?;
+                    let process = launch_process_with_token(token, &launch_spec)
+                        .map_err(|error| error.to_string())?;
+                    Ok((process, session_id))
                 })
-            });
-            let audited_result = match result {
-                Ok((pid, session_id)) => controller
-                    .audit_logger
-                    .log(
-                        "LaunchTrustedInstallerConsole",
-                        "WinProfile-Admin",
-                        "cmd.exe",
-                        AuditStatus::Success,
-                        format!("Spawned PID {pid} in session {session_id}"),
-                    )
-                    .map(|_| pid)
-                    .map_err(|error| error.to_string()),
-                Err(error) => {
-                    let detail = error.to_string();
-                    match controller.audit_logger.log(
-                        "LaunchTrustedInstallerConsole",
-                        "WinProfile-Admin",
-                        "cmd.exe",
-                        AuditStatus::Failed,
-                        &detail,
-                    ) {
-                        Ok(()) => Err(detail),
-                        Err(audit_error) => Err(format!("{detail}; audit error: {audit_error}")),
-                    }
-                }
-            };
+                .map_err(|error| error.to_string());
             let audit_entries = controller.audit_logger.get_entries();
             controller.finish_operation();
             if let Err(error) = weak.upgrade_in_event_loop(move |ui| {
@@ -669,10 +788,100 @@ fn set_error(ui: &MainWindow, error: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicUsize;
+
+    struct FakeAudit {
+        outcomes: Mutex<VecDeque<Result<(), String>>>,
+        events: Mutex<Vec<(String, AuditStatus)>>,
+    }
+
+    impl FakeAudit {
+        fn new(outcomes: impl IntoIterator<Item = Result<(), &'static str>>) -> Self {
+            Self {
+                outcomes: Mutex::new(
+                    outcomes
+                        .into_iter()
+                        .map(|result| result.map_err(str::to_string))
+                        .collect(),
+                ),
+                events: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<(String, AuditStatus)> {
+            self.events.lock().expect("events lock").clone()
+        }
+    }
+
+    impl TrustedInstallerAudit for FakeAudit {
+        fn record(
+            &self,
+            operation: &str,
+            status: AuditStatus,
+            _details: String,
+        ) -> Result<(), String> {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push((operation.to_string(), status));
+            self.outcomes
+                .lock()
+                .expect("outcomes lock")
+                .pop_front()
+                .unwrap_or(Ok(()))
+        }
+    }
+
+    struct FakeProcess {
+        pid: u32,
+        terminate_calls: Arc<AtomicUsize>,
+        wait_calls: Arc<AtomicUsize>,
+        terminate_result: Result<(), String>,
+        wait_result: Result<(), String>,
+    }
+
+    impl FakeProcess {
+        fn successful(pid: u32) -> (Self, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+            let terminate_calls = Arc::new(AtomicUsize::new(0));
+            let wait_calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    pid,
+                    terminate_calls: Arc::clone(&terminate_calls),
+                    wait_calls: Arc::clone(&wait_calls),
+                    terminate_result: Ok(()),
+                    wait_result: Ok(()),
+                },
+                terminate_calls,
+                wait_calls,
+            )
+        }
+    }
+
+    impl ManagedTrustedInstallerProcess for FakeProcess {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        fn terminate(&self) -> Result<(), String> {
+            self.terminate_calls.fetch_add(1, Ordering::SeqCst);
+            self.terminate_result.clone()
+        }
+
+        fn wait_for_exit(&self) -> Result<(), String> {
+            self.wait_calls.fetch_add(1, Ordering::SeqCst);
+            self.wait_result.clone()
+        }
+    }
 
     #[test]
-    fn close_policy_blocks_repair_and_unknown_state() {
+    fn close_policy_blocks_repair_trustedinstaller_and_unknown_state() {
         assert_eq!(OperationKind::Repair.close_policy(), ClosePolicy::Block);
+        assert_eq!(
+            OperationKind::TrustedInstaller.close_policy(),
+            ClosePolicy::Block
+        );
         assert_eq!(OperationKind::Unknown.close_policy(), ClosePolicy::Block);
     }
 
@@ -689,11 +898,20 @@ mod tests {
         for operation in [
             OperationKind::Idle,
             OperationKind::Scan,
-            OperationKind::TrustedInstaller,
             OperationKind::Export,
         ] {
             assert_eq!(operation.close_policy(), ClosePolicy::Allow);
         }
+    }
+
+    #[test]
+    fn operation_state_blocks_close_until_trustedinstaller_terminal_handling_finishes() {
+        let state = OperationState::new();
+
+        assert!(state.try_begin(OperationKind::TrustedInstaller));
+        assert_eq!(state.active_operation().close_policy(), ClosePolicy::Block);
+        assert!(!state.finish());
+        assert_eq!(state.active_operation().close_policy(), ClosePolicy::Allow);
     }
 
     #[test]
@@ -746,5 +964,95 @@ mod tests {
             validate_migration_source(true),
             Err(MIGRATION_SOURCE_LOADED_ERROR)
         );
+    }
+
+    #[test]
+    fn trustedinstaller_request_audit_failure_prevents_launcher_call() {
+        let audit = FakeAudit::new([Err("request journal unavailable")]);
+        let launcher_called = AtomicBool::new(false);
+
+        let result = execute_trustedinstaller_launch(&audit, || {
+            launcher_called.store(true, Ordering::SeqCst);
+            let (process, _, _) = FakeProcess::successful(41);
+            Ok((process, 1))
+        });
+
+        assert!(matches!(
+            result,
+            Err(TrustedInstallerLaunchError::RequestAudit(error))
+                if error == "request journal unavailable"
+        ));
+        assert!(!launcher_called.load(Ordering::SeqCst));
+        assert_eq!(
+            audit.events(),
+            vec![(TI_REQUEST_OPERATION.to_string(), AuditStatus::Success)]
+        );
+    }
+
+    #[test]
+    fn trustedinstaller_terminal_audit_failure_terminates_and_waits() {
+        let audit = FakeAudit::new([Ok(()), Err("terminal journal unavailable")]);
+        let (process, terminate_calls, wait_calls) = FakeProcess::successful(4242);
+
+        let result = execute_trustedinstaller_launch(&audit, || Ok((process, 7)));
+
+        assert!(matches!(
+            result,
+            Err(TrustedInstallerLaunchError::TerminalAuditCompensated {
+                pid: 4242,
+                audit_error,
+            }) if audit_error == "terminal journal unavailable"
+        ));
+        assert_eq!(terminate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            audit.events(),
+            vec![
+                (TI_REQUEST_OPERATION.to_string(), AuditStatus::Success),
+                (TI_TERMINAL_OPERATION.to_string(), AuditStatus::Success),
+            ]
+        );
+    }
+
+    #[test]
+    fn trustedinstaller_launch_failure_is_durably_audited() {
+        let audit = FakeAudit::new([Ok(()), Ok(())]);
+
+        let result =
+            execute_trustedinstaller_launch(&audit, || -> Result<(FakeProcess, u32), String> {
+                Err("CreateProcess denied".to_string())
+            });
+
+        assert!(matches!(
+            result,
+            Err(TrustedInstallerLaunchError::Launch(error))
+                if error == "CreateProcess denied"
+        ));
+        assert_eq!(
+            audit.events(),
+            vec![
+                (TI_REQUEST_OPERATION.to_string(), AuditStatus::Success),
+                (TI_TERMINAL_OPERATION.to_string(), AuditStatus::Failed),
+            ]
+        );
+    }
+
+    #[test]
+    fn trustedinstaller_launch_and_failure_audit_errors_are_both_visible() {
+        let audit = FakeAudit::new([Ok(()), Err("failed journal unavailable")]);
+
+        let result =
+            execute_trustedinstaller_launch(&audit, || -> Result<(FakeProcess, u32), String> {
+                Err("CreateProcess denied".to_string())
+            });
+
+        assert!(matches!(
+            result,
+            Err(TrustedInstallerLaunchError::LaunchAndFailureAudit {
+                launch_error,
+                audit_error,
+            }) if launch_error == "CreateProcess denied"
+                && audit_error == "failed journal unavailable"
+        ));
     }
 }

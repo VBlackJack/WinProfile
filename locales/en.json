@@ -33,7 +33,7 @@
   "status.export_success": "Audit exported to {path}",
   "status.audit_cleared": "Audit display cleared; durable journal preserved",
   "status.refresh_failed": "{success}; inventory refresh failed: {error}",
-  "status.close_blocked_repair": "A profile repair is still running. Wait for verification or rollback to finish before closing WinProfile.",
+  "status.close_blocked_repair": "A sensitive operation is still running. Wait for verification, audit, or compensation to finish before closing WinProfile.",
   "dashboard.scan_btn": "Scan Profiles",
   "dashboard.total_profiles": "Total Profiles",
   "dashboard.healthy_profiles": "Healthy",
