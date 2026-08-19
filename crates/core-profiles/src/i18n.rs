@@ -14,92 +14,137 @@
  * limitations under the License.
  */
 
-use std::collections::HashMap;
-use std::sync::RwLock;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::OnceLock;
 
-static CURRENT_LOCALE: RwLock<String> = RwLock::new(String::new());
+use thiserror::Error;
+
+static CURRENT_LOCALE: AtomicU8 = AtomicU8::new(0);
+static INSTANCE: OnceLock<Result<I18nManager, I18nError>> = OnceLock::new();
 
 const EN_JSON: &str = include_str!("../../../locales/en.json");
 const FR_JSON: &str = include_str!("../../../locales/fr.json");
 
-/// Structure storing parsed translation maps.
+#[derive(Error, Debug, Clone)]
+pub enum I18nError {
+    #[error("Invalid {locale} translation bundle: {reason}")]
+    InvalidBundle { locale: String, reason: String },
+    #[error("Translation key parity mismatch: only_en={only_en:?}, only_fr={only_fr:?}")]
+    KeyParity {
+        only_en: Vec<String>,
+        only_fr: Vec<String>,
+    },
+    #[error("Unsupported locale: {0}")]
+    UnsupportedLocale(String),
+}
+
+/// Parsed and parity-validated embedded translation bundles.
 pub struct I18nManager {
     locales: HashMap<String, HashMap<String, String>>,
 }
 
 impl I18nManager {
-    /// Initializes and parses embedded JSON translation bundles.
-    pub fn global() -> &'static I18nManager {
-        static INSTANCE: std::sync::OnceLock<I18nManager> = std::sync::OnceLock::new();
-        INSTANCE.get_or_init(|| {
-            let mut locales = HashMap::new();
-
-            if let Ok(en_map) = serde_json::from_str::<HashMap<String, String>>(EN_JSON) {
-                locales.insert("en".to_string(), en_map);
-            }
-            if let Ok(fr_map) = serde_json::from_str::<HashMap<String, String>>(FR_JSON) {
-                locales.insert("fr".to_string(), fr_map);
-            }
-
-            I18nManager { locales }
-        })
+    /// Returns the validated global translation manager.
+    pub fn global() -> Result<&'static I18nManager, I18nError> {
+        match INSTANCE.get_or_init(Self::build) {
+            Ok(manager) => Ok(manager),
+            Err(error) => Err(error.clone()),
+        }
     }
 
-    /// Sets the active locale code (e.g. "fr" or "en").
-    pub fn set_locale(locale: &str) {
-        if let Ok(mut cur) = CURRENT_LOCALE.write() {
-            *cur = locale.to_string();
-        }
+    /// Forces bundle parsing and parity validation during application startup.
+    pub fn validate() -> Result<(), I18nError> {
+        Self::global().map(|_| ())
+    }
+
+    /// Sets the active locale code.
+    pub fn set_locale(locale: &str) -> Result<(), I18nError> {
+        let code = match locale {
+            "fr" => 0,
+            "en" => 1,
+            value => return Err(I18nError::UnsupportedLocale(value.to_string())),
+        };
+        CURRENT_LOCALE.store(code, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Gets the active locale code.
-    pub fn get_locale() -> String {
-        if let Ok(cur) = CURRENT_LOCALE.read() {
-            if !cur.is_empty() {
-                return cur.clone();
-            }
+    pub fn get_locale() -> &'static str {
+        if CURRENT_LOCALE.load(Ordering::Relaxed) == 1 {
+            "en"
+        } else {
+            "fr"
         }
-        "fr".to_string() // French default as specified
     }
 
-    /// Translates a key for the currently selected locale with fallback.
+    /// Translates a key for the selected locale, then falls back to English.
     pub fn translate(&self, key: &str) -> String {
-        let active = Self::get_locale();
-        if let Some(map) = self.locales.get(&active) {
-            if let Some(val) = map.get(key) {
-                return val.clone();
-            }
-        }
-
-        // Fallback to English
-        if active != "en" {
-            if let Some(en_map) = self.locales.get("en") {
-                if let Some(val) = en_map.get(key) {
-                    return val.clone();
-                }
-            }
-        }
-
-        key.to_string()
+        self.locales
+            .get(Self::get_locale())
+            .and_then(|map| map.get(key))
+            .or_else(|| self.locales.get("en").and_then(|map| map.get(key)))
+            .cloned()
+            .unwrap_or_else(|| format!("[missing:{key}]"))
     }
 
-    /// Translates a key and replaces `{name}` placeholders with provided argument values.
+    /// Translates a key and replaces named placeholders.
     pub fn translate_args(&self, key: &str, args: &[(&str, &str)]) -> String {
         let mut template = self.translate(key);
-        for &(param, val) in args {
-            let pattern = format!("{{{}}}", param);
-            template = template.replace(&pattern, val);
+        for &(parameter, value) in args {
+            template = template.replace(&format!("{{{parameter}}}"), value);
         }
         template
     }
+
+    /// Returns sorted translation keys for verification tests.
+    pub fn keys(&self) -> Vec<String> {
+        self.locales
+            .get("en")
+            .map(|map| {
+                let mut keys = map.keys().cloned().collect::<Vec<_>>();
+                keys.sort();
+                keys
+            })
+            .unwrap_or_default()
+    }
+
+    fn build() -> Result<Self, I18nError> {
+        let en = parse_bundle("en", EN_JSON)?;
+        let fr = parse_bundle("fr", FR_JSON)?;
+        let en_keys = en.keys().cloned().collect::<BTreeSet<_>>();
+        let fr_keys = fr.keys().cloned().collect::<BTreeSet<_>>();
+        if en_keys != fr_keys {
+            return Err(I18nError::KeyParity {
+                only_en: en_keys.difference(&fr_keys).cloned().collect(),
+                only_fr: fr_keys.difference(&en_keys).cloned().collect(),
+            });
+        }
+        Ok(Self {
+            locales: HashMap::from([("en".to_string(), en), ("fr".to_string(), fr)]),
+        })
+    }
 }
 
-/// Global helper for key translation.
+fn parse_bundle(locale: &str, json: &str) -> Result<HashMap<String, String>, I18nError> {
+    serde_json::from_str(json).map_err(|error| I18nError::InvalidBundle {
+        locale: locale.to_string(),
+        reason: error.to_string(),
+    })
+}
+
+/// Global helper for key translation after startup validation.
 pub fn t(key: &str) -> String {
-    I18nManager::global().translate(key)
+    match I18nManager::global() {
+        Ok(manager) => manager.translate(key),
+        Err(error) => format!("[i18n:{error}]"),
+    }
 }
 
-/// Global helper for key translation with named parameter arguments.
+/// Global helper for key translation with named arguments.
 pub fn t_args(key: &str, args: &[(&str, &str)]) -> String {
-    I18nManager::global().translate_args(key, args)
+    match I18nManager::global() {
+        Ok(manager) => manager.translate_args(key, args),
+        Err(error) => format!("[i18n:{error}]"),
+    }
 }

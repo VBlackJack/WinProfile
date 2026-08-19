@@ -16,14 +16,13 @@
 
 fn main() {
     slint_build::compile("ui/main-window.slint").expect("Failed to compile Slint UI definitions");
-
-    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    if target_env == "msvc" {
-        let manifest_path = std::path::Path::new("../../resources/app.manifest");
-        if manifest_path.exists() {
-            let abs_path = std::fs::canonicalize(manifest_path).unwrap_or_else(|_| manifest_path.to_path_buf());
-            println!("cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}", abs_path.display());
-            println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
-        }
+    println!("cargo:rerun-if-changed=../../resources/app.manifest");
+    embed_manifest::embed_manifest_file("../../resources/app.manifest")
+        .expect("Failed to embed the required Windows elevation manifest");
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rerun-if-changed=../../resources/version.rc");
+        embed_resource::compile("../../resources/version.rc", embed_resource::NONE)
+            .manifest_required()
+            .expect("Failed to embed required Windows version metadata");
     }
 }

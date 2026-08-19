@@ -18,18 +18,14 @@ use std::ffi::c_void;
 use std::path::Path;
 use thiserror::Error;
 use windows_sys::Win32::Foundation::{
-    GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED,
+    GetLastError, LocalFree, SetLastError, ERROR_INSUFFICIENT_BUFFER, ERROR_NOT_ALL_ASSIGNED,
     ERROR_SUCCESS, HANDLE, LUID,
 };
+use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, LookupAccountSidW, LookupPrivilegeValueW,
-    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    SE_PRIVILEGE_ENABLED, SID_NAME_USE, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_PRIVILEGES, TOKEN_QUERY, UNPROTECTED_DACL_SECURITY_INFORMATION,
-};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSidToSidW, SetNamedSecurityInfoW,
-    TreeResetNamedSecurityInfoW, SE_FILE_OBJECT,
+    AdjustTokenPrivileges, GetTokenInformation, LookupAccountSidW, LookupPrivilegeValueW,
+    TokenElevation, SE_PRIVILEGE_ENABLED, SID_NAME_USE, TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION,
+    TOKEN_PRIVILEGES, TOKEN_QUERY,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
@@ -39,7 +35,7 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 use crate::handles::OwnedHandle;
 use crate::registry::to_wide_null;
 
-pub type PSID = *mut c_void;
+type Psid = *mut c_void;
 
 #[derive(Error, Debug)]
 pub enum SecurityError {
@@ -49,10 +45,6 @@ pub enum SecurityError {
     PrivilegeNotAssigned(String),
     #[error("Failed to resolve SID: {0}")]
     SidResolutionError(String),
-    #[error("Path is a reparse point or junction: {0}")]
-    ReparsePointEncountered(String),
-    #[error("Invalid path")]
-    InvalidPath,
 }
 
 pub type SecResult<T> = Result<T, SecurityError>;
@@ -69,8 +61,7 @@ pub const SE_TCB_NAME: &str = "SeTcbPrivilege";
 /// and automatically restores the original token privileges state on drop.
 pub struct PrivilegeGuard {
     token: OwnedHandle,
-    previous_state: TOKEN_PRIVILEGES,
-    has_previous: bool,
+    previous_states: Vec<TOKEN_PRIVILEGES>,
 }
 
 impl PrivilegeGuard {
@@ -92,18 +83,17 @@ impl PrivilegeGuard {
         let token = OwnedHandle::from_raw(raw_token)
             .ok_or_else(|| SecurityError::Win32Error(unsafe { GetLastError() }))?;
 
-        let mut previous_state: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
-        let mut return_length: u32 = 0;
+        let mut previous_states = Vec::new();
 
         for &priv_name in privilege_names {
             let wide_name = to_wide_null(priv_name);
             let mut luid: LUID = unsafe { std::mem::zeroed() };
 
-            let luid_success = unsafe {
-                LookupPrivilegeValueW(std::ptr::null(), wide_name.as_ptr(), &mut luid)
-            };
+            let luid_success =
+                unsafe { LookupPrivilegeValueW(std::ptr::null(), wide_name.as_ptr(), &mut luid) };
 
             if luid_success == 0 {
+                restore_privileges(&token, &previous_states)?;
                 return Err(SecurityError::PrivilegeNotAssigned(priv_name.to_string()));
             }
 
@@ -111,6 +101,10 @@ impl PrivilegeGuard {
             tp.PrivilegeCount = 1;
             tp.Privileges[0].Luid = luid;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+            let mut previous_state: TOKEN_PRIVILEGES = unsafe { std::mem::zeroed() };
+            let mut return_length: u32 = 0;
+            unsafe { SetLastError(ERROR_SUCCESS) };
 
             let adjust_success = unsafe {
                 AdjustTokenPrivileges(
@@ -124,78 +118,107 @@ impl PrivilegeGuard {
             };
 
             let last_err = unsafe { GetLastError() };
-            if adjust_success == 0 || last_err == ERROR_NOT_ALL_ASSIGNED {
-                tracing::warn!(privilege = priv_name, err = last_err, "Could not enable privilege");
+            if adjust_success == 0 {
+                restore_privileges(&token, &previous_states)?;
+                return Err(SecurityError::Win32Error(last_err));
+            }
+            if last_err == ERROR_NOT_ALL_ASSIGNED {
+                restore_privileges(&token, &previous_states)?;
+                return Err(SecurityError::PrivilegeNotAssigned(priv_name.to_string()));
+            }
+            if previous_state.PrivilegeCount > 0 {
+                previous_states.push(previous_state);
             }
         }
 
         Ok(Self {
             token,
-            previous_state,
-            has_previous: return_length > 0,
+            previous_states,
         })
+    }
+
+    /// Restores every adjusted privilege and surfaces restoration failures.
+    pub fn restore(mut self) -> SecResult<()> {
+        restore_privileges(&self.token, &self.previous_states)?;
+        self.previous_states.clear();
+        Ok(())
     }
 }
 
 impl Drop for PrivilegeGuard {
     fn drop(&mut self) {
-        if self.has_previous {
-            unsafe {
-                AdjustTokenPrivileges(
-                    self.token.as_raw(),
-                    0,
-                    &self.previous_state,
-                    0,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-            }
+        if let Err(error) = restore_privileges(&self.token, &self.previous_states) {
+            tracing::error!(%error, "Failed to restore token privileges during cleanup");
         }
     }
 }
 
+fn restore_privileges(token: &OwnedHandle, states: &[TOKEN_PRIVILEGES]) -> SecResult<()> {
+    let mut first_error = None;
+    for previous_state in states.iter().rev() {
+        unsafe { SetLastError(ERROR_SUCCESS) };
+        let restored = unsafe {
+            AdjustTokenPrivileges(
+                token.as_raw(),
+                0,
+                previous_state,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        let last_error = unsafe { GetLastError() };
+        if (restored == 0 || last_error == ERROR_NOT_ALL_ASSIGNED) && first_error.is_none() {
+            first_error = Some(SecurityError::Win32Error(last_error));
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Returns whether the current process token is elevated.
+pub fn is_process_elevated() -> SecResult<bool> {
+    let mut raw_token: HANDLE = std::ptr::null_mut();
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) };
+    if opened == 0 {
+        return Err(SecurityError::Win32Error(unsafe { GetLastError() }));
+    }
+    let token = OwnedHandle::from_raw(raw_token)
+        .ok_or_else(|| SecurityError::Win32Error(unsafe { GetLastError() }))?;
+
+    let mut elevation: TOKEN_ELEVATION = unsafe { std::mem::zeroed() };
+    let mut returned = 0;
+    let queried = unsafe {
+        GetTokenInformation(
+            token.as_raw(),
+            TokenElevation,
+            &mut elevation as *mut TOKEN_ELEVATION as *mut c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    if queried == 0 {
+        return Err(SecurityError::Win32Error(unsafe { GetLastError() }));
+    }
+    Ok(elevation.TokenIsElevated != 0)
+}
+
 /// Checks if a filesystem path is a Reparse Point (Junction, Symlink, or OneDrive placeholder).
-pub fn is_reparse_point(path: &Path) -> bool {
+pub fn path_is_reparse_point(path: &Path) -> SecResult<bool> {
     let wide_path = to_wide_null(path.as_os_str());
     let attributes = unsafe { GetFileAttributesW(wide_path.as_ptr()) };
     if attributes == INVALID_FILE_ATTRIBUTES {
-        return false;
-    }
-    (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-}
-
-/// Converts a binary PSID to a canonical SDDL string (e.g., "S-1-5-21-...").
-pub fn sid_to_string(psid: PSID) -> SecResult<String> {
-    if psid.is_null() {
-        return Err(SecurityError::SidResolutionError("PSID is null".into()));
-    }
-
-    let mut str_ptr: *mut u16 = std::ptr::null_mut();
-    let success = unsafe { ConvertSidToStringSidW(psid, &mut str_ptr) };
-
-    if success == 0 || str_ptr.is_null() {
         return Err(SecurityError::Win32Error(unsafe { GetLastError() }));
     }
-
-    let mut len = 0;
-    while unsafe { *str_ptr.add(len) } != 0 {
-        len += 1;
-    }
-
-    let slice = unsafe { std::slice::from_raw_parts(str_ptr, len) };
-    let result = String::from_utf16(slice).map_err(|_| SecurityError::SidResolutionError("Invalid UTF-16".into()));
-
-    unsafe {
-        LocalFree(str_ptr as *mut c_void);
-    }
-
-    result
+    Ok((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
 }
 
 /// Resolves a Security Identifier (SID) string to its Account and Domain Name.
 pub fn lookup_account_by_sid_string(sid_str: &str) -> SecResult<(String, String)> {
     let wide_sid = to_wide_null(sid_str);
-    let mut psid: PSID = std::ptr::null_mut();
+    let mut psid: Psid = std::ptr::null_mut();
 
     let conv_success = unsafe { ConvertStringSidToSidW(wide_sid.as_ptr(), &mut psid) };
     if conv_success == 0 || psid.is_null() {
@@ -221,8 +244,10 @@ pub fn lookup_account_by_sid_string(sid_str: &str) -> SecResult<(String, String)
 
     let err = unsafe { GetLastError() };
     if err != ERROR_INSUFFICIENT_BUFFER && err != ERROR_SUCCESS {
-        unsafe { LocalFree(psid as *mut c_void) };
-        return Err(SecurityError::SidResolutionError(format!("LookupAccountSidW error: {err}")));
+        unsafe { LocalFree(psid) };
+        return Err(SecurityError::SidResolutionError(format!(
+            "LookupAccountSidW error: {err}"
+        )));
     }
 
     let mut name_buf = vec![0u16; name_len as usize];
@@ -240,81 +265,17 @@ pub fn lookup_account_by_sid_string(sid_str: &str) -> SecResult<(String, String)
         )
     };
 
-    unsafe { LocalFree(psid as *mut c_void) };
+    unsafe { LocalFree(psid) };
 
     if lookup_success == 0 {
-        return Err(SecurityError::SidResolutionError(format!("LookupAccountSidW failed: {}", unsafe { GetLastError() })));
+        return Err(SecurityError::SidResolutionError(format!(
+            "LookupAccountSidW failed: {}",
+            unsafe { GetLastError() }
+        )));
     }
 
     let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
     let domain = String::from_utf16_lossy(&domain_buf[..domain_len as usize]);
 
     Ok((domain, name))
-}
-
-/// Reassigns ownership and recursively resets NTFS DACL model on a directory tree,
-/// safeguarding against traversing reparse points (symlinks/junctions/OneDrive).
-pub fn reset_tree_security_safe(root_path: &Path, owner_sid_str: &str) -> SecResult<()> {
-    if is_reparse_point(root_path) {
-        return Err(SecurityError::ReparsePointEncountered(root_path.to_string_lossy().to_string()));
-    }
-
-    let _privs = PrivilegeGuard::new(&[
-        SE_TAKE_OWNERSHIP_NAME,
-        SE_RESTORE_NAME,
-        SE_BACKUP_NAME,
-    ])?;
-
-    let wide_sid = to_wide_null(owner_sid_str);
-    let mut psid: PSID = std::ptr::null_mut();
-
-    let conv_res = unsafe { ConvertStringSidToSidW(wide_sid.as_ptr(), &mut psid) };
-    if conv_res == 0 || psid.is_null() {
-        return Err(SecurityError::SidResolutionError(owner_sid_str.to_string()));
-    }
-
-    let wide_path = to_wide_null(root_path.as_os_str());
-
-    // 1. Set Ownership on root
-    let owner_status = unsafe {
-        SetNamedSecurityInfoW(
-            wide_path.as_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            psid,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-
-    if owner_status != ERROR_SUCCESS {
-        unsafe { LocalFree(psid as *mut c_void) };
-        return Err(SecurityError::Win32Error(owner_status));
-    }
-
-    // 2. Tree reset DACL propagation
-    let tree_status = unsafe {
-        TreeResetNamedSecurityInfoW(
-            wide_path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
-            psid,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            0, // Keep explicit ACEs
-            None,
-            0,
-            std::ptr::null_mut(),
-        )
-    };
-
-    unsafe { LocalFree(psid as *mut c_void) };
-
-    if tree_status == ERROR_SUCCESS {
-        Ok(())
-    } else {
-        Err(SecurityError::Win32Error(tree_status))
-    }
 }

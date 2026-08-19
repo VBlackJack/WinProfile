@@ -18,29 +18,25 @@ use std::ffi::c_void;
 use std::time::Duration;
 use thiserror::Error;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_SERVICE_ALREADY_RUNNING,
-    HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_SERVICE_ALREADY_RUNNING, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::{
-    DuplicateTokenEx, SetTokenInformation,
-    SecurityImpersonation, TokenPrimary, TokenSessionId,
+    DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
     TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW,
-    PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Environment::CreateEnvironmentBlock;
 use windows_sys::Win32::System::RemoteDesktop::WTSGetActiveConsoleSessionId;
 use windows_sys::Win32::System::Services::{
-    OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
-    StartServiceW, SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO,
-    SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
+    OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, StartServiceW, SC_MANAGER_CONNECT,
+    SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
     SERVICE_STATUS_PROCESS,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateProcessAsUserW, OpenProcess, OpenProcessToken, PROCESS_INFORMATION,
-    PROCESS_QUERY_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, OpenProcess, OpenProcessToken, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, STARTUPINFOW,
 };
 
 use crate::handles::{OwnedEnvironmentBlock, OwnedHandle, OwnedScHandle};
@@ -48,6 +44,10 @@ use crate::registry::to_wide_null;
 use crate::security::{PrivilegeGuard, SE_DEBUG_NAME, SE_IMPERSONATE_NAME, SE_TCB_NAME};
 
 pub const MAXIMUM_ALLOWED: u32 = 0x02000000;
+const TRUSTED_INSTALLER_SERVICE: &str = "TrustedInstaller";
+const SERVICE_START_POLL_ATTEMPTS: usize = 20;
+const SERVICE_START_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const INTERACTIVE_DESKTOP: &str = "winsta0\\default";
 
 #[derive(Error, Debug)]
 pub enum TokenError {
@@ -57,6 +57,8 @@ pub enum TokenError {
     ProcessNotFound(String),
     #[error("Service '{0}' failed to start")]
     ServiceStartFailed(String),
+    #[error("No active interactive console session is available")]
+    NoActiveConsoleSession,
     #[error("Security or privilege error: {0}")]
     SecurityError(#[from] crate::security::SecurityError),
 }
@@ -64,8 +66,13 @@ pub enum TokenError {
 pub type TokenResult<T> = Result<T, TokenError>;
 
 /// Returns the active console interactive session ID.
-pub fn get_active_console_session() -> u32 {
-    unsafe { WTSGetActiveConsoleSessionId() }
+pub fn get_active_console_session() -> TokenResult<u32> {
+    let session_id = unsafe { WTSGetActiveConsoleSessionId() };
+    if session_id == u32::MAX {
+        Err(TokenError::NoActiveConsoleSession)
+    } else {
+        Ok(session_id)
+    }
 }
 
 /// Finds a running process ID by its executable image name (case-insensitive).
@@ -101,20 +108,15 @@ pub fn find_process_id_by_name(image_name: &str) -> TokenResult<u32> {
 
 /// Starts the TrustedInstaller service via SCM and waits until it is in the RUNNING state.
 pub fn ensure_trustedinstaller_service_running() -> TokenResult<u32> {
-    let scm_handle = unsafe {
-        OpenSCManagerW(
-            std::ptr::null(),
-            std::ptr::null(),
-            SC_MANAGER_CONNECT,
-        )
-    };
+    let scm_handle =
+        unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
     if scm_handle.is_null() {
         return Err(TokenError::Win32Error(unsafe { GetLastError() }));
     }
     let owned_scm = OwnedScHandle::from_raw(scm_handle)
         .ok_or_else(|| TokenError::Win32Error(unsafe { GetLastError() }))?;
 
-    let wide_service_name = to_wide_null("TrustedInstaller");
+    let wide_service_name = to_wide_null(TRUSTED_INSTALLER_SERVICE);
     let service_handle = unsafe {
         OpenServiceW(
             owned_scm.as_raw(),
@@ -132,14 +134,14 @@ pub fn ensure_trustedinstaller_service_running() -> TokenResult<u32> {
     let start_res = unsafe { StartServiceW(owned_service.as_raw(), 0, std::ptr::null()) };
     let start_err = unsafe { GetLastError() };
     if start_res == 0 && start_err != ERROR_SERVICE_ALREADY_RUNNING {
-        tracing::warn!(err = start_err, "Service start returned non-zero code");
+        return Err(TokenError::Win32Error(start_err));
     }
 
     // Wait until RUNNING
     let mut status: SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
     let mut bytes_needed = 0;
 
-    for _ in 0..20 {
+    for _ in 0..SERVICE_START_POLL_ATTEMPTS {
         let query_res = unsafe {
             QueryServiceStatusEx(
                 owned_service.as_raw(),
@@ -154,17 +156,18 @@ pub fn ensure_trustedinstaller_service_running() -> TokenResult<u32> {
             return Ok(status.dwProcessId);
         }
 
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(SERVICE_START_POLL_INTERVAL);
     }
 
-    // Fallback: search process by name
-    find_process_id_by_name("TrustedInstaller.exe")
+    Err(TokenError::ServiceStartFailed(
+        TRUSTED_INSTALLER_SERVICE.to_string(),
+    ))
 }
 
 /// Captures and duplicates the primary token from the TrustedInstaller process,
 /// configuring the token session ID for interactive display on target session.
 pub fn duplicate_trustedinstaller_token(target_session_id: u32) -> TokenResult<OwnedHandle> {
-    let _privs = PrivilegeGuard::new(&[SE_DEBUG_NAME, SE_IMPERSONATE_NAME, SE_TCB_NAME])?;
+    let privileges = PrivilegeGuard::new(&[SE_DEBUG_NAME, SE_IMPERSONATE_NAME, SE_TCB_NAME])?;
 
     let pid = ensure_trustedinstaller_service_running()?;
 
@@ -217,8 +220,10 @@ pub fn duplicate_trustedinstaller_token(target_session_id: u32) -> TokenResult<O
         )
     };
     if set_sess_res == 0 {
-        tracing::warn!(err = unsafe { GetLastError() }, "SetTokenInformation(TokenSessionId) warning");
+        return Err(TokenError::Win32Error(unsafe { GetLastError() }));
     }
+
+    privileges.restore()?;
 
     Ok(owned_dup)
 }
@@ -231,13 +236,13 @@ pub fn launch_process_with_token(
 ) -> TokenResult<u32> {
     let mut env_block: *mut c_void = std::ptr::null_mut();
     let env_res = unsafe { CreateEnvironmentBlock(&mut env_block, token.as_raw(), 0) };
-    let _owned_env = if env_res != 0 && !env_block.is_null() {
-        OwnedEnvironmentBlock::from_raw(env_block)
-    } else {
-        None
-    };
+    if env_res == 0 || env_block.is_null() {
+        return Err(TokenError::Win32Error(unsafe { GetLastError() }));
+    }
+    let _owned_env = OwnedEnvironmentBlock::from_raw(env_block)
+        .ok_or_else(|| TokenError::Win32Error(unsafe { GetLastError() }))?;
 
-    let desktop_name = desktop.unwrap_or("winsta0\\default");
+    let desktop_name = desktop.unwrap_or(INTERACTIVE_DESKTOP);
     let mut wide_desktop = to_wide_null(desktop_name);
     let mut wide_cmd = to_wide_null(cmd_line);
 
@@ -247,8 +252,6 @@ pub fn launch_process_with_token(
 
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
-    let flags = 0x00000400; // CREATE_UNICODE_ENVIRONMENT
-
     let proc_res = unsafe {
         CreateProcessAsUserW(
             token.as_raw(),
@@ -257,7 +260,7 @@ pub fn launch_process_with_token(
             std::ptr::null(),
             std::ptr::null(),
             0,
-            flags,
+            CREATE_UNICODE_ENVIRONMENT,
             env_block,
             std::ptr::null(),
             &si,

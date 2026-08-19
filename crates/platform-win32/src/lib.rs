@@ -22,23 +22,22 @@ pub mod tokens;
 
 pub use handles::{OwnedEnvironmentBlock, OwnedHandle, OwnedScHandle};
 pub use registry::{
-    create_key, delete_tree, delete_value, enum_subkeys, from_wide_null, load_hive,
-    open_key, query_value_string, query_value_u32, save_key, set_value_string,
-    set_value_u32, to_wide_null, unload_hive, OwnedHKey, RegResult,
-    RegistryError,
+    create_key, delete_tree, delete_value, enum_subkeys, from_wide_null, load_hive, open_key,
+    open_subkey, query_value_string, query_value_u32, rename_subkey, save_key, set_value_string,
+    set_value_u32, subkey_exists, to_wide_null, unload_hive, OwnedHKey, RegResult, RegistryError,
+    RegistryRoot,
 };
 pub use restart_manager::{
-    LockingProcessInfo, RestartManagerError, RestartManagerSession, RmResult,
-    RM_FORCE_SHUTDOWN, RM_NORMAL_SHUTDOWN,
+    LockingProcessInfo, RestartManagerError, RestartManagerSession, RmResult, RM_FORCE_SHUTDOWN,
+    RM_NORMAL_SHUTDOWN,
 };
 pub use security::{
-    is_reparse_point, lookup_account_by_sid_string, reset_tree_security_safe,
-    sid_to_string, PrivilegeGuard, SecResult, SecurityError,
-    SE_BACKUP_NAME, SE_DEBUG_NAME, SE_IMPERSONATE_NAME, SE_RESTORE_NAME,
+    is_process_elevated, lookup_account_by_sid_string, path_is_reparse_point, PrivilegeGuard,
+    SecResult, SecurityError, SE_BACKUP_NAME, SE_DEBUG_NAME, SE_IMPERSONATE_NAME, SE_RESTORE_NAME,
     SE_TAKE_OWNERSHIP_NAME, SE_TCB_NAME,
 };
 pub use tokens::{
     duplicate_trustedinstaller_token, ensure_trustedinstaller_service_running,
-    find_process_id_by_name, get_active_console_session, launch_process_with_token,
-    TokenError, TokenResult, MAXIMUM_ALLOWED,
+    find_process_id_by_name, get_active_console_session, launch_process_with_token, TokenError,
+    TokenResult, MAXIMUM_ALLOWED,
 };

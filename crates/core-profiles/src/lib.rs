@@ -21,11 +21,10 @@ pub mod models;
 pub mod repair;
 pub mod scanner;
 
-pub use i18n::{t, t_args, I18nManager};
-pub use migration::{MigrationError, MigrationResult, ProfileMigrationEngine};
+pub use i18n::{t, t_args, I18nError, I18nManager};
+pub use migration::{MigrationError, MigrationReceipt, MigrationResult, ProfileMigrationEngine};
 pub use models::{
-    DiagnosticReport, MigrationPlan, ProfileAnomaly, ProfileHealth, RepairPlan,
-    UserProfile,
+    DiagnosticReport, MigrationPlan, ProfileAnomaly, ProfileHealth, RepairPlan, UserProfile,
 };
 pub use repair::{ProfileRepairEngine, RepairError, RepairResult};
 pub use scanner::{ProfileScanner, ScannerError, ScannerResult};

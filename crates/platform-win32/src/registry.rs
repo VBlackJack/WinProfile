@@ -20,12 +20,11 @@ use std::path::Path;
 use thiserror::Error;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW,
-    RegEnumKeyExW, RegLoadKeyW, RegOpenKeyExW, RegQueryValueExW,
-    RegSaveKeyExW, RegSetValueExW, RegUnLoadKeyW, HKEY, HKEY_CLASSES_ROOT,
-    HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS,
-    REG_DWORD, REG_EXPAND_SZ, REG_NO_COMPRESSION, REG_OPTION_NON_VOLATILE,
-    REG_SZ, REG_VALUE_TYPE,
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegEnumKeyExW, RegLoadKeyW,
+    RegOpenKeyExW, RegQueryValueExW, RegRenameKey, RegSaveKeyExW, RegSetValueExW, RegUnLoadKeyW,
+    HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
+    HKEY_USERS, REG_DWORD, REG_EXPAND_SZ, REG_NO_COMPRESSION, REG_OPTION_NON_VOLATILE, REG_SZ,
+    REG_VALUE_TYPE,
 };
 
 #[derive(Error, Debug)]
@@ -34,6 +33,12 @@ pub enum RegistryError {
     Win32Error(u32),
     #[error("Registry value '{0}' not found")]
     ValueNotFound(String),
+    #[error("Registry value '{value}' has type {actual}, expected {expected}")]
+    UnexpectedValueType {
+        value: String,
+        expected: u32,
+        actual: u32,
+    },
     #[error("Invalid UTF-16 registry data")]
     InvalidUtf16,
     #[error("Registry key path cannot be converted to wide string")]
@@ -43,6 +48,28 @@ pub enum RegistryError {
 }
 
 pub type RegResult<T> = Result<T, RegistryError>;
+
+/// Safe selector for the predefined Windows Registry roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryRoot {
+    LocalMachine,
+    CurrentUser,
+    Users,
+    ClassesRoot,
+    CurrentConfig,
+}
+
+impl RegistryRoot {
+    fn as_raw(self) -> HKEY {
+        match self {
+            Self::LocalMachine => HKEY_LOCAL_MACHINE,
+            Self::CurrentUser => HKEY_CURRENT_USER,
+            Self::Users => HKEY_USERS,
+            Self::ClassesRoot => HKEY_CLASSES_ROOT,
+            Self::CurrentConfig => HKEY_CURRENT_CONFIG,
+        }
+    }
+}
 
 /// RAII wrapper around a Windows Registry HKEY handle.
 #[derive(Debug)]
@@ -64,13 +91,6 @@ impl OwnedHKey {
     pub fn as_raw(&self) -> HKEY {
         self.hkey
     }
-
-    /// Predefined standard HKEY constants.
-    pub const LOCAL_MACHINE: HKEY = HKEY_LOCAL_MACHINE;
-    pub const CURRENT_USER: HKEY = HKEY_CURRENT_USER;
-    pub const USERS: HKEY = HKEY_USERS;
-    pub const CLASSES_ROOT: HKEY = HKEY_CLASSES_ROOT;
-    pub const CURRENT_CONFIG: HKEY = HKEY_CURRENT_CONFIG;
 }
 
 impl Drop for OwnedHKey {
@@ -89,9 +109,6 @@ impl Drop for OwnedHKey {
     }
 }
 
-unsafe impl Send for OwnedHKey {}
-unsafe impl Sync for OwnedHKey {}
-
 /// Encodes a string into a null-terminated UTF-16 wide vector.
 pub fn to_wide_null(s: impl AsRef<OsStr>) -> Vec<u16> {
     s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
@@ -104,19 +121,21 @@ pub fn from_wide_null(slice: &[u16]) -> Result<String, RegistryError> {
 }
 
 /// Opens an existing registry key with the requested SAM access mask.
-pub fn open_key(root: HKEY, subkey: &str, sam_desired: u32) -> RegResult<OwnedHKey> {
+pub fn open_key(root: RegistryRoot, subkey: &str, sam_desired: u32) -> RegResult<OwnedHKey> {
+    open_key_raw(root.as_raw(), subkey, sam_desired)
+}
+
+/// Opens a subkey relative to an already-owned registry handle.
+pub fn open_subkey(parent: &OwnedHKey, subkey: &str, sam_desired: u32) -> RegResult<OwnedHKey> {
+    open_key_raw(parent.as_raw(), subkey, sam_desired)
+}
+
+fn open_key_raw(root: HKEY, subkey: &str, sam_desired: u32) -> RegResult<OwnedHKey> {
     let wide_subkey = to_wide_null(subkey);
     let mut hkey_out: HKEY = std::ptr::null_mut();
 
-    let status = unsafe {
-        RegOpenKeyExW(
-            root,
-            wide_subkey.as_ptr(),
-            0,
-            sam_desired,
-            &mut hkey_out,
-        )
-    };
+    let status =
+        unsafe { RegOpenKeyExW(root, wide_subkey.as_ptr(), 0, sam_desired, &mut hkey_out) };
 
     if status == ERROR_SUCCESS {
         OwnedHKey::from_raw(hkey_out).ok_or(RegistryError::Win32Error(status))
@@ -126,14 +145,14 @@ pub fn open_key(root: HKEY, subkey: &str, sam_desired: u32) -> RegResult<OwnedHK
 }
 
 /// Creates or opens a registry key with the specified access mask.
-pub fn create_key(root: HKEY, subkey: &str, sam_desired: u32) -> RegResult<OwnedHKey> {
+pub fn create_key(parent: &OwnedHKey, subkey: &str, sam_desired: u32) -> RegResult<OwnedHKey> {
     let wide_subkey = to_wide_null(subkey);
     let mut hkey_out: HKEY = std::ptr::null_mut();
     let mut disposition: u32 = 0;
 
     let status = unsafe {
         RegCreateKeyExW(
-            root,
+            parent.as_raw(),
             wide_subkey.as_ptr(),
             0,
             std::ptr::null_mut(),
@@ -174,7 +193,11 @@ pub fn query_value_u32(hkey: &OwnedHKey, value_name: &str) -> RegResult<u32> {
         if val_type == REG_DWORD {
             Ok(data)
         } else {
-            Err(RegistryError::Win32Error(status))
+            Err(RegistryError::UnexpectedValueType {
+                value: value_name.to_string(),
+                expected: REG_DWORD,
+                actual: val_type,
+            })
         }
     } else if status == ERROR_FILE_NOT_FOUND {
         Err(RegistryError::ValueNotFound(value_name.to_string()))
@@ -209,10 +232,14 @@ pub fn query_value_string(hkey: &OwnedHKey, value_name: &str) -> RegResult<Strin
     }
 
     if val_type != REG_SZ && val_type != REG_EXPAND_SZ {
-        return Err(RegistryError::Win32Error(status));
+        return Err(RegistryError::UnexpectedValueType {
+            value: value_name.to_string(),
+            expected: REG_SZ,
+            actual: val_type,
+        });
     }
 
-    let u16_len = (data_size as usize + 1) / 2;
+    let u16_len = (data_size as usize).div_ceil(2);
     let mut buffer: Vec<u16> = vec![0; u16_len];
 
     let status = unsafe {
@@ -300,6 +327,27 @@ pub fn delete_tree(hkey: &OwnedHKey, subkey: &str) -> RegResult<()> {
     }
 }
 
+/// Renames a direct child key while preserving all values and subkeys.
+pub fn rename_subkey(hkey: &OwnedHKey, old_name: &str, new_name: &str) -> RegResult<()> {
+    let wide_old = to_wide_null(old_name);
+    let wide_new = to_wide_null(new_name);
+    let status = unsafe { RegRenameKey(hkey.as_raw(), wide_old.as_ptr(), wide_new.as_ptr()) };
+    if status == ERROR_SUCCESS {
+        Ok(())
+    } else {
+        Err(RegistryError::Win32Error(status))
+    }
+}
+
+/// Returns whether a direct child key exists, propagating all errors except not-found.
+pub fn subkey_exists(hkey: &OwnedHKey, subkey: &str) -> RegResult<bool> {
+    match open_subkey(hkey, subkey, windows_sys::Win32::System::Registry::KEY_READ) {
+        Ok(_) => Ok(true),
+        Err(RegistryError::Win32Error(ERROR_FILE_NOT_FOUND)) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Enumerates all subkeys under an open registry key.
 pub fn enum_subkeys(hkey: &OwnedHKey) -> RegResult<Vec<String>> {
     let mut results = Vec::new();
@@ -355,11 +403,11 @@ pub fn save_key(hkey: &OwnedHKey, target_file: &Path) -> RegResult<()> {
 }
 
 /// Mounts an off-line registry hive file into the registry under HKEY_USERS or HKEY_LOCAL_MACHINE.
-pub fn load_hive(root: HKEY, subkey: &str, hive_path: &Path) -> RegResult<()> {
+pub fn load_hive(root: RegistryRoot, subkey: &str, hive_path: &Path) -> RegResult<()> {
     let wide_subkey = to_wide_null(subkey);
     let wide_path = to_wide_null(hive_path.as_os_str());
 
-    let status = unsafe { RegLoadKeyW(root, wide_subkey.as_ptr(), wide_path.as_ptr()) };
+    let status = unsafe { RegLoadKeyW(root.as_raw(), wide_subkey.as_ptr(), wide_path.as_ptr()) };
     if status == ERROR_SUCCESS {
         Ok(())
     } else {
@@ -368,9 +416,9 @@ pub fn load_hive(root: HKEY, subkey: &str, hive_path: &Path) -> RegResult<()> {
 }
 
 /// Unloads the specified off-line registry hive.
-pub fn unload_hive(root: HKEY, subkey: &str) -> RegResult<()> {
+pub fn unload_hive(root: RegistryRoot, subkey: &str) -> RegResult<()> {
     let wide_subkey = to_wide_null(subkey);
-    let status = unsafe { RegUnLoadKeyW(root, wide_subkey.as_ptr()) };
+    let status = unsafe { RegUnLoadKeyW(root.as_raw(), wide_subkey.as_ptr()) };
     if status == ERROR_SUCCESS {
         Ok(())
     } else {

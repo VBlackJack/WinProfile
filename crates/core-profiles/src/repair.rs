@@ -14,38 +14,58 @@
  * limitations under the License.
  */
 
+use chrono::Utc;
 use std::path::Path;
 use thiserror::Error;
-use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, KEY_READ, KEY_WRITE};
+use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::System::Registry::{KEY_ALL_ACCESS, KEY_READ};
 
 use audit_journal::{
-    restore_registry_snapshot, AuditLogger, AuditStatus, SnapshotEngine,
+    restore_registry_snapshot, AuditError, AuditLogger, AuditStatus, RollbackError, SnapshotEngine,
     SnapshotMetadata,
 };
 use platform_win32::{
-    create_key, delete_tree, open_key, query_value_string, query_value_u32,
-    reset_tree_security_safe, set_value_string, set_value_u32,
-    RestartManagerSession,
+    open_key, open_subkey, query_value_string, query_value_u32, rename_subkey, set_value_u32,
+    subkey_exists, RegistryRoot, RestartManagerError, RestartManagerSession,
 };
 
 use crate::constants::*;
 use crate::models::RepairPlan;
 
+const AUDIT_ACTOR: &str = "WinProfile-Admin";
+const BACKUP_SUFFIX: &str = "pre-repair";
+
 #[derive(Error, Debug)]
 pub enum RepairError {
-    #[error("Profile is currently loaded in active session. User must log off first.")]
+    #[error("Profile is currently loaded in an active session; log off before repair")]
     SessionActive,
+    #[error("Repair plan contains no selected operation")]
+    NoActionSelected,
+    #[error("Invalid profile SID: {0}")]
+    InvalidSid(String),
+    #[error("Required registry key is missing: {0}")]
+    MissingRegistryKey(String),
     #[error("Registry operation failed: {0}")]
     RegistryError(#[from] platform_win32::RegistryError),
-    #[error("Security or ACL remediation failed: {0}")]
-    SecurityError(#[from] platform_win32::SecurityError),
     #[error("Snapshot engine error: {0}")]
     SnapshotError(#[from] audit_journal::SnapshotError),
+    #[error("Rollback failed: {0}")]
+    RollbackError(#[from] RollbackError),
+    #[error("Audit logging failed: {0}")]
+    AuditError(#[from] AuditError),
+    #[error("Restart Manager failed: {0}")]
+    RestartManagerError(#[from] RestartManagerError),
     #[error("Transaction failed at step '{step}': {reason}")]
     TransactionFailed { step: String, reason: String },
 }
 
 pub type RepairResult<T> = Result<T, RepairError>;
+
+#[derive(Default)]
+struct RegistryMutation {
+    bak_moved: bool,
+    canonical_backup: Option<String>,
+}
 
 /// Transactional repair executor for Windows user profiles.
 pub struct ProfileRepairEngine<'a> {
@@ -61,151 +81,339 @@ impl<'a> ProfileRepairEngine<'a> {
         }
     }
 
-    /// Executes the full repair plan under snapshot protection and audit tracking.
+    /// Validates and executes a registry-only repair under mandatory snapshot protection.
     pub fn execute_plan(&self, plan: &RepairPlan, is_loaded: bool) -> RepairResult<()> {
-        if is_loaded && !plan.dry_run {
-            return Err(RepairError::SessionActive);
-        }
-
-        let canonical_subkey = format!("{}\\{}", REG_KEY_PROFILE_LIST, plan.canonical_sid);
-        let bak_subkey = format!("{}\\{}{}", REG_KEY_PROFILE_LIST, plan.canonical_sid, BAK_EXTENSION);
-
+        let validation = self.validate_plan(plan, is_loaded)?;
         if plan.dry_run {
             self.audit_logger.log(
                 "RepairDryRun",
-                "WinProfile-Admin",
+                AUDIT_ACTOR,
                 &plan.canonical_sid,
                 AuditStatus::Success,
-                "Simulation completed successfully without altering system state.",
-            );
+                validation,
+            )?;
             return Ok(());
         }
 
-        // 1. Snapshot Phase
-        let mut snapshot: Option<SnapshotMetadata> = None;
-        let target_snapshot_key = if plan.fix_bak {
-            &bak_subkey
-        } else {
-            &canonical_subkey
-        };
-
-        if let Ok(snap) = self.snapshot_engine.create_registry_snapshot(
-            target_snapshot_key,
+        let snapshots = self.create_required_snapshots(plan)?;
+        self.audit_logger.log(
+            "RepairStarted",
+            AUDIT_ACTOR,
             &plan.canonical_sid,
-            &plan.profile_path,
-            "Pre-repair automatic transaction snapshot",
-        ) {
-            snapshot = Some(snap);
-        }
+            AuditStatus::Warning,
+            format!(
+                "Validated repair with {} durable snapshot(s)",
+                snapshots.len()
+            ),
+        )?;
 
-        // 2. Execution Phase
-        let transaction_result = self.execute_transaction_steps(plan, &canonical_subkey, &bak_subkey);
+        let parent = open_key(
+            RegistryRoot::LocalMachine,
+            REG_KEY_PROFILE_LIST,
+            KEY_ALL_ACCESS,
+        )?;
+        let mut mutation = RegistryMutation::default();
+        let execution = self.execute_steps(plan, &parent, &mut mutation);
 
-        // 3. Rollback on Error
-        if let Err(ref err) = transaction_result {
+        if let Err(error) = execution {
+            let rollback = self.rollback(plan, &parent, &mutation, &snapshots);
+            let details = match rollback {
+                Ok(()) => format!("Repair failed and rollback completed: {error}"),
+                Err(rollback_error) => {
+                    let mut reason =
+                        format!("original error: {error}; rollback error: {rollback_error}");
+                    if let Err(audit_error) = self.audit_logger.log(
+                        "RepairRollbackFailed",
+                        AUDIT_ACTOR,
+                        &plan.canonical_sid,
+                        AuditStatus::Failed,
+                        &reason,
+                    ) {
+                        reason.push_str(&format!("; audit error: {audit_error}"));
+                    }
+                    return Err(RepairError::TransactionFailed {
+                        step: "Rollback".to_string(),
+                        reason,
+                    });
+                }
+            };
             self.audit_logger.log(
                 "RepairFailed",
-                "WinProfile-Admin",
+                AUDIT_ACTOR,
                 &plan.canonical_sid,
-                AuditStatus::Failed,
-                format!("Error: {err}. Initiating rollback..."),
-            );
-
-            if let Some(ref snap) = snapshot {
-                let _ = restore_registry_snapshot(snap, Some(self.audit_logger));
-            }
-        } else {
-            self.audit_logger.log(
-                "RepairSuccess",
-                "WinProfile-Admin",
-                &plan.canonical_sid,
-                AuditStatus::Success,
-                "Profile repaired and verified cleanly.",
-            );
+                AuditStatus::RolledBack,
+                details,
+            )?;
+            return Err(error);
         }
 
-        transaction_result
-    }
-
-    fn execute_transaction_steps(
-        &self,
-        plan: &RepairPlan,
-        canonical_subkey: &str,
-        bak_subkey: &str,
-    ) -> RepairResult<()> {
-        // Step A: Unlock NTUSER.DAT if requested
-        if plan.unlock_hive && !plan.profile_path.is_empty() {
-            let ntuser_path = Path::new(&plan.profile_path).join(NTUSER_DAT);
-            if ntuser_path.exists() {
-                if let Ok(rm) = RestartManagerSession::new() {
-                    if rm.register_file(&ntuser_path).is_ok() {
-                        let _ = rm.shutdown_locking_processes(false);
-                    }
-                }
-            }
-        }
-
-        // Step B: Fix .bak key renaming
-        if plan.fix_bak {
-            // If a broken temporary canonical key exists, remove it
-            let _ = delete_tree(
-                &open_key(HKEY_LOCAL_MACHINE, REG_KEY_PROFILE_LIST, KEY_ALL_ACCESS)?,
-                &plan.canonical_sid,
-            );
-
-            // Read values from .bak key
-            let bak_key = open_key(HKEY_LOCAL_MACHINE, bak_subkey, KEY_READ)?;
-            let profile_image_path = query_value_string(&bak_key, VAL_PROFILE_IMAGE_PATH).unwrap_or_default();
-            let guid = query_value_string(&bak_key, VAL_GUID).ok();
-            let flags = query_value_u32(&bak_key, VAL_FLAGS).unwrap_or(0);
-
-            // Create fresh canonical key
-            let parent_key = open_key(HKEY_LOCAL_MACHINE, REG_KEY_PROFILE_LIST, KEY_ALL_ACCESS)?;
-            let new_key = create_key(parent_key.as_raw(), &plan.canonical_sid, KEY_ALL_ACCESS)?;
-
-            if !profile_image_path.is_empty() {
-                set_value_string(&new_key, VAL_PROFILE_IMAGE_PATH, &profile_image_path)?;
-            }
-            if let Some(ref g) = guid {
-                set_value_string(&new_key, VAL_GUID, g)?;
-            }
-            if flags != 0 {
-                set_value_u32(&new_key, VAL_FLAGS, flags)?;
-            }
-
-            // Set clean State and RefCount
-            set_value_u32(&new_key, VAL_STATE, 0)?;
-            set_value_u32(&new_key, VAL_REF_COUNT, 0)?;
-
-            // Delete old .bak key
-            let _ = delete_tree(&parent_key, &format!("{}{}", plan.canonical_sid, BAK_EXTENSION));
-        }
-
-        // Step C: Reset State / RefCount if not already done by .bak fix
-        if plan.reset_state && !plan.fix_bak {
-            let key = open_key(HKEY_LOCAL_MACHINE, canonical_subkey, KEY_WRITE)?;
-            set_value_u32(&key, VAL_STATE, 0)?;
-            set_value_u32(&key, VAL_REF_COUNT, 0)?;
-        }
-
-        // Step D: Reassign ownership & fix NTFS DACL
-        if plan.fix_acls && !plan.profile_path.is_empty() {
-            let path_obj = Path::new(&plan.profile_path);
-            if path_obj.exists() {
-                reset_tree_security_safe(path_obj, &plan.canonical_sid)?;
-            }
-        }
-
-        // Verification Step: Verify canonical key exists and State == 0
-        let verify_key = open_key(HKEY_LOCAL_MACHINE, canonical_subkey, KEY_READ)?;
-        let state = query_value_u32(&verify_key, VAL_STATE).unwrap_or(1);
-        if state != 0 {
-            return Err(RepairError::TransactionFailed {
-                step: "Verification".into(),
-                reason: format!("State mask remains dirty: {state}"),
-            });
+        if let Err(audit_error) = self.audit_logger.log(
+            "RepairSuccess",
+            AUDIT_ACTOR,
+            &plan.canonical_sid,
+            AuditStatus::Success,
+            format!(
+                "Repair verified; preserved prior canonical key: {}",
+                mutation.canonical_backup.as_deref().unwrap_or("none")
+            ),
+        ) {
+            self.rollback(plan, &parent, &mutation, &snapshots)?;
+            return Err(audit_error.into());
         }
 
         Ok(())
+    }
+
+    fn validate_plan(&self, plan: &RepairPlan, is_loaded: bool) -> RepairResult<String> {
+        if !plan.fix_bak && !plan.reset_state && !plan.unlock_hive {
+            return Err(RepairError::NoActionSelected);
+        }
+        if !is_valid_sid(&plan.canonical_sid) {
+            return Err(RepairError::InvalidSid(plan.canonical_sid.clone()));
+        }
+        let bak_sid = format!("{}{}", plan.canonical_sid, BAK_EXTENSION);
+        if plan.sid != plan.canonical_sid && plan.sid != bak_sid {
+            return Err(RepairError::InvalidSid(plan.sid.clone()));
+        }
+        let live_loaded = match open_key(RegistryRoot::Users, &plan.canonical_sid, KEY_READ) {
+            Ok(_) => true,
+            Err(platform_win32::RegistryError::Win32Error(ERROR_FILE_NOT_FOUND)) => false,
+            Err(error) => return Err(error.into()),
+        };
+        if is_loaded || live_loaded {
+            return Err(RepairError::SessionActive);
+        }
+
+        let parent = open_key(RegistryRoot::LocalMachine, REG_KEY_PROFILE_LIST, KEY_READ)?;
+        let canonical_name = &plan.canonical_sid;
+        let bak_name = format!("{canonical_name}{BAK_EXTENSION}");
+        if !subkey_exists(&parent, &plan.sid)? {
+            return Err(RepairError::MissingRegistryKey(plan.sid.clone()));
+        }
+        let selected_key = open_subkey(&parent, &plan.sid, KEY_READ)?;
+        let selected_profile_path = query_value_string(&selected_key, VAL_PROFILE_IMAGE_PATH)?;
+        if normalize_profile_path(&selected_profile_path)
+            != normalize_profile_path(&plan.profile_path)
+        {
+            return Err(RepairError::TransactionFailed {
+                step: "Preflight".to_string(),
+                reason: format!(
+                    "selected registry path '{}' does not match plan path '{}'",
+                    selected_profile_path, plan.profile_path
+                ),
+            });
+        }
+
+        if plan.fix_bak {
+            if !subkey_exists(&parent, &bak_name)? {
+                return Err(RepairError::MissingRegistryKey(bak_name));
+            }
+            let bak = open_subkey(&parent, &bak_name, KEY_READ)?;
+            let profile_path = query_value_string(&bak, VAL_PROFILE_IMAGE_PATH)?;
+            if profile_path.trim().is_empty() {
+                return Err(RepairError::TransactionFailed {
+                    step: "Preflight".to_string(),
+                    reason: "the .bak key has an empty ProfileImagePath".to_string(),
+                });
+            }
+        } else if plan.reset_state && !subkey_exists(&parent, canonical_name)? {
+            return Err(RepairError::MissingRegistryKey(canonical_name.clone()));
+        }
+
+        if plan.unlock_hive {
+            let profile_path = Path::new(&plan.profile_path);
+            if plan.profile_path.trim().is_empty() || !profile_path.is_dir() {
+                return Err(RepairError::TransactionFailed {
+                    step: "Preflight".to_string(),
+                    reason: "unlock requires an existing profile directory".to_string(),
+                });
+            }
+        }
+
+        Ok(format!(
+            "Preflight passed: fix_bak={}, reset_state={}, unlock_hive={}, canonical_exists={}",
+            plan.fix_bak,
+            plan.reset_state,
+            plan.unlock_hive,
+            subkey_exists(&parent, canonical_name)?
+        ))
+    }
+
+    fn create_required_snapshots(&self, plan: &RepairPlan) -> RepairResult<Vec<SnapshotMetadata>> {
+        let mut paths = Vec::new();
+        let canonical_path = format!("{REG_KEY_PROFILE_LIST}\\{}", plan.canonical_sid);
+        let bak_path = format!("{canonical_path}{BAK_EXTENSION}");
+
+        if plan.fix_bak {
+            paths.push(bak_path);
+            let parent = open_key(RegistryRoot::LocalMachine, REG_KEY_PROFILE_LIST, KEY_READ)?;
+            if subkey_exists(&parent, &plan.canonical_sid)? {
+                paths.push(canonical_path);
+            }
+        } else if plan.reset_state {
+            paths.push(canonical_path);
+        }
+
+        let mut snapshots = Vec::with_capacity(paths.len());
+        for path in paths {
+            snapshots.push(self.snapshot_engine.create_registry_snapshot(
+                &path,
+                &plan.canonical_sid,
+                &plan.profile_path,
+                "Mandatory pre-repair snapshot",
+            )?);
+        }
+        Ok(snapshots)
+    }
+
+    fn execute_steps(
+        &self,
+        plan: &RepairPlan,
+        parent: &platform_win32::OwnedHKey,
+        mutation: &mut RegistryMutation,
+    ) -> RepairResult<()> {
+        if plan.unlock_hive {
+            self.unlock_hive(plan)?;
+        }
+
+        let canonical_name = &plan.canonical_sid;
+        let bak_name = format!("{canonical_name}{BAK_EXTENSION}");
+        if plan.fix_bak {
+            if subkey_exists(parent, canonical_name)? {
+                let backup_name = format!(
+                    "{canonical_name}.{BACKUP_SUFFIX}-{}",
+                    Utc::now().format("%Y%m%dT%H%M%S%.6fZ")
+                );
+                if subkey_exists(parent, &backup_name)? {
+                    return Err(RepairError::TransactionFailed {
+                        step: "RegistryRename".to_string(),
+                        reason: format!("backup key already exists: {backup_name}"),
+                    });
+                }
+                rename_subkey(parent, canonical_name, &backup_name)?;
+                mutation.canonical_backup = Some(backup_name);
+            }
+
+            rename_subkey(parent, &bak_name, canonical_name)?;
+            mutation.bak_moved = true;
+        }
+
+        if plan.reset_state {
+            let canonical = open_subkey(parent, canonical_name, KEY_ALL_ACCESS)?;
+            set_value_u32(&canonical, VAL_STATE, 0)?;
+            set_value_u32(&canonical, VAL_REF_COUNT, 0)?;
+        }
+
+        self.verify(plan, parent)
+    }
+
+    fn unlock_hive(&self, plan: &RepairPlan) -> RepairResult<()> {
+        let ntuser_path = Path::new(&plan.profile_path).join(NTUSER_DAT);
+        if !ntuser_path.exists() {
+            return Ok(());
+        }
+        let manager = RestartManagerSession::new()?;
+        manager.register_file(&ntuser_path)?;
+        let processes = manager.get_locking_processes()?;
+        if processes.is_empty() {
+            return Ok(());
+        }
+        manager.shutdown_locking_processes(false)?;
+        let remaining = manager.get_locking_processes()?;
+        if !remaining.is_empty() {
+            return Err(RepairError::TransactionFailed {
+                step: "UnlockHive".to_string(),
+                reason: format!("{} process(es) still hold NTUSER.DAT", remaining.len()),
+            });
+        }
+        Ok(())
+    }
+
+    fn verify(&self, plan: &RepairPlan, parent: &platform_win32::OwnedHKey) -> RepairResult<()> {
+        if !subkey_exists(parent, &plan.canonical_sid)? {
+            return Err(RepairError::MissingRegistryKey(plan.canonical_sid.clone()));
+        }
+        if plan.fix_bak
+            && subkey_exists(parent, &format!("{}{}", plan.canonical_sid, BAK_EXTENSION))?
+        {
+            return Err(RepairError::TransactionFailed {
+                step: "Verification".to_string(),
+                reason: "the .bak key still exists".to_string(),
+            });
+        }
+        let canonical = open_subkey(parent, &plan.canonical_sid, KEY_READ)?;
+        if query_value_string(&canonical, VAL_PROFILE_IMAGE_PATH)?
+            .trim()
+            .is_empty()
+        {
+            return Err(RepairError::TransactionFailed {
+                step: "Verification".to_string(),
+                reason: "ProfileImagePath is empty".to_string(),
+            });
+        }
+        if plan.reset_state {
+            let state = query_value_u32(&canonical, VAL_STATE)?;
+            let ref_count = query_value_u32(&canonical, VAL_REF_COUNT)?;
+            if state != 0 || ref_count != 0 {
+                return Err(RepairError::TransactionFailed {
+                    step: "Verification".to_string(),
+                    reason: format!("State={state}, RefCount={ref_count}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback(
+        &self,
+        plan: &RepairPlan,
+        parent: &platform_win32::OwnedHKey,
+        mutation: &RegistryMutation,
+        snapshots: &[SnapshotMetadata],
+    ) -> RepairResult<()> {
+        let canonical_name = &plan.canonical_sid;
+        let bak_name = format!("{canonical_name}{BAK_EXTENSION}");
+
+        if mutation.bak_moved && subkey_exists(parent, canonical_name)? {
+            rename_subkey(parent, canonical_name, &bak_name)?;
+        }
+        if let Some(backup_name) = mutation.canonical_backup.as_deref() {
+            if subkey_exists(parent, backup_name)? {
+                rename_subkey(parent, backup_name, canonical_name)?;
+            }
+        }
+        for snapshot in snapshots {
+            restore_registry_snapshot(snapshot, Some(self.audit_logger))?;
+        }
+        Ok(())
+    }
+}
+
+fn is_valid_sid(value: &str) -> bool {
+    value.starts_with("S-1-")
+        && value
+            .split('-')
+            .skip(1)
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn normalize_profile_path(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches(['\\', '/'])
+        .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_sid;
+
+    #[test]
+    fn sid_validation_is_strict() {
+        assert!(is_valid_sid("S-1-5-21-1001"));
+        assert!(!is_valid_sid("S-1-5-21-1001.bak"));
+        assert!(!is_valid_sid("S-1-5-21-abc"));
+        assert!(!is_valid_sid("S-1-5-21-"));
+        assert!(!is_valid_sid(""));
     }
 }

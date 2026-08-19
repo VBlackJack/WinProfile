@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
+use crate::i18n::t;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use crate::i18n::t;
 
 /// Specific anomaly detected during profile scanning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +28,10 @@ pub enum ProfileAnomaly {
     DirtyStateMask(u32),
     LockedNtUserDat(Vec<String>),
     MissingDirectory(String),
-    AclOwnershipMismatch,
+    RegistryReadFailure(String),
+    SidResolutionFailure(String),
+    FilesystemScanFailure(String),
+    LockInspectionFailure(String),
 }
 
 impl ProfileAnomaly {
@@ -41,8 +44,11 @@ impl ProfileAnomaly {
             ProfileAnomaly::PathCollision(_) => t("profile.status.path_collision"),
             ProfileAnomaly::DirtyStateMask(_) => t("profile.status.dirty_state"),
             ProfileAnomaly::LockedNtUserDat(_) => t("profile.status.hive_locked"),
-            ProfileAnomaly::MissingDirectory(_) => t("profile.status.bak_suffix"),
-            ProfileAnomaly::AclOwnershipMismatch => t("profile.status.acl_corrupted"),
+            ProfileAnomaly::MissingDirectory(_) => t("profile.status.missing_directory"),
+            ProfileAnomaly::RegistryReadFailure(_) => t("profile.status.registry_read_failure"),
+            ProfileAnomaly::SidResolutionFailure(_) => t("profile.status.sid_resolution_failure"),
+            ProfileAnomaly::FilesystemScanFailure(_) => t("profile.status.filesystem_scan_failure"),
+            ProfileAnomaly::LockInspectionFailure(_) => t("profile.status.lock_inspection_failure"),
         }
     }
 }
@@ -79,7 +85,14 @@ impl UserProfile {
     /// Computes overall health based on detected anomalies.
     pub fn compute_health(&mut self) {
         if self.is_bak
-            || self.anomalies.iter().any(|a| matches!(a, ProfileAnomaly::BakSuffix | ProfileAnomaly::TempSession | ProfileAnomaly::PathCollision(_)))
+            || self.anomalies.iter().any(|a| {
+                matches!(
+                    a,
+                    ProfileAnomaly::BakSuffix
+                        | ProfileAnomaly::TempSession
+                        | ProfileAnomaly::PathCollision(_)
+                )
+            })
         {
             self.health = ProfileHealth::Corrupted;
         } else if !self.anomalies.is_empty() {
@@ -109,7 +122,6 @@ pub struct RepairPlan {
     pub profile_path: String,
     pub fix_bak: bool,
     pub reset_state: bool,
-    pub fix_acls: bool,
     pub unlock_hive: bool,
     pub dry_run: bool,
 }
@@ -119,9 +131,7 @@ pub struct RepairPlan {
 pub struct MigrationPlan {
     pub source_sid: String,
     pub source_path: String,
-    pub target_account: String,
     pub target_path: String,
     pub include_roaming_appdata: bool,
     pub include_personal_folders: bool,
-    pub include_registry_software: bool,
 }

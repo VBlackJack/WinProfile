@@ -16,8 +16,8 @@
 
 use std::ffi::c_void;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::System::Services::{CloseServiceHandle, SC_HANDLE};
 use windows_sys::Win32::System::Environment::DestroyEnvironmentBlock;
+use windows_sys::Win32::System::Services::{CloseServiceHandle, SC_HANDLE};
 
 /// RAII wrapper around a Win32 generic HANDLE.
 /// Automatically invokes `CloseHandle` on drop if valid.
@@ -65,9 +65,6 @@ impl Drop for OwnedHandle {
     }
 }
 
-unsafe impl Send for OwnedHandle {}
-unsafe impl Sync for OwnedHandle {}
-
 /// RAII wrapper around a Service Control Manager SC_HANDLE.
 /// Automatically invokes `CloseServiceHandle` on drop if valid.
 #[derive(Debug)]
@@ -105,9 +102,6 @@ impl Drop for OwnedScHandle {
         }
     }
 }
-
-unsafe impl Send for OwnedScHandle {}
-unsafe impl Sync for OwnedScHandle {}
 
 /// RAII wrapper for a user environment block allocated via `CreateEnvironmentBlock`.
 #[derive(Debug)]

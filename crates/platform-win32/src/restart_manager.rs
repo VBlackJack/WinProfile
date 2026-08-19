@@ -18,8 +18,8 @@ use std::path::Path;
 use thiserror::Error;
 use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
 use windows_sys::Win32::System::RestartManager::{
-    RmEndSession, RmGetList, RmRegisterResources, RmShutdown, RmStartSession,
-    RM_PROCESS_INFO, RmForceShutdown,
+    RmEndSession, RmForceShutdown, RmGetList, RmRegisterResources, RmShutdown, RmStartSession,
+    RM_PROCESS_INFO,
 };
 
 use crate::registry::to_wide_null;
@@ -60,9 +60,7 @@ impl RestartManagerSession {
         let mut session_handle: u32 = 0;
         let mut session_key = [0u16; 33];
 
-        let status = unsafe {
-            RmStartSession(&mut session_handle, 0, session_key.as_mut_ptr())
-        };
+        let status = unsafe { RmStartSession(&mut session_handle, 0, session_key.as_mut_ptr()) };
 
         if status == ERROR_SUCCESS {
             Ok(Self {
@@ -123,7 +121,8 @@ impl RestartManagerSession {
             return Ok(Vec::new());
         }
 
-        let mut proc_infos: Vec<RM_PROCESS_INFO> = vec![unsafe { std::mem::zeroed() }; proc_info_needed as usize];
+        let mut proc_infos: Vec<RM_PROCESS_INFO> =
+            vec![unsafe { std::mem::zeroed() }; proc_info_needed as usize];
         proc_info_count = proc_info_needed;
 
         let status = unsafe {
@@ -142,10 +141,18 @@ impl RestartManagerSession {
 
         let mut results = Vec::new();
         for info in &proc_infos[..proc_info_count as usize] {
-            let name_len = info.strAppName.iter().position(|&c| c == 0).unwrap_or(info.strAppName.len());
+            let name_len = info
+                .strAppName
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(info.strAppName.len());
             let app_name = String::from_utf16_lossy(&info.strAppName[..name_len]);
 
-            let svc_len = info.strServiceShortName.iter().position(|&c| c == 0).unwrap_or(info.strServiceShortName.len());
+            let svc_len = info
+                .strServiceShortName
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(info.strServiceShortName.len());
             let svc_name = String::from_utf16_lossy(&info.strServiceShortName[..svc_len]);
 
             results.push(LockingProcessInfo {
@@ -168,9 +175,7 @@ impl RestartManagerSession {
             RM_NORMAL_SHUTDOWN
         };
 
-        let status = unsafe {
-            RmShutdown(self.session_handle, flags, None)
-        };
+        let status = unsafe { RmShutdown(self.session_handle, flags, None) };
 
         if status == ERROR_SUCCESS {
             Ok(())

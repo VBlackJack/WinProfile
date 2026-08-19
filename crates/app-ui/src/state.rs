@@ -28,7 +28,7 @@ pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
     };
 
     let status_text = if profile.anomalies.is_empty() {
-        "Healthy".to_string()
+        core_profiles::t("profile.status.healthy")
     } else {
         profile
             .anomalies
@@ -61,18 +61,23 @@ pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
 }
 
 pub fn audit_entry_to_slint(entry: &AuditEntry) -> AuditLogEntry {
-    let status_str = match entry.status {
-        AuditStatus::Success => "Success",
-        AuditStatus::Warning => "Warning",
-        AuditStatus::Failed => "Failed",
-        AuditStatus::RolledBack => "RolledBack",
+    let (status_str, status_type) = match entry.status {
+        AuditStatus::Success => (core_profiles::t("audit.status.success"), 0),
+        AuditStatus::Warning => (core_profiles::t("audit.status.warning"), 1),
+        AuditStatus::Failed => (core_profiles::t("audit.status.failed"), 2),
+        AuditStatus::RolledBack => (core_profiles::t("audit.status.rolled_back"), 3),
     };
 
     AuditLogEntry {
-        timestamp: entry.timestamp.format("%Y-%m-%d %H:%M:%S").to_string().into(),
+        timestamp: entry
+            .timestamp
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+            .into(),
         operation: entry.operation.clone().into(),
         target: entry.target.clone().into(),
         status: status_str.into(),
+        status_type,
         details: entry.details.clone().into(),
     }
 }

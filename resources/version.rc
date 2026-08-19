@@ -18,12 +18,11 @@
 #include <windows.h>
 
 #define IDI_APP_ICON 1
-#define IDR_MANIFEST 1
 
 // Version resource definition
 1 VERSIONINFO
-FILEVERSION 2026,8,19,0
-PRODUCTVERSION 2026,8,19,0
+FILEVERSION 2026,819,0,0
+PRODUCTVERSION 2026,819,0,0
 FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
 FILEFLAGS 0x1L
@@ -40,12 +39,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Julien Bombled\0"
             VALUE "FileDescription", "WinProfile Suite - Windows User Profile Repair & Migration Suite\0"
-            VALUE "FileVersion", "2026.0819.00\0"
-            VALUE "InternalName", "winprofile-suite\0"
+            VALUE "FileVersion", "2026.819.0\0"
+            VALUE "InternalName", "winprofile-admin\0"
             VALUE "LegalCopyright", "Copyright 2026 Julien Bombled. Licensed under Apache-2.0.\0"
             VALUE "OriginalFilename", "winprofile-admin.exe\0"
             VALUE "ProductName", "WinProfile Suite\0"
-            VALUE "ProductVersion", "2026.0819.00\0"
+            VALUE "ProductVersion", "2026.819.0\0"
         END
     END
     BLOCK "VarFileInfo"

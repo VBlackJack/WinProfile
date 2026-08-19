@@ -23,11 +23,12 @@ description = "Slint GUI frontend for WinProfile Suite (winprofile-admin.exe)"
 [[bin]]
 name = "winprofile-admin"
 path = "src/main.rs"
+test = false
+bench = false
 
 [dependencies]
 platform-win32.workspace = true
 audit-journal.workspace = true
-broker-protocol.workspace = true
 core-profiles.workspace = true
 slint.workspace = true
 serde.workspace = true
@@ -41,3 +42,5 @@ windows-sys.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true
+embed-manifest.workspace = true
+embed-resource.workspace = true

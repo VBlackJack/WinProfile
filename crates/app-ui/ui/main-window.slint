@@ -15,7 +15,7 @@
  */
 
 import { DraculaTheme } from "theme.slint";
-import { Button, CheckBox, LineEdit, ScrollView, ProgressIndicator } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ListView, ProgressIndicator } from "std-widgets.slint";
 
 export struct ProfileEntry {
     sid: string,
@@ -24,7 +24,7 @@ export struct ProfileEntry {
     domain: string,
     profile_path: string,
     status_text: string,
-    health_type: int, // 0: Healthy, 1: Warning, 2: Corrupted
+    health_type: int,
     loaded: bool,
     is_bak: bool,
     state_raw: string,
@@ -36,77 +36,94 @@ export struct AuditLogEntry {
     operation: string,
     target: string,
     status: string,
+    status_type: int,
     details: string,
 }
 
-component NavTab {
-    in property <string> text;
-    in property <bool> active;
-    callback clicked();
-
-    Rectangle {
-        background: active ? DraculaTheme.selection : transparent;
-        border-radius: DraculaTheme.border-radius;
-        animate background { duration: 150ms; }
-
-        TouchArea {
-            clicked => { root.clicked(); }
-        }
-
-        HorizontalLayout {
-            padding-left: DraculaTheme.spacing-md;
-            padding-right: DraculaTheme.spacing-md;
-            padding-top: DraculaTheme.spacing-sm;
-            padding-bottom: DraculaTheme.spacing-sm;
-            spacing: DraculaTheme.spacing-sm;
-
-            Text {
-                text: root.text;
-                color: active ? DraculaTheme.purple : DraculaTheme.foreground;
-                font-family: DraculaTheme.font-family;
-                font-size: 13px;
-                font-weight: active ? 700 : 500;
-                vertical-alignment: center;
-            }
-        }
-    }
+export global AppStrings {
+    in-out property <string> window-title;
+    in-out property <string> app-title;
+    in-out property <string> app-subtitle;
+    in-out property <string> app-version;
+    in-out property <string> app-license;
+    in-out property <string> nav-dashboard;
+    in-out property <string> nav-repair;
+    in-out property <string> nav-migration;
+    in-out property <string> nav-maintenance;
+    in-out property <string> nav-logs;
+    in-out property <string> elevated;
+    in-out property <string> unelevated;
+    in-out property <string> scan;
+    in-out property <string> total;
+    in-out property <string> healthy;
+    in-out property <string> corrupted;
+    in-out property <string> temporary;
+    in-out property <string> column-account;
+    in-out property <string> column-sid;
+    in-out property <string> column-path;
+    in-out property <string> column-status;
+    in-out property <string> column-loaded;
+    in-out property <string> column-action;
+    in-out property <string> select;
+    in-out property <string> yes;
+    in-out property <string> no;
+    in-out property <string> no-profiles;
+    in-out property <string> repair-title;
+    in-out property <string> target-account;
+    in-out property <string> target-sid;
+    in-out property <string> profile-path;
+    in-out property <string> anomalies;
+    in-out property <string> none-selected;
+    in-out property <string> loaded-warning;
+    in-out property <string> repair-pipeline;
+    in-out property <string> fix-bak;
+    in-out property <string> reset-state;
+    in-out property <string> unlock-hive;
+    in-out property <string> dry-run;
+    in-out property <string> execute-repair;
+    in-out property <string> migration-title;
+    in-out property <string> migration-warning;
+    in-out property <string> migration-source;
+    in-out property <string> migration-target;
+    in-out property <string> migration-placeholder;
+    in-out property <string> include-roaming;
+    in-out property <string> include-docs;
+    in-out property <string> start-migration;
+    in-out property <string> cancel-migration;
+    in-out property <string> maintenance-title;
+    in-out property <string> maintenance-description;
+    in-out property <string> launch-ti;
+    in-out property <string> audit-title;
+    in-out property <string> clear-audit;
+    in-out property <string> export-audit;
+    in-out property <string> audit-timestamp;
+    in-out property <string> audit-operation;
+    in-out property <string> audit-target;
+    in-out property <string> audit-result;
+    in-out property <string> audit-details;
+    in-out property <string> confirm;
+    in-out property <string> cancel;
 }
 
-component StatCard {
-    in property <string> title;
+component StatCard inherits Rectangle {
+    in property <string> card-title;
     in property <string> value;
     in property <color> accent-color;
+    background: DraculaTheme.card-bg;
+    border-radius: DraculaTheme.border-radius;
+    border-width: 1px;
+    border-color: DraculaTheme.card-border;
 
-    Rectangle {
-        background: DraculaTheme.card-bg;
-        border-radius: DraculaTheme.border-radius;
-        border-width: 1px;
-        border-color: DraculaTheme.card-border;
-
-        VerticalLayout {
-            padding: DraculaTheme.spacing-md;
-            spacing: DraculaTheme.spacing-sm;
-
-            Text {
-                text: root.title;
-                color: DraculaTheme.text-secondary;
-                font-family: DraculaTheme.font-family;
-                font-size: 12px;
-            }
-
-            Text {
-                text: root.value;
-                color: root.accent-color;
-                font-family: DraculaTheme.font-family;
-                font-size: 24px;
-                font-weight: 700;
-            }
-        }
+    VerticalLayout {
+        padding: DraculaTheme.spacing-md;
+        spacing: 4px;
+        Text { text: root.card-title; color: DraculaTheme.text-secondary; font-size: 12px; }
+        Text { text: root.value; color: root.accent-color; font-size: 23px; font-weight: 700; }
     }
 }
 
 export component MainWindow inherits Window {
-    title: "WinProfile Suite - Windows Profile Repair & Migration";
+    title: AppStrings.window-title;
     min-width: 1040px;
     min-height: 720px;
     preferred-width: 1180px;
@@ -114,599 +131,348 @@ export component MainWindow inherits Window {
     background: DraculaTheme.background;
     default-font-family: DraculaTheme.font-family;
 
-    // View state
     in-out property <int> active-tab: 0;
-    in-out property <string> status-message: "Ready";
-    in-out property <bool> is-elevated: true;
-    in-out property <bool> is-broker-connected: false;
-
-    // Data lists
+    in-out property <string> status-message;
+    in-out property <bool> is-elevated: false;
+    in-out property <bool> operation-busy: false;
+    in-out property <bool> migration-running: false;
     in-out property <[ProfileEntry]> profiles: [];
     in-out property <[AuditLogEntry]> audit-entries: [];
-
-    // Stats
     in-out property <int> total-profiles-count: 0;
     in-out property <int> healthy-count: 0;
     in-out property <int> corrupted-count: 0;
     in-out property <int> temp-count: 0;
-
-    // Selection
     in-out property <int> selected-idx: -1;
-    in-out property <string> selected-sid: "";
-    in-out property <string> selected-path: "";
-    in-out property <string> selected-username: "";
-    in-out property <string> selected-anomalies: "";
+    in-out property <string> selected-sid;
+    in-out property <string> selected-path;
+    in-out property <string> selected-username;
+    in-out property <string> selected-anomalies;
     in-out property <bool> selected-loaded: false;
-
-    // Repair options
-    in-out property <bool> repair-fix-bak: true;
-    in-out property <bool> repair-reset-state: true;
-    in-out property <bool> repair-fix-acls: true;
-    in-out property <bool> repair-unlock-hive: true;
-
-    // Migration options
-    in-out property <string> migration-target-account: "";
-    in-out property <bool> migration-include-roaming: true;
-    in-out property <bool> migration-include-docs: true;
+    in-out property <bool> repair-fix-bak: false;
+    in-out property <bool> repair-reset-state: false;
+    in-out property <bool> repair-unlock-hive: false;
+    in-out property <string> migration-target-path;
+    in-out property <bool> migration-include-roaming: false;
+    in-out property <bool> migration-include-docs: false;
     in-out property <float> migration-progress: 0.0;
-    in-out property <string> migration-status: "";
+    in-out property <string> migration-status;
+    in-out property <bool> confirmation-visible: false;
+    in-out property <int> confirmation-kind: -1;
+    in-out property <string> confirmation-title;
+    in-out property <string> confirmation-message;
 
-    // Callbacks
     callback scan-profiles();
     callback select-profile(int);
-    callback execute-repair(bool); // dry_run
+    callback execute-dry-run();
+    callback request-repair();
     callback start-migration();
-    callback launch-ti-console();
-    callback test-broker-pipe();
+    callback cancel-migration();
+    callback request-ti-console();
+    callback confirm-action(int);
     callback export-audit-json();
     callback clear-audit-logs();
 
-    VerticalLayout {
-        padding: 0;
-        spacing: 0;
+    Rectangle {
+        background: DraculaTheme.background;
 
-        // Top Header
-        Rectangle {
-            height: 60px;
-            background: DraculaTheme.current-line;
+        VerticalLayout {
+            spacing: 0;
 
-            HorizontalLayout {
-                padding-left: DraculaTheme.spacing-lg;
-                padding-right: DraculaTheme.spacing-lg;
-                alignment: space-between;
-
-                // Logo & Title
-                VerticalLayout {
-                    alignment: center;
-                    Text {
-                        text: "WinProfile Suite";
-                        color: DraculaTheme.purple;
-                        font-size: 18px;
-                        font-weight: 800;
-                    }
-                    Text {
-                        text: "Windows User Profile Repair & Migration Suite - Julien Bombled";
-                        color: DraculaTheme.comment;
-                        font-size: 11px;
-                    }
-                }
-
-                // Elevation Badge & Scan Button
+            Rectangle {
+                height: 62px;
+                background: DraculaTheme.current-line;
                 HorizontalLayout {
-                    alignment: end;
-                    spacing: DraculaTheme.spacing-md;
-
-                    Rectangle {
-                        height: 28px;
-                        background: root.is-elevated ? #2e4a3e : #4a2e2e;
-                        border-radius: 4px;
-                        border-width: 1px;
-                        border-color: root.is-elevated ? DraculaTheme.green : DraculaTheme.red;
-
-                        HorizontalLayout {
-                            padding-left: 10px;
-                            padding-right: 10px;
-                            alignment: center;
-                            Text {
-                                text: root.is-elevated ? "Elevated (Administrator)" : "Standard User (Read-Only)";
-                                color: root.is-elevated ? DraculaTheme.green : DraculaTheme.red;
-                                font-size: 11px;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-
-                    Button {
-                        text: "Scan Profiles";
-                        primary: true;
-                        clicked => { root.scan-profiles(); }
-                    }
-                }
-            }
-        }
-
-        // Navigation Bar
-        Rectangle {
-            height: 44px;
-            background: #21222c;
-
-            HorizontalLayout {
-                padding-left: DraculaTheme.spacing-lg;
-                padding-right: DraculaTheme.spacing-lg;
-                spacing: DraculaTheme.spacing-sm;
-                alignment: start;
-
-                NavTab {
-                    text: "Inventory & Health";
-                    active: root.active-tab == 0;
-                    clicked => { root.active-tab = 0; }
-                }
-                NavTab {
-                    text: "Transactional Repair";
-                    active: root.active-tab == 1;
-                    clicked => { root.active-tab = 1; }
-                }
-                NavTab {
-                    text: "Profile Migration";
-                    active: root.active-tab == 2;
-                    clicked => { root.active-tab = 2; }
-                }
-                NavTab {
-                    text: "SecOps Broker Console";
-                    active: root.active-tab == 3;
-                    clicked => { root.active-tab = 3; }
-                }
-                NavTab {
-                    text: "Audit Journal";
-                    active: root.active-tab == 4;
-                    clicked => { root.active-tab = 4; }
-                }
-            }
-        }
-
-        // Main Content Views
-        Rectangle {
-            background: DraculaTheme.background;
-
-            // Tab 0: Inventory & Health
-            if root.active-tab == 0: VerticalLayout {
-                padding: DraculaTheme.spacing-lg;
-                spacing: DraculaTheme.spacing-md;
-
-                // KPI Stat Cards
-                HorizontalLayout {
-                    spacing: DraculaTheme.spacing-md;
-                    height: 80px;
-
-                    StatCard {
-                        title: "Total Profiles";
-                        value: root.total-profiles-count;
-                        accent-color: DraculaTheme.cyan;
-                    }
-                    StatCard {
-                        title: "Healthy";
-                        value: root.healthy-count;
-                        accent-color: DraculaTheme.green;
-                    }
-                    StatCard {
-                        title: "Anomalies Detected";
-                        value: root.corrupted-count;
-                        accent-color: DraculaTheme.orange;
-                    }
-                    StatCard {
-                        title: "Temporary (.bak/TEMP)";
-                        value: root.temp-count;
-                        accent-color: DraculaTheme.red;
-                    }
-                }
-
-                // Profile Table
-                Rectangle {
-                    background: DraculaTheme.card-bg;
-                    border-radius: DraculaTheme.border-radius;
-                    border-width: 1px;
-                    border-color: DraculaTheme.card-border;
-
-                    VerticalLayout {
-                        padding: DraculaTheme.spacing-sm;
-
-                        // Table Header
-                        Rectangle {
-                            height: 32px;
-                            background: DraculaTheme.current-line;
-                            border-radius: 4px;
-
-                            HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 10px;
-                                spacing: 10px;
-
-                                Text { text: "Username / Account"; color: DraculaTheme.text-secondary; font-weight: 700; width: 180px; vertical-alignment: center; }
-                                Text { text: "Security ID (SID)"; color: DraculaTheme.text-secondary; font-weight: 700; width: 220px; vertical-alignment: center; }
-                                Text { text: "Profile Path"; color: DraculaTheme.text-secondary; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
-                                Text { text: "Health Status"; color: DraculaTheme.text-secondary; font-weight: 700; width: 180px; vertical-alignment: center; }
-                                Text { text: "Loaded"; color: DraculaTheme.text-secondary; font-weight: 700; width: 70px; vertical-alignment: center; }
-                                Text { text: "Action"; color: DraculaTheme.text-secondary; font-weight: 700; width: 90px; vertical-alignment: center; }
-                            }
-                        }
-
-                        // Table Rows
-                        ScrollView {
-                            VerticalLayout {
-                                spacing: 4px;
-                                padding-top: 4px;
-
-                                for profile[idx] in root.profiles: Rectangle {
-                                    height: 40px;
-                                    background: (root.selected-idx == idx) ? DraculaTheme.selection : transparent;
-                                    border-radius: 4px;
-
-                                    TouchArea {
-                                        clicked => { root.select-profile(idx); }
-                                    }
-
-                                    HorizontalLayout {
-                                        padding-left: 10px;
-                                        padding-right: 10px;
-                                        spacing: 10px;
-
-                                        Text {
-                                            text: profile.username;
-                                            color: DraculaTheme.foreground;
-                                            font-weight: 600;
-                                            width: 180px;
-                                            vertical-alignment: center;
-                                            overflow: elide;
-                                        }
-                                        Text {
-                                            text: profile.sid;
-                                            color: DraculaTheme.comment;
-                                            font-size: 11px;
-                                            width: 220px;
-                                            vertical-alignment: center;
-                                            overflow: elide;
-                                        }
-                                        Text {
-                                            text: profile.profile_path;
-                                            color: DraculaTheme.cyan;
-                                            font-size: 11px;
-                                            horizontal-stretch: 1;
-                                            vertical-alignment: center;
-                                            overflow: elide;
-                                        }
-                                        Text {
-                                            text: profile.status_text;
-                                            color: profile.health_type == 0 ? DraculaTheme.green : (profile.health_type == 1 ? DraculaTheme.orange : DraculaTheme.red);
-                                            font-weight: 600;
-                                            width: 180px;
-                                            vertical-alignment: center;
-                                            overflow: elide;
-                                        }
-                                        Text {
-                                            text: profile.loaded ? "Yes" : "No";
-                                            color: profile.loaded ? DraculaTheme.yellow : DraculaTheme.comment;
-                                            width: 70px;
-                                            vertical-alignment: center;
-                                        }
-                                        Button {
-                                            text: "Select";
-                                            width: 80px;
-                                            clicked => { root.select-profile(idx); }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Tab 1: Transactional Repair
-            if root.active-tab == 1: VerticalLayout {
-                padding: DraculaTheme.spacing-lg;
-                spacing: DraculaTheme.spacing-md;
-
-                Rectangle {
-                    background: DraculaTheme.card-bg;
-                    border-radius: DraculaTheme.border-radius;
-                    border-width: 1px;
-                    border-color: DraculaTheme.card-border;
-
-                    VerticalLayout {
-                        padding: DraculaTheme.spacing-lg;
-                        spacing: DraculaTheme.spacing-md;
-
-                        Text {
-                            text: "Transactional Profile Remediation Plan";
-                            color: DraculaTheme.purple;
-                            font-size: 16px;
-                            font-weight: 700;
-                        }
-
-                        // Selected target info
-                        Rectangle {
-                            background: DraculaTheme.current-line;
-                            border-radius: 6px;
-
-                            VerticalLayout {
-                                padding: 10px;
-                                spacing: 4px;
-                                Text { text: "Target Account: " + (root.selected-username != "" ? root.selected-username : "None selected"); color: DraculaTheme.foreground; font-weight: 700; }
-                                Text { text: "Target SID: " + root.selected-sid; color: DraculaTheme.comment; font-size: 11px; }
-                                Text { text: "Profile Path: " + root.selected-path; color: DraculaTheme.cyan; font-size: 11px; }
-                                if root.selected-anomalies != "": Text { text: "Anomalies: " + root.selected-anomalies; color: DraculaTheme.orange; font-weight: 600; }
-                                if root.selected-loaded: Text { text: "Warning: User session is currently active. User must log off before repair."; color: DraculaTheme.red; font-weight: 700; }
-                            }
-                        }
-
-                        // Pipeline description
-                        Text {
-                            text: "Remediation Pipeline: Snapshot Hive -> Safety Precheck -> Atomic Renaming -> State/RefCount Reset -> NTFS DACL Model -> Verification";
-                            color: DraculaTheme.text-secondary;
-                            font-size: 12px;
-                        }
-
-                        // Checkbox options
-                        CheckBox {
-                            text: "Restore .bak registry key to canonical SID";
-                            checked <=> root.repair-fix-bak;
-                        }
-                        CheckBox {
-                            text: "Reset State mask (0x0000) and RefCount (0)";
-                            checked <=> root.repair-reset-state;
-                        }
-                        CheckBox {
-                            text: "Reassign NTFS Ownership & Reapply DACL inheritance";
-                            checked <=> root.repair-fix-acls;
-                        }
-                        CheckBox {
-                            text: "Close blocking NTUSER.DAT handles via Restart Manager";
-                            checked <=> root.repair-unlock-hive;
-                        }
-
-                        // Action Buttons
-                        HorizontalLayout {
-                            spacing: DraculaTheme.spacing-md;
-                            padding-top: 10px;
-
-                            Button {
-                                text: "Simulate (Dry-Run)";
-                                clicked => { root.execute-repair(true); }
-                            }
-                            Button {
-                                text: "Execute Transactional Repair";
-                                primary: true;
-                                enabled: root.selected-sid != "";
-                                clicked => { root.execute-repair(false); }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Tab 2: Profile Migration
-            if root.active-tab == 2: VerticalLayout {
-                padding: DraculaTheme.spacing-lg;
-                spacing: DraculaTheme.spacing-md;
-
-                Rectangle {
-                    background: DraculaTheme.card-bg;
-                    border-radius: DraculaTheme.border-radius;
-                    border-width: 1px;
-                    border-color: DraculaTheme.card-border;
-
-                    VerticalLayout {
-                        padding: DraculaTheme.spacing-lg;
-                        spacing: DraculaTheme.spacing-md;
-
-                        Text {
-                            text: "Selective Profile Migration Wizard";
-                            color: DraculaTheme.cyan;
-                            font-size: 16px;
-                            font-weight: 700;
-                        }
-
-                        // DPAPI Warning banner
-                        Rectangle {
-                            background: #4a3e2e;
-                            border-radius: 6px;
-                            border-width: 1px;
-                            border-color: DraculaTheme.orange;
-
-                            VerticalLayout {
-                                padding: 10px;
-                                spacing: 4px;
-                                Text { text: "SecOps DPAPI / EFS Notice:"; color: DraculaTheme.orange; font-weight: 700; }
-                                Text {
-                                    text: "MasterKeys, browser credentials, and Windows Hello PINs are cryptographically tied to the original SID and machine TPM. File data will be transferred safely, but credentials require re-authentication.";
-                                    color: DraculaTheme.foreground;
-                                    font-size: 11px;
-                                    wrap: word-wrap;
-                                }
-                            }
-                        }
-
-                        Text { text: "Source Profile: " + root.selected-path; color: DraculaTheme.foreground; font-weight: 600; }
-
-                        HorizontalLayout {
-                            alignment: start;
-                            spacing: DraculaTheme.spacing-md;
-                            Text { text: "Target Account / Path:"; color: DraculaTheme.text-secondary; vertical-alignment: center; }
-                            LineEdit {
-                                text <=> root.migration-target-account;
-                                placeholder-text: "e.g. C:\\Users\\NewDomainUser";
-                                width: 350px;
-                            }
-                        }
-
-                        CheckBox {
-                            text: "Migrate AppData\\Roaming (Application Configurations)";
-                            checked <=> root.migration-include-roaming;
-                        }
-                        CheckBox {
-                            text: "Migrate Personal Folders (Documents, Desktop, Downloads, Pictures)";
-                            checked <=> root.migration-include-docs;
-                        }
-
-                        if root.migration-status != "": Text {
-                            text: root.migration-status;
-                            color: DraculaTheme.green;
-                            font-weight: 600;
-                        }
-
-                        ProgressIndicator {
-                            progress: root.migration-progress;
-                            height: 12px;
-                        }
-
-                        Button {
-                            text: "Start Selective Migration";
-                            primary: true;
-                            enabled: root.selected-path != "" && root.migration-target-account != "";
-                            clicked => { root.start-migration(); }
-                        }
-                    }
-                }
-            }
-
-            // Tab 3: SecOps Broker Console
-            if root.active-tab == 3: VerticalLayout {
-                padding: DraculaTheme.spacing-lg;
-                spacing: DraculaTheme.spacing-md;
-
-                Rectangle {
-                    background: DraculaTheme.card-bg;
-                    border-radius: DraculaTheme.border-radius;
-                    border-width: 1px;
-                    border-color: DraculaTheme.card-border;
-
-                    VerticalLayout {
-                        padding: DraculaTheme.spacing-lg;
-                        spacing: DraculaTheme.spacing-md;
-
-                        Text {
-                            text: "SecOps Privileged Maintenance & Elevation Console";
-                            color: DraculaTheme.pink;
-                            font-size: 16px;
-                            font-weight: 700;
-                        }
-
-                        Text {
-                            text: "Official Win32 Token Duplication (TrustedInstaller / LocalSystem) without dropping intermediate binaries on disk, avoiding EDR heuristic false positives.";
-                            color: DraculaTheme.text-secondary;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
-
-                        Rectangle {
-                            background: DraculaTheme.current-line;
-                            border-radius: 6px;
-
-                            VerticalLayout {
-                                padding: 10px;
-                                spacing: 6px;
-                                Text { text: "Broker Named Pipe: \\\\.\\pipe\\WinProfileBrokerSecure"; color: DraculaTheme.cyan; font-family: "Consolas"; }
-                                Text { text: "SDDL: D:(A;;GA;;;BA)(A;;GA;;;SY) - Administrators & SYSTEM Only"; color: DraculaTheme.comment; font-family: "Consolas"; font-size: 11px; }
-                                Text { text: "Flag: PIPE_REJECT_REMOTE_CLIENTS (Local Machine Only)"; color: DraculaTheme.green; font-size: 11px; font-weight: 600; }
-                            }
-                        }
-
-                        HorizontalLayout {
-                            spacing: DraculaTheme.spacing-md;
-                            Button {
-                                text: "Test Pipe DACL & Impersonation";
-                                clicked => { root.test-broker-pipe(); }
-                            }
-                            Button {
-                                text: "Launch Interactive TrustedInstaller Console";
-                                primary: true;
-                                clicked => { root.launch-ti-console(); }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Tab 4: Audit Journal
-            if root.active-tab == 4: VerticalLayout {
-                padding: DraculaTheme.spacing-lg;
-                spacing: DraculaTheme.spacing-md;
-
-                HorizontalLayout {
+                    padding-left: DraculaTheme.spacing-lg;
+                    padding-right: DraculaTheme.spacing-lg;
                     alignment: space-between;
-                    Text {
-                        text: "Structured Transactional Audit Journal";
-                        color: DraculaTheme.yellow;
-                        font-size: 16px;
-                        font-weight: 700;
-                        vertical-alignment: center;
+                    VerticalLayout {
+                        alignment: center;
+                        Text { text: AppStrings.app-title; color: DraculaTheme.purple; font-size: 19px; font-weight: 800; }
+                        Text { text: AppStrings.app-subtitle; color: DraculaTheme.text-secondary; font-size: 11px; }
                     }
                     HorizontalLayout {
-                        spacing: DraculaTheme.spacing-sm;
-                        Button {
-                            text: "Clear Display";
-                            clicked => { root.clear-audit-logs(); }
+                        alignment: end;
+                        spacing: DraculaTheme.spacing-md;
+                        Rectangle {
+                            height: 30px;
+                            background: root.is-elevated ? #214a38 : #512c35;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: root.is-elevated ? DraculaTheme.green : DraculaTheme.red;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                Text {
+                                    text: root.is-elevated ? AppStrings.elevated : AppStrings.unelevated;
+                                    color: root.is-elevated ? DraculaTheme.green : DraculaTheme.red;
+                                    font-size: 11px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                            }
                         }
                         Button {
-                            text: "Export JSON Log";
-                            clicked => { root.export-audit-json(); }
+                            text: AppStrings.scan;
+                            enabled: !root.operation-busy;
+                            primary: true;
+                            clicked => { root.scan-profiles(); }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 48px;
+                background: #21222c;
+                HorizontalLayout {
+                    padding-left: DraculaTheme.spacing-lg;
+                    padding-right: DraculaTheme.spacing-lg;
+                    spacing: DraculaTheme.spacing-sm;
+                    alignment: start;
+                    Button { text: AppStrings.nav-dashboard; checked: root.active-tab == 0; clicked => { root.active-tab = 0; } }
+                    Button { text: AppStrings.nav-repair; checked: root.active-tab == 1; clicked => { root.active-tab = 1; } }
+                    Button { text: AppStrings.nav-migration; checked: root.active-tab == 2; clicked => { root.active-tab = 2; } }
+                    Button { text: AppStrings.nav-maintenance; checked: root.active-tab == 3; clicked => { root.active-tab = 3; } }
+                    Button { text: AppStrings.nav-logs; checked: root.active-tab == 4; clicked => { root.active-tab = 4; } }
+                }
+            }
+
+            Rectangle {
+                background: DraculaTheme.background;
+
+                if root.active-tab == 0: VerticalLayout {
+                    padding: DraculaTheme.spacing-lg;
+                    spacing: DraculaTheme.spacing-md;
+                    HorizontalLayout {
+                        spacing: DraculaTheme.spacing-md;
+                        height: 82px;
+                        StatCard { card-title: AppStrings.total; value: root.total-profiles-count; accent-color: DraculaTheme.cyan; }
+                        StatCard { card-title: AppStrings.healthy; value: root.healthy-count; accent-color: DraculaTheme.green; }
+                        StatCard { card-title: AppStrings.corrupted; value: root.corrupted-count; accent-color: DraculaTheme.orange; }
+                        StatCard { card-title: AppStrings.temporary; value: root.temp-count; accent-color: DraculaTheme.red; }
+                    }
+                    Rectangle {
+                        background: DraculaTheme.card-bg;
+                        border-radius: DraculaTheme.border-radius;
+                        border-width: 1px;
+                        border-color: DraculaTheme.card-border;
+                        VerticalLayout {
+                            padding: DraculaTheme.spacing-sm;
+                            spacing: 4px;
+                            Rectangle {
+                                height: 34px;
+                                background: DraculaTheme.current-line;
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Text { text: AppStrings.column-account; color: DraculaTheme.text-secondary; font-weight: 700; width: 150px; vertical-alignment: center; }
+                                    Text { text: AppStrings.column-sid; color: DraculaTheme.text-secondary; font-weight: 700; width: 220px; vertical-alignment: center; }
+                                    Text { text: AppStrings.column-path; color: DraculaTheme.text-secondary; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                                    Text { text: AppStrings.column-status; color: DraculaTheme.text-secondary; font-weight: 700; width: 190px; vertical-alignment: center; }
+                                    Text { text: AppStrings.column-loaded; color: DraculaTheme.text-secondary; font-weight: 700; width: 58px; vertical-alignment: center; }
+                                    Text { text: AppStrings.column-action; color: DraculaTheme.text-secondary; font-weight: 700; width: 90px; vertical-alignment: center; }
+                                }
+                            }
+                            if root.profiles.length == 0: Text {
+                                text: AppStrings.no-profiles;
+                                color: DraculaTheme.text-secondary;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            ListView {
+                                for profile[idx] in root.profiles: Rectangle {
+                                    height: 44px;
+                                    background: root.selected-idx == idx ? DraculaTheme.selection : transparent;
+                                    border-radius: 4px;
+                                    HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+                                        spacing: 8px;
+                                        Text { text: profile.username; color: DraculaTheme.foreground; font-weight: 600; width: 150px; vertical-alignment: center; overflow: elide; }
+                                        Text { text: profile.sid; color: DraculaTheme.text-secondary; font-size: 11px; width: 220px; vertical-alignment: center; overflow: elide; }
+                                        Text { text: profile.profile_path; color: DraculaTheme.cyan; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                        Text { text: profile.status_text; color: profile.health_type == 0 ? DraculaTheme.green : (profile.health_type == 1 ? DraculaTheme.orange : DraculaTheme.red); font-weight: 600; width: 190px; vertical-alignment: center; overflow: elide; }
+                                        Text { text: profile.loaded ? AppStrings.yes : AppStrings.no; color: profile.loaded ? DraculaTheme.yellow : DraculaTheme.text-secondary; width: 58px; vertical-alignment: center; }
+                                        Button { text: AppStrings.select; width: 90px; enabled: !root.operation-busy; clicked => { root.select-profile(idx); } }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
-                Rectangle {
-                    background: DraculaTheme.card-bg;
-                    border-radius: DraculaTheme.border-radius;
-                    border-width: 1px;
-                    border-color: DraculaTheme.card-border;
-
-                    VerticalLayout {
-                        padding: DraculaTheme.spacing-sm;
-
-                        Rectangle {
-                            height: 32px;
-                            background: DraculaTheme.current-line;
-                            border-radius: 4px;
-
+                if root.active-tab == 1: VerticalLayout {
+                    padding: DraculaTheme.spacing-lg;
+                    spacing: DraculaTheme.spacing-md;
+                    Rectangle {
+                        background: DraculaTheme.card-bg;
+                        border-radius: DraculaTheme.border-radius;
+                        border-width: 1px;
+                        border-color: DraculaTheme.card-border;
+                        VerticalLayout {
+                            padding: DraculaTheme.spacing-lg;
+                            spacing: DraculaTheme.spacing-md;
+                            Text { text: AppStrings.repair-title; color: DraculaTheme.purple; font-size: 17px; font-weight: 700; }
+                            Rectangle {
+                                background: DraculaTheme.current-line;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 10px;
+                                    spacing: 4px;
+                                    Text { text: AppStrings.target-account + " " + (root.selected-username != "" ? root.selected-username : AppStrings.none-selected); color: DraculaTheme.foreground; font-weight: 700; }
+                                    Text { text: AppStrings.target-sid + " " + root.selected-sid; color: DraculaTheme.text-secondary; font-size: 11px; }
+                                    Text { text: AppStrings.profile-path + " " + root.selected-path; color: DraculaTheme.cyan; font-size: 11px; }
+                                    if root.selected-anomalies != "": Text { text: AppStrings.anomalies + " " + root.selected-anomalies; color: DraculaTheme.orange; font-weight: 600; }
+                                    if root.selected-loaded: Text { text: AppStrings.loaded-warning; color: DraculaTheme.red; font-weight: 700; }
+                                }
+                            }
+                            Text { text: AppStrings.repair-pipeline; color: DraculaTheme.text-secondary; font-size: 12px; wrap: word-wrap; }
+                            CheckBox { text: AppStrings.fix-bak; checked <=> root.repair-fix-bak; enabled: !root.operation-busy; }
+                            CheckBox { text: AppStrings.reset-state; checked <=> root.repair-reset-state; enabled: !root.operation-busy; }
+                            CheckBox { text: AppStrings.unlock-hive; checked <=> root.repair-unlock-hive; enabled: !root.operation-busy; }
                             HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 10px;
-                                spacing: 10px;
-
-                                Text { text: "Timestamp"; color: DraculaTheme.text-secondary; font-weight: 700; width: 150px; vertical-alignment: center; }
-                                Text { text: "Operation"; color: DraculaTheme.text-secondary; font-weight: 700; width: 140px; vertical-alignment: center; }
-                                Text { text: "Target"; color: DraculaTheme.text-secondary; font-weight: 700; width: 180px; vertical-alignment: center; }
-                                Text { text: "Result"; color: DraculaTheme.text-secondary; font-weight: 700; width: 100px; vertical-alignment: center; }
-                                Text { text: "Details"; color: DraculaTheme.text-secondary; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                                spacing: DraculaTheme.spacing-md;
+                                Button {
+                                    text: AppStrings.dry-run;
+                                    enabled: root.is-elevated && !root.operation-busy && root.selected-sid != "" && !root.selected-loaded;
+                                    clicked => { root.execute-dry-run(); }
+                                }
+                                Button {
+                                    text: AppStrings.execute-repair;
+                                    primary: true;
+                                    enabled: root.is-elevated && !root.operation-busy && root.selected-sid != "" && !root.selected-loaded;
+                                    clicked => { root.request-repair(); }
+                                }
                             }
                         }
+                    }
+                }
 
-                        ScrollView {
-                            VerticalLayout {
-                                spacing: 4px;
-                                padding-top: 4px;
+                if root.active-tab == 2: VerticalLayout {
+                    padding: DraculaTheme.spacing-lg;
+                    spacing: DraculaTheme.spacing-md;
+                    Rectangle {
+                        background: DraculaTheme.card-bg;
+                        border-radius: DraculaTheme.border-radius;
+                        border-width: 1px;
+                        border-color: DraculaTheme.card-border;
+                        VerticalLayout {
+                            padding: DraculaTheme.spacing-lg;
+                            spacing: DraculaTheme.spacing-md;
+                            Text { text: AppStrings.migration-title; color: DraculaTheme.cyan; font-size: 17px; font-weight: 700; }
+                            Rectangle {
+                                background: #4a3d2a;
+                                border-radius: 6px;
+                                VerticalLayout {
+                                    padding: 12px;
+                                    Text { text: AppStrings.migration-warning; color: DraculaTheme.yellow; wrap: word-wrap; }
+                                }
+                            }
+                            Text { text: AppStrings.migration-source + " " + root.selected-path; color: DraculaTheme.foreground; font-weight: 600; }
+                            HorizontalLayout {
+                                spacing: DraculaTheme.spacing-md;
+                                Text { text: AppStrings.migration-target; color: DraculaTheme.text-secondary; vertical-alignment: center; }
+                                LineEdit {
+                                    text <=> root.migration-target-path;
+                                    placeholder-text: AppStrings.migration-placeholder;
+                                    accessible-label: AppStrings.migration-target;
+                                    enabled: !root.operation-busy;
+                                    horizontal-stretch: 1;
+                                }
+                            }
+                            CheckBox { text: AppStrings.include-roaming; checked <=> root.migration-include-roaming; enabled: !root.operation-busy; }
+                            CheckBox { text: AppStrings.include-docs; checked <=> root.migration-include-docs; enabled: !root.operation-busy; }
+                            Text { text: root.migration-status; color: DraculaTheme.text-secondary; font-weight: 600; }
+                            ProgressIndicator { progress: root.migration-progress; height: 14px; }
+                            HorizontalLayout {
+                                spacing: DraculaTheme.spacing-md;
+                                Button {
+                                    text: AppStrings.start-migration;
+                                    primary: true;
+                                    enabled: root.is-elevated && !root.operation-busy && root.selected-path != "" && root.migration-target-path != "" && (root.migration-include-roaming || root.migration-include-docs);
+                                    clicked => { root.start-migration(); }
+                                }
+                                Button {
+                                    text: AppStrings.cancel-migration;
+                                    enabled: root.migration-running;
+                                    clicked => { root.cancel-migration(); }
+                                }
+                            }
+                        }
+                    }
+                }
 
+                if root.active-tab == 3: VerticalLayout {
+                    padding: DraculaTheme.spacing-lg;
+                    spacing: DraculaTheme.spacing-md;
+                    Rectangle {
+                        background: DraculaTheme.card-bg;
+                        border-radius: DraculaTheme.border-radius;
+                        border-width: 1px;
+                        border-color: DraculaTheme.card-border;
+                        VerticalLayout {
+                            padding: DraculaTheme.spacing-lg;
+                            spacing: DraculaTheme.spacing-md;
+                            Text { text: AppStrings.maintenance-title; color: DraculaTheme.pink; font-size: 17px; font-weight: 700; }
+                            Text { text: AppStrings.maintenance-description; color: DraculaTheme.text-secondary; wrap: word-wrap; }
+                            Button {
+                                text: AppStrings.launch-ti;
+                                primary: true;
+                                enabled: root.is-elevated && !root.operation-busy;
+                                clicked => { root.request-ti-console(); }
+                            }
+                        }
+                    }
+                }
+
+                if root.active-tab == 4: VerticalLayout {
+                    padding: DraculaTheme.spacing-lg;
+                    spacing: DraculaTheme.spacing-md;
+                    HorizontalLayout {
+                        alignment: space-between;
+                        Text { text: AppStrings.audit-title; color: DraculaTheme.yellow; font-size: 17px; font-weight: 700; vertical-alignment: center; }
+                        HorizontalLayout {
+                            spacing: DraculaTheme.spacing-sm;
+                            Button { text: AppStrings.clear-audit; enabled: !root.operation-busy; clicked => { root.clear-audit-logs(); } }
+                            Button { text: AppStrings.export-audit; enabled: !root.operation-busy; clicked => { root.export-audit-json(); } }
+                        }
+                    }
+                    Rectangle {
+                        background: DraculaTheme.card-bg;
+                        border-radius: DraculaTheme.border-radius;
+                        border-width: 1px;
+                        border-color: DraculaTheme.card-border;
+                        VerticalLayout {
+                            padding: DraculaTheme.spacing-sm;
+                            spacing: 4px;
+                            Rectangle {
+                                height: 34px;
+                                background: DraculaTheme.current-line;
+                                HorizontalLayout {
+                                    padding-left: 10px;
+                                    padding-right: 10px;
+                                    spacing: 8px;
+                                    Text { text: AppStrings.audit-timestamp; color: DraculaTheme.text-secondary; font-weight: 700; width: 150px; vertical-alignment: center; }
+                                    Text { text: AppStrings.audit-operation; color: DraculaTheme.text-secondary; font-weight: 700; width: 150px; vertical-alignment: center; }
+                                    Text { text: AppStrings.audit-target; color: DraculaTheme.text-secondary; font-weight: 700; width: 180px; vertical-alignment: center; }
+                                    Text { text: AppStrings.audit-result; color: DraculaTheme.text-secondary; font-weight: 700; width: 100px; vertical-alignment: center; }
+                                    Text { text: AppStrings.audit-details; color: DraculaTheme.text-secondary; font-weight: 700; horizontal-stretch: 1; vertical-alignment: center; }
+                                }
+                            }
+                            ListView {
                                 for entry in root.audit-entries: Rectangle {
-                                    height: 34px;
+                                    height: 38px;
                                     background: DraculaTheme.current-line;
                                     border-radius: 4px;
-
                                     HorizontalLayout {
                                         padding-left: 10px;
                                         padding-right: 10px;
-                                        spacing: 10px;
-
-                                        Text { text: entry.timestamp; color: DraculaTheme.comment; font-size: 11px; width: 150px; vertical-alignment: center; }
-                                        Text { text: entry.operation; color: DraculaTheme.purple; font-weight: 600; width: 140px; vertical-alignment: center; }
+                                        spacing: 8px;
+                                        Text { text: entry.timestamp; color: DraculaTheme.text-secondary; font-size: 11px; width: 150px; vertical-alignment: center; }
+                                        Text { text: entry.operation; color: DraculaTheme.purple; font-weight: 600; width: 150px; vertical-alignment: center; overflow: elide; }
                                         Text { text: entry.target; color: DraculaTheme.cyan; font-size: 11px; width: 180px; vertical-alignment: center; overflow: elide; }
-                                        Text {
-                                            text: entry.status;
-                                            color: entry.status == "Success" ? DraculaTheme.green : (entry.status == "Warning" ? DraculaTheme.orange : DraculaTheme.red);
-                                            font-weight: 700;
-                                            width: 100px;
-                                            vertical-alignment: center;
-                                        }
+                                        Text { text: entry.status; color: entry.status_type == 0 ? DraculaTheme.green : (entry.status_type == 1 ? DraculaTheme.orange : DraculaTheme.red); font-weight: 700; width: 100px; vertical-alignment: center; }
                                         Text { text: entry.details; color: DraculaTheme.foreground; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
                                     }
                                 }
@@ -715,30 +481,51 @@ export component MainWindow inherits Window {
                     }
                 }
             }
+
+            Rectangle {
+                height: 32px;
+                background: DraculaTheme.current-line;
+                HorizontalLayout {
+                    padding-left: DraculaTheme.spacing-lg;
+                    padding-right: DraculaTheme.spacing-lg;
+                    alignment: space-between;
+                    Text { text: root.status-message; color: DraculaTheme.foreground; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                    Text { text: AppStrings.app-version + " | " + AppStrings.app-license; color: DraculaTheme.text-secondary; font-size: 11px; vertical-alignment: center; }
+                }
+            }
         }
 
-        // Status Bar Footer
-        Rectangle {
-            height: 30px;
-            background: DraculaTheme.current-line;
-
-            HorizontalLayout {
-                padding-left: DraculaTheme.spacing-lg;
-                padding-right: DraculaTheme.spacing-lg;
-                alignment: space-between;
-
-                Text {
-                    text: root.status-message;
-                    color: DraculaTheme.foreground;
-                    font-size: 11px;
-                    vertical-alignment: center;
-                }
-
-                Text {
-                    text: "CalVer 2026.0819.00 | Apache-2.0";
-                    color: DraculaTheme.comment;
-                    font-size: 11px;
-                    vertical-alignment: center;
+        if root.confirmation-visible: Rectangle {
+            background: #aa000000;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 580px;
+                    height: 260px;
+                    background: DraculaTheme.card-bg;
+                    border-radius: DraculaTheme.border-radius;
+                    border-width: 2px;
+                    border-color: DraculaTheme.orange;
+                    VerticalLayout {
+                        padding: DraculaTheme.spacing-lg;
+                        spacing: DraculaTheme.spacing-md;
+                        Text { text: root.confirmation-title; color: DraculaTheme.orange; font-size: 18px; font-weight: 700; }
+                        Text { text: root.confirmation-message; color: DraculaTheme.foreground; wrap: word-wrap; vertical-stretch: 1; }
+                        HorizontalLayout {
+                            alignment: end;
+                            spacing: DraculaTheme.spacing-md;
+                            Button { text: AppStrings.cancel; clicked => { root.confirmation-visible = false; root.confirmation-kind = -1; } }
+                            Button {
+                                text: AppStrings.confirm;
+                                primary: true;
+                                clicked => {
+                                    root.confirmation-visible = false;
+                                    root.confirm-action(root.confirmation-kind);
+                                    root.confirmation-kind = -1;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

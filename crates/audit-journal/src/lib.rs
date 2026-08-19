@@ -18,6 +18,6 @@ pub mod journal;
 pub mod rollback;
 pub mod snapshot;
 
-pub use journal::{AuditEntry, AuditLogger, AuditStatus};
+pub use journal::{AuditEntry, AuditError, AuditLogger, AuditResult, AuditStatus};
 pub use rollback::{restore_registry_snapshot, RollbackError, RollbackResult};
 pub use snapshot::{SnapshotEngine, SnapshotError, SnapshotMetadata, SnapshotResult};

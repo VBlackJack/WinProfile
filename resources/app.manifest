@@ -16,7 +16,7 @@
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
   <assemblyIdentity
-    version="2026.0819.0.0"
+    version="2026.819.0.0"
     processorArchitecture="*"
     name="WinProfile.Suite"
     type="win32"

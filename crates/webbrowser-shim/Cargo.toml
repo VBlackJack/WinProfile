@@ -13,26 +13,16 @@
 # limitations under the License.
 
 [package]
-name = "broker-service"
-version.workspace = true
-authors.workspace = true
+name = "webbrowser"
+version = "1.2.4"
 edition.workspace = true
 license.workspace = true
-description = "Privileged LocalSystem Windows Service worker executing transactions over secure Named Pipe"
+description = "Minimal Windows browser launcher used by the Slint backend"
 
-[[bin]]
-name = "winprofile-broker"
-path = "src/main.rs"
+[features]
+disable-wsl = []
+hardened = []
+wasm-console = []
 
 [dependencies]
-platform-win32.workspace = true
-audit-journal.workspace = true
-broker-protocol.workspace = true
-core-profiles.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 windows-sys.workspace = true
-anyhow.workspace = true

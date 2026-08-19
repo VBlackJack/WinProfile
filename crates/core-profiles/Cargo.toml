@@ -23,9 +23,9 @@ description = "Core domain logic: Windows user profile scanner, diagnostic engin
 [dependencies]
 platform-win32.workspace = true
 audit-journal.workspace = true
-broker-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 chrono.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

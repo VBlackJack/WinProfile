@@ -16,16 +16,14 @@
 
 use thiserror::Error;
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-use windows_sys::Win32::System::Registry::{
-    RegRestoreKeyW, HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS, REG_FORCE_RESTORE,
-};
+use windows_sys::Win32::System::Registry::{RegRestoreKeyW, KEY_ALL_ACCESS, REG_FORCE_RESTORE};
 
 use platform_win32::{
-    create_key, to_wide_null, PrivilegeGuard, RegistryError,
+    create_key, open_key, to_wide_null, PrivilegeGuard, RegistryError, RegistryRoot,
     SE_BACKUP_NAME, SE_RESTORE_NAME,
 };
 
-use crate::journal::{AuditLogger, AuditStatus};
+use crate::journal::{AuditError, AuditLogger, AuditStatus};
 use crate::snapshot::SnapshotMetadata;
 
 #[derive(Error, Debug)]
@@ -38,6 +36,8 @@ pub enum RollbackError {
     SecurityError(#[from] platform_win32::SecurityError),
     #[error("Base registry error: {0}")]
     BaseRegError(#[from] RegistryError),
+    #[error("Audit logging failed after rollback: {0}")]
+    AuditError(#[from] AuditError),
 }
 
 pub type RollbackResult<T> = Result<T, RollbackError>;
@@ -53,33 +53,36 @@ pub fn restore_registry_snapshot(
         ));
     }
 
-    let _privs = PrivilegeGuard::new(&[SE_RESTORE_NAME, SE_BACKUP_NAME])?;
+    let privileges = PrivilegeGuard::new(&[SE_RESTORE_NAME, SE_BACKUP_NAME])?;
 
     let subkey_name = metadata
         .registry_key_path
         .strip_prefix("HKLM\\")
         .unwrap_or(&metadata.registry_key_path);
 
-    let hkey = create_key(HKEY_LOCAL_MACHINE, subkey_name, KEY_ALL_ACCESS)?;
+    let (parent_path, leaf_name) = subkey_name
+        .rsplit_once('\\')
+        .ok_or(RollbackError::BaseRegError(RegistryError::InvalidPath))?;
+    let parent = open_key(RegistryRoot::LocalMachine, parent_path, KEY_ALL_ACCESS)?;
+    let hkey = create_key(&parent, leaf_name, KEY_ALL_ACCESS)?;
     let wide_file = to_wide_null(metadata.snapshot_file_path.as_os_str());
 
-    let status = unsafe {
-        RegRestoreKeyW(
-            hkey.as_raw(),
-            wide_file.as_ptr(),
-            REG_FORCE_RESTORE as u32,
-        )
-    };
+    let status =
+        unsafe { RegRestoreKeyW(hkey.as_raw(), wide_file.as_ptr(), REG_FORCE_RESTORE as u32) };
 
     if status == ERROR_SUCCESS {
+        privileges.restore()?;
         if let Some(log) = logger {
             log.log(
                 "RollbackSnapshot",
                 "WinProfile",
                 &metadata.sid,
                 AuditStatus::RolledBack,
-                format!("Restored snapshot from {}", metadata.snapshot_file_path.display()),
-            );
+                format!(
+                    "Restored snapshot from {}",
+                    metadata.snapshot_file_path.display()
+                ),
+            )?;
         }
         Ok(())
     } else {
@@ -90,7 +93,7 @@ pub fn restore_registry_snapshot(
                 &metadata.sid,
                 AuditStatus::Failed,
                 format!("Rollback failed with error code: {status}"),
-            );
+            )?;
         }
         Err(RollbackError::RegistryError(status))
     }
