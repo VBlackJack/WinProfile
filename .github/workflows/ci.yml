@@ -14,7 +14,7 @@ jobs:
   quality:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install pinned GNU toolchain
         shell: pwsh
         run: rustup toolchain install 1.97.1-x86_64-pc-windows-gnu --profile minimal --component clippy,rustfmt
@@ -36,7 +36,7 @@ jobs:
   package:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install pinned MSVC toolchain
         shell: pwsh
         run: rustup toolchain install 1.97.1-x86_64-pc-windows-msvc --profile minimal
