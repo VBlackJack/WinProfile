@@ -11,18 +11,27 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_MSVC_TOOLCHAIN: 1.97.1-x86_64-pc-windows-msvc
+  CARGO_AUDIT_VERSION: 0.22.2
+  CARGO_AUDIT_ARCHIVE: cargo-audit-x86_64-pc-windows-msvc-v0.22.2.zip
+  CARGO_AUDIT_SHA256: 0a7316540862c13d954f648917ceacca593747baed6eec180fafa590be2710ab
+
 jobs:
   release:
     runs-on: windows-2022
-    env:
-      SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
-      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
-      SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned MSVC toolchain
         shell: pwsh
-        run: rustup toolchain install 1.97.1-x86_64-pc-windows-msvc --profile minimal
+        run: rustup toolchain install $env:RUST_MSVC_TOOLCHAIN --profile minimal --component clippy,rustfmt
       - name: Validate tag and release notes
         shell: pwsh
         run: |
@@ -31,12 +40,38 @@ jobs:
           if ($version -ne $manifestVersion) { throw "Tag $version does not match Cargo version $manifestVersion" }
           $notes = "docs\release-v$version.md"
           if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) { throw "Missing release notes: $notes" }
-          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_BASE64)) { throw 'Missing signing certificate secret' }
-          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_PASSWORD)) { throw 'Missing signing certificate password secret' }
-          if ([string]::IsNullOrWhiteSpace($env:SIGNING_TIMESTAMP_URL)) { throw 'Missing signing timestamp URL secret' }
+      - name: Formatting
+        shell: pwsh
+        run: cargo "+$env:RUST_MSVC_TOOLCHAIN" fmt --all -- --check
+      - name: Clippy
+        shell: pwsh
+        run: cargo "+$env:RUST_MSVC_TOOLCHAIN" clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        shell: pwsh
+        run: cargo "+$env:RUST_MSVC_TOOLCHAIN" test --workspace --all-features --locked
+      - name: Audit dependencies
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $archive = Join-Path $env:RUNNER_TEMP $env:CARGO_AUDIT_ARCHIVE
+          $destination = Join-Path $env:RUNNER_TEMP "cargo-audit-$($env:CARGO_AUDIT_VERSION)"
+          $assetUri = "https://github.com/rustsec/rustsec/releases/download/cargo-audit/v$($env:CARGO_AUDIT_VERSION)/$($env:CARGO_AUDIT_ARCHIVE)"
+          Invoke-WebRequest -Uri $assetUri -OutFile $archive
+          $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:CARGO_AUDIT_SHA256) {
+            throw "Unexpected cargo-audit archive SHA-256: $actualHash"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination -Force
+          $cargoAudit = Get-ChildItem -LiteralPath $destination -Filter 'cargo-audit.exe' -File -Recurse |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cargoAudit) { throw 'cargo-audit executable was not found in the verified archive' }
+          & $cargoAudit audit
+          if ($LASTEXITCODE -ne 0) { throw 'cargo-audit reported a dependency vulnerability' }
       - name: Build release executable
         shell: pwsh
-        run: cargo +1.97.1-x86_64-pc-windows-msvc build -p app-ui --release --locked
+        run: cargo "+$env:RUST_MSVC_TOOLCHAIN" build -p app-ui --release --locked
       - name: Verify PE metadata and elevation manifest
         shell: pwsh
         run: |
@@ -57,7 +92,14 @@ jobs:
           }
       - name: Sign and verify executable
         shell: pwsh
+        env:
+          SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+          SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_BASE64)) { throw 'Missing signing certificate secret' }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_PASSWORD)) { throw 'Missing signing certificate password secret' }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_TIMESTAMP_URL)) { throw 'Missing signing timestamp URL secret' }
           $exe = Resolve-Path 'target\release\winprofile-admin.exe'
           $pfx = Join-Path $env:RUNNER_TEMP 'winprofile-signing.pfx'
           try {
@@ -75,11 +117,6 @@ jobs:
           finally {
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
-      - name: Audit dependencies
-        shell: pwsh
-        run: |
-          cargo +1.97.1-x86_64-pc-windows-msvc install cargo-audit --version 0.22.2 --locked
-          cargo +1.97.1-x86_64-pc-windows-msvc audit
       - name: Create checksum
         shell: pwsh
         run: |

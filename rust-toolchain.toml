@@ -13,6 +13,6 @@
 # limitations under the License.
 
 [toolchain]
-channel = "1.97.1-x86_64-pc-windows-gnu"
+channel = "1.97.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
