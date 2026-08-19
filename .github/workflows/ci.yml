@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   quality:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v6
       - name: Install pinned GNU toolchain
@@ -34,7 +34,7 @@ jobs:
           cargo +1.97.1-x86_64-pc-windows-gnu audit
 
   package:
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v6
       - name: Install pinned MSVC toolchain
@@ -50,7 +50,12 @@ jobs:
           $version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
           if ($version -ne '2026.819.0') { throw "Unexpected PE file version: $version" }
           $manifest = Join-Path $env:RUNNER_TEMP 'winprofile-admin.manifest'
-          & mt.exe -nologo "-inputresource:$exe;#1" "-out:$manifest"
+          $mt = Get-ChildItem -LiteralPath "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter 'mt.exe' -Recurse |
+            Where-Object FullName -Match '\\x64\\mt\.exe$' |
+            Sort-Object FullName |
+            Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $mt) { throw 'Windows SDK manifest tool was not found' }
+          & $mt -nologo "-inputresource:$exe;#1" "-out:$manifest"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to extract PE manifest' }
           if (-not (Select-String -LiteralPath $manifest -SimpleMatch 'requireAdministrator')) {
             throw 'PE manifest does not require administrator elevation'

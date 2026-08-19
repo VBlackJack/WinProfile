@@ -1,0 +1,100 @@
+# Copyright 2026 Julien Bombled
+# Licensed under the Apache License, Version 2.0.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-2022
+    env:
+      SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+      SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+      SIGNING_TIMESTAMP_URL: ${{ secrets.WINDOWS_SIGNING_TIMESTAMP_URL }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned MSVC toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.1-x86_64-pc-windows-msvc --profile minimal
+      - name: Validate tag and release notes
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $manifestVersion = (Select-String -LiteralPath 'Cargo.toml' -Pattern '^version = "([^"]+)"$').Matches.Groups[1].Value
+          if ($version -ne $manifestVersion) { throw "Tag $version does not match Cargo version $manifestVersion" }
+          $notes = "docs\release-v$version.md"
+          if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) { throw "Missing release notes: $notes" }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_BASE64)) { throw 'Missing signing certificate secret' }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_CERTIFICATE_PASSWORD)) { throw 'Missing signing certificate password secret' }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_TIMESTAMP_URL)) { throw 'Missing signing timestamp URL secret' }
+      - name: Build release executable
+        shell: pwsh
+        run: cargo +1.97.1-x86_64-pc-windows-msvc build -p app-ui --release --locked
+      - name: Verify PE metadata and elevation manifest
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'target\release\winprofile-admin.exe'
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $fileVersion = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
+          if ($fileVersion -ne $version) { throw "Unexpected PE file version: $fileVersion" }
+          $manifest = Join-Path $env:RUNNER_TEMP 'winprofile-admin.manifest'
+          $mt = Get-ChildItem -LiteralPath "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter 'mt.exe' -Recurse |
+            Where-Object FullName -Match '\\x64\\mt\.exe$' |
+            Sort-Object FullName |
+            Select-Object -Last 1 -ExpandProperty FullName
+          if (-not $mt) { throw 'Windows SDK manifest tool was not found' }
+          & $mt -nologo "-inputresource:$exe;#1" "-out:$manifest"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract PE manifest' }
+          if (-not (Select-String -LiteralPath $manifest -SimpleMatch 'requireAdministrator')) {
+            throw 'PE manifest does not require administrator elevation'
+          }
+      - name: Sign and verify executable
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'target\release\winprofile-admin.exe'
+          $pfx = Join-Path $env:RUNNER_TEMP 'winprofile-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGNING_CERTIFICATE_BASE64))
+            $signTool = Get-ChildItem -LiteralPath "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter 'signtool.exe' -Recurse |
+              Where-Object FullName -Match '\\x64\\signtool\.exe$' |
+              Sort-Object FullName |
+              Select-Object -Last 1 -ExpandProperty FullName
+            if (-not $signTool) { throw 'Windows SDK signing tool was not found' }
+            & $signTool sign /fd SHA256 /f $pfx /p $env:SIGNING_CERTIFICATE_PASSWORD /tr $env:SIGNING_TIMESTAMP_URL /td SHA256 $exe
+            if ($LASTEXITCODE -ne 0) { throw 'Authenticode signing failed' }
+            $signature = Get-AuthenticodeSignature -LiteralPath $exe
+            if ($signature.Status -ne 'Valid') { throw "Invalid Authenticode status: $($signature.Status)" }
+          }
+          finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+      - name: Audit dependencies
+        shell: pwsh
+        run: |
+          cargo +1.97.1-x86_64-pc-windows-msvc install cargo-audit --version 0.22.2 --locked
+          cargo +1.97.1-x86_64-pc-windows-msvc audit
+      - name: Create checksum
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'target\release\winprofile-admin.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          "$hash  winprofile-admin.exe" | Set-Content -LiteralPath 'target\release\SHA256SUMS.txt' -Encoding ascii
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          gh release create $env:GITHUB_REF_NAME `
+            'target\release\winprofile-admin.exe' `
+            'target\release\SHA256SUMS.txt' `
+            --verify-tag `
+            --title "WinProfile $version" `
+            --notes-file "docs\release-v$version.md"

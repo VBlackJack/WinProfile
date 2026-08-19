@@ -1,0 +1,10 @@
+# Normalize repository text files across Windows and CI environments.
+* text=auto eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.pfx binary
