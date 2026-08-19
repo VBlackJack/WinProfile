@@ -29,7 +29,15 @@ The tool does not invent filesystem ACLs. Account-specific ownership or DACL rem
 
 ## Migration transaction
 
-The source and destination are canonicalized before mutation. Equal, nested, or ancestor roots are rejected. Every directory and file created by the transaction is recorded. Files use create-new semantics and are read back for SHA-256 verification. The receipt includes file count, byte count, and a deterministic aggregate manifest hash. Failure or cancellation removes only entries created by the current transaction and never deletes pre-existing destination content.
+Migration is permitted only for an unloaded source profile. The controller rejects a loaded profile before elevation, operation registration, or worker dispatch.
+
+Filesystem traversal is rooted in opened directory handles. Each component is opened with `NtCreateFile`, `OBJECT_ATTRIBUTES.RootDirectory`, and `FILE_OPEN_REPARSE_POINT`, then inspected through the returned handle before use. Directory enumeration and child opens remain relative to those verified handles. Source and destination ancestry is compared by volume and file identity, so path aliases such as `SUBST` cannot bypass equal, nested, or ancestor-root rejection.
+
+Destination files use `FILE_CREATE` and therefore never overwrite existing content. Source and destination file handles grant only `FILE_SHARE_READ`, blocking concurrent write and delete opens while a file is copied and verified. SHA-256 is accumulated from the opened source handle; the destination is rewound and rehashed through the exact created handle, with its byte length checked before it enters the deterministic receipt manifest.
+
+The transaction retains handles to every created object. A delete-on-failure guard covers errors before transaction registration, and rollback consumes those handles from children to parents without resolving paths again. Cancellation is checked between one-megabyte chunks, during destination verification, and immediately before terminal success logging.
+
+This is not an atomic point-in-time tree snapshot: WinProfile does not use VSS, so different files can represent different instants even though each individual file is protected while open. UNC/SMB and ReFS behavior, denied-ACL recovery, backup/restore privileges, and `FILE_OPEN_FOR_BACKUP_INTENT` are not measured and are not part of the current guarantee.
 
 ## Audit integrity
 
