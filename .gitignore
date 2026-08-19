@@ -1,6 +1,5 @@
 # Build outputs
 /target
-Cargo.lock
 
 # IDE and editors
 .idea/

@@ -1,0 +1,70 @@
+# Copyright 2026 Julien Bombled
+# Licensed under the Apache License, Version 2.0.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned GNU toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.1-x86_64-pc-windows-gnu --profile minimal --component clippy,rustfmt
+      - name: Formatting
+        shell: pwsh
+        run: cargo +1.97.1-x86_64-pc-windows-gnu fmt --all -- --check
+      - name: Clippy
+        shell: pwsh
+        run: cargo +1.97.1-x86_64-pc-windows-gnu clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Tests
+        shell: pwsh
+        run: cargo +1.97.1-x86_64-pc-windows-gnu test --workspace --all-features --locked
+      - name: Dependency audit
+        shell: pwsh
+        run: |
+          cargo +1.97.1-x86_64-pc-windows-gnu install cargo-audit --version 0.22.2 --locked
+          cargo +1.97.1-x86_64-pc-windows-gnu audit
+
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install pinned MSVC toolchain
+        shell: pwsh
+        run: rustup toolchain install 1.97.1-x86_64-pc-windows-msvc --profile minimal
+      - name: Build release executable
+        shell: pwsh
+        run: cargo +1.97.1-x86_64-pc-windows-msvc build -p app-ui --release --locked
+      - name: Verify PE metadata and elevation manifest
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'target\release\winprofile-admin.exe'
+          $version = (Get-Item -LiteralPath $exe).VersionInfo.FileVersion
+          if ($version -ne '2026.819.0') { throw "Unexpected PE file version: $version" }
+          $manifest = Join-Path $env:RUNNER_TEMP 'winprofile-admin.manifest'
+          & mt.exe -nologo "-inputresource:$exe;#1" "-out:$manifest"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to extract PE manifest' }
+          if (-not (Select-String -LiteralPath $manifest -SimpleMatch 'requireAdministrator')) {
+            throw 'PE manifest does not require administrator elevation'
+          }
+      - name: Create SHA-256 checksum
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path 'target\release\winprofile-admin.exe'
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash.ToLowerInvariant()
+          "$hash  winprofile-admin.exe" | Set-Content -LiteralPath 'target\release\SHA256SUMS.txt' -Encoding ascii
+      - uses: actions/upload-artifact@v7
+        with:
+          name: winprofile-admin-UNSIGNED-${{ github.sha }}
+          path: |
+            target/release/winprofile-admin.exe
+            target/release/SHA256SUMS.txt
+          if-no-files-found: error
