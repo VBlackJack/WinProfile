@@ -23,9 +23,11 @@ use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegEnumKeyExW, RegLoadKeyW,
     RegOpenKeyExW, RegQueryValueExW, RegRenameKey, RegSaveKeyExW, RegSetValueExW, RegUnLoadKeyW,
     HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
-    HKEY_USERS, REG_DWORD, REG_EXPAND_SZ, REG_NO_COMPRESSION, REG_OPTION_NON_VOLATILE, REG_SZ,
+    HKEY_USERS, REG_DWORD, REG_EXPAND_SZ, REG_LATEST_FORMAT, REG_OPTION_NON_VOLATILE, REG_SZ,
     REG_VALUE_TYPE,
 };
+
+const SNAPSHOT_SAVE_FORMAT: u32 = REG_LATEST_FORMAT;
 
 #[derive(Error, Debug)]
 pub enum RegistryError {
@@ -385,15 +387,19 @@ pub fn enum_subkeys(hkey: &OwnedHKey) -> RegResult<Vec<String>> {
 
 /// Saves the specified registry key and all of its subkeys and values to a new binary hive file.
 pub fn save_key(hkey: &OwnedHKey, target_file: &Path) -> RegResult<()> {
+    save_key_with(
+        hkey.as_raw(),
+        target_file,
+        |raw_hkey, path, format| unsafe { RegSaveKeyExW(raw_hkey, path, std::ptr::null(), format) },
+    )
+}
+
+fn save_key_with<F>(hkey: HKEY, target_file: &Path, save: F) -> RegResult<()>
+where
+    F: FnOnce(HKEY, *const u16, u32) -> u32,
+{
     let wide_path = to_wide_null(target_file.as_os_str());
-    let status = unsafe {
-        RegSaveKeyExW(
-            hkey.as_raw(),
-            wide_path.as_ptr(),
-            std::ptr::null(),
-            REG_NO_COMPRESSION,
-        )
-    };
+    let status = save(hkey, wide_path.as_ptr(), SNAPSHOT_SAVE_FORMAT);
 
     if status == ERROR_SUCCESS {
         Ok(())
@@ -423,5 +429,28 @@ pub fn unload_hive(root: RegistryRoot, subkey: &str) -> RegResult<()> {
         Ok(())
     } else {
         Err(RegistryError::Win32Error(status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn registry_snapshot_uses_latest_format_without_no_compression() {
+        let observed_format = Cell::new(u32::MAX);
+        save_key_with(
+            std::ptr::null_mut(),
+            Path::new(r"C:\unused\snapshot.hiv"),
+            |_, path, format| {
+                assert!(!path.is_null());
+                observed_format.set(format);
+                ERROR_SUCCESS
+            },
+        )
+        .expect("simulated registry snapshot save");
+
+        assert_eq!(observed_format.get(), REG_LATEST_FORMAT);
     }
 }

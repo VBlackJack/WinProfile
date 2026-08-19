@@ -16,12 +16,15 @@
 
 #[cfg(test)]
 mod tests {
-    use audit_journal::{AuditLogger, AuditStatus, SnapshotMetadata};
+    use audit_journal::{AuditLogger, AuditStatus, SnapshotEngine, SnapshotMetadata};
     use chrono::Utc;
     use core_profiles::constants::*;
     use core_profiles::i18n::{t, t_args, I18nManager};
     use core_profiles::models::{ProfileAnomaly, ProfileHealth, UserProfile};
-    use core_profiles::{MigrationError, MigrationPlan, ProfileMigrationEngine};
+    use core_profiles::{
+        MigrationError, MigrationPlan, ProfileMigrationEngine, ProfileRepairEngine, RepairError,
+        RepairPlan,
+    };
     use platform_win32::SecureDirectory;
     use std::cell::Cell;
     use std::ffi::OsStr;
@@ -232,6 +235,61 @@ mod tests {
         let path = temp.path().join("audit.jsonl");
         assert!(AuditLogger::with_limits(Some(path.clone()), 10, 0, 1).is_err());
         assert!(AuditLogger::with_limits(Some(path), 10, 1024, 0).is_err());
+    }
+
+    #[test]
+    fn destructive_engines_fail_closed_on_operation_lock_while_dry_run_remains_available() {
+        let temp = TestDirectory::new();
+        let log_path = temp.path().join("audit.jsonl");
+        let holder = AuditLogger::new(Some(log_path.clone()), 10).expect("lock holder");
+        let worker = AuditLogger::new(Some(log_path), 10).expect("worker logger");
+        let held = holder
+            .acquire_operation_guard()
+            .expect("destructive operation guard");
+
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&source).expect("migration source");
+        let migration = ProfileMigrationEngine::new(&worker);
+        let migration_plan = MigrationPlan {
+            source_sid: "S-1-5-21-1001".to_string(),
+            source_path: source.display().to_string(),
+            target_path: target.display().to_string(),
+            include_roaming_appdata: false,
+            include_personal_folders: true,
+        };
+        assert!(matches!(
+            migration.execute_migration(&migration_plan, |_, _| {}),
+            Err(MigrationError::Audit(_))
+        ));
+        assert!(
+            !target.exists(),
+            "migration must not create its target before locking"
+        );
+
+        let snapshots =
+            SnapshotEngine::new(Some(temp.path().join("snapshots"))).expect("snapshot engine");
+        let repair = ProfileRepairEngine::new(&snapshots, &worker);
+        let mut repair_plan = RepairPlan {
+            sid: "invalid".to_string(),
+            canonical_sid: "invalid".to_string(),
+            profile_path: String::new(),
+            fix_bak: false,
+            reset_state: false,
+            unlock_hive: false,
+            dry_run: false,
+        };
+        assert!(matches!(
+            repair.execute_plan(&repair_plan, false),
+            Err(RepairError::AuditError(_))
+        ));
+
+        repair_plan.dry_run = true;
+        assert!(matches!(
+            repair.execute_plan(&repair_plan, false),
+            Err(RepairError::NoActionSelected)
+        ));
+        drop(held);
     }
 
     #[test]
@@ -521,22 +579,26 @@ mod tests {
 
     #[test]
     fn test_snapshot_metadata_serialization() {
-        let meta = SnapshotMetadata {
-            id: "snap_12345".into(),
-            timestamp: Utc::now(),
-            sid: "S-1-5-21-1001".into(),
-            profile_path: "C:\\Users\\TestUser".into(),
-            registry_key_path:
-                "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\S-1-5-21-1001"
-                    .into(),
-            snapshot_file_path: PathBuf::from("C:\\ProgramData\\WinProfile\\Snapshots\\snap_1.hiv"),
-            reason: "Pre-test snapshot".into(),
-        };
-
-        let json = serde_json::to_string_pretty(&meta).expect("Serialization failed");
+        let json = serde_json::json!({
+            "id": "snap_12345",
+            "timestamp": Utc::now(),
+            "sid": "S-1-5-21-1001",
+            "profile_path": "C:\\Users\\TestUser",
+            "registry_key_path": "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\S-1-5-21-1001",
+            "snapshot_file_name": "snap_1.hiv",
+            "sha256": "00".repeat(32),
+            "file_volume_serial": 1,
+            "file_index": 2,
+            "reason": "Pre-test snapshot"
+        })
+        .to_string();
         let deserialized: SnapshotMetadata =
             serde_json::from_str(&json).expect("Deserialization failed");
+        let serialized = serde_json::to_string_pretty(&deserialized).expect("Serialization failed");
         assert_eq!(deserialized.id, "snap_12345");
         assert_eq!(deserialized.sid, "S-1-5-21-1001");
+        assert!(!serialized.contains("C:\\\\ProgramData"));
+        assert!(!serialized.contains("protected_artifact"));
+        assert!(!serialized.contains("snapshot_file_path"));
     }
 }

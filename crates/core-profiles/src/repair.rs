@@ -67,6 +67,11 @@ struct RegistryMutation {
     canonical_backup: Option<String>,
 }
 
+struct RepairSnapshot {
+    metadata: SnapshotMetadata,
+    expected_registry_key_path: String,
+}
+
 /// Transactional repair executor for Windows user profiles.
 pub struct ProfileRepairEngine<'a> {
     snapshot_engine: &'a SnapshotEngine,
@@ -83,6 +88,11 @@ impl<'a> ProfileRepairEngine<'a> {
 
     /// Validates and executes a registry-only repair under mandatory snapshot protection.
     pub fn execute_plan(&self, plan: &RepairPlan, is_loaded: bool) -> RepairResult<()> {
+        let _operation_guard = if plan.dry_run {
+            None
+        } else {
+            Some(self.audit_logger.acquire_operation_guard()?)
+        };
         let validation = self.validate_plan(plan, is_loaded)?;
         if plan.dry_run {
             self.audit_logger.log(
@@ -239,7 +249,7 @@ impl<'a> ProfileRepairEngine<'a> {
         ))
     }
 
-    fn create_required_snapshots(&self, plan: &RepairPlan) -> RepairResult<Vec<SnapshotMetadata>> {
+    fn create_required_snapshots(&self, plan: &RepairPlan) -> RepairResult<Vec<RepairSnapshot>> {
         let mut paths = Vec::new();
         let canonical_path = format!("{REG_KEY_PROFILE_LIST}\\{}", plan.canonical_sid);
         let bak_path = format!("{canonical_path}{BAK_EXTENSION}");
@@ -256,12 +266,16 @@ impl<'a> ProfileRepairEngine<'a> {
 
         let mut snapshots = Vec::with_capacity(paths.len());
         for path in paths {
-            snapshots.push(self.snapshot_engine.create_registry_snapshot(
+            let metadata = self.snapshot_engine.create_registry_snapshot(
                 &path,
                 &plan.canonical_sid,
                 &plan.profile_path,
                 "Mandatory pre-repair snapshot",
-            )?);
+            )?;
+            snapshots.push(RepairSnapshot {
+                metadata,
+                expected_registry_key_path: format!("HKLM\\{path}"),
+            });
         }
         Ok(snapshots)
     }
@@ -369,23 +383,99 @@ impl<'a> ProfileRepairEngine<'a> {
         plan: &RepairPlan,
         parent: &platform_win32::OwnedHKey,
         mutation: &RegistryMutation,
-        snapshots: &[SnapshotMetadata],
+        snapshots: &[RepairSnapshot],
     ) -> RepairResult<()> {
         let canonical_name = &plan.canonical_sid;
         let bak_name = format!("{canonical_name}{BAK_EXTENSION}");
+        let mut errors = Vec::new();
 
-        if mutation.bak_moved && subkey_exists(parent, canonical_name)? {
-            rename_subkey(parent, canonical_name, &bak_name)?;
-        }
-        if let Some(backup_name) = mutation.canonical_backup.as_deref() {
-            if subkey_exists(parent, backup_name)? {
-                rename_subkey(parent, backup_name, canonical_name)?;
+        if mutation.bak_moved {
+            match subkey_exists(parent, canonical_name) {
+                Ok(true) => {
+                    if let Err(error) = rename_subkey(parent, canonical_name, &bak_name) {
+                        errors.push(format!("restore .bak name: {error}"));
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => errors.push(format!("inspect canonical key: {error}")),
             }
         }
-        for snapshot in snapshots {
-            restore_registry_snapshot(snapshot, Some(self.audit_logger))?;
+        if let Some(backup_name) = mutation.canonical_backup.as_deref() {
+            match subkey_exists(parent, backup_name) {
+                Ok(true) => {
+                    if let Err(error) = rename_subkey(parent, backup_name, canonical_name) {
+                        errors.push(format!("restore canonical name: {error}"));
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => errors.push(format!("inspect canonical backup: {error}")),
+            }
+        }
+        errors = attempt_all_then_audit(
+            snapshots,
+            errors,
+            |snapshot| {
+                restore_registry_snapshot(&snapshot.metadata, &snapshot.expected_registry_key_path)
+                    .map_err(|error| {
+                        format!("restore {}: {error}", snapshot.expected_registry_key_path)
+                    })
+            },
+            |restore_errors| {
+                let (status, details) = rollback_summary(snapshots.len(), restore_errors);
+                self.audit_logger
+                    .log(
+                        "RepairRollbackSummary",
+                        AUDIT_ACTOR,
+                        &plan.canonical_sid,
+                        status,
+                        details,
+                    )
+                    .map_err(|error| format!("rollback summary audit: {error}"))
+            },
+        );
+        if !errors.is_empty() {
+            return Err(RollbackError::Aggregate(errors.join("; ")).into());
         }
         Ok(())
+    }
+}
+
+fn attempt_all_then_audit<T, Restore, Audit>(
+    items: &[T],
+    mut errors: Vec<String>,
+    mut restore: Restore,
+    audit: Audit,
+) -> Vec<String>
+where
+    Restore: FnMut(&T) -> Result<(), String>,
+    Audit: FnOnce(&[String]) -> Result<(), String>,
+{
+    for item in items {
+        if let Err(error) = restore(item) {
+            errors.push(error);
+        }
+    }
+    if let Err(error) = audit(&errors) {
+        errors.push(error);
+    }
+    errors
+}
+
+fn rollback_summary(snapshot_count: usize, errors: &[String]) -> (AuditStatus, String) {
+    if errors.is_empty() {
+        (
+            AuditStatus::RolledBack,
+            format!("Rollback completed for {snapshot_count} snapshot(s)"),
+        )
+    } else {
+        (
+            AuditStatus::Failed,
+            format!(
+                "Rollback attempted all {snapshot_count} snapshot(s); {} error(s): {}",
+                errors.len(),
+                errors.join("; ")
+            ),
+        )
     }
 }
 
@@ -406,7 +496,9 @@ fn normalize_profile_path(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::is_valid_sid;
+    use super::{attempt_all_then_audit, is_valid_sid, rollback_summary};
+    use audit_journal::AuditStatus;
+    use std::cell::RefCell;
 
     #[test]
     fn sid_validation_is_strict() {
@@ -415,5 +507,52 @@ mod tests {
         assert!(!is_valid_sid("S-1-5-21-abc"));
         assert!(!is_valid_sid("S-1-5-21-"));
         assert!(!is_valid_sid(""));
+    }
+
+    #[test]
+    fn every_snapshot_is_attempted_before_audit_failure_is_reported() {
+        let attempted = RefCell::new(Vec::new());
+        let errors = attempt_all_then_audit(
+            &[1, 2],
+            Vec::new(),
+            |item| {
+                attempted.borrow_mut().push(*item);
+                if *item == 1 {
+                    Err("first restore failed".to_string())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| Err("summary audit failed".to_string()),
+        );
+        assert_eq!(*attempted.borrow(), vec![1, 2]);
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].contains("first restore"));
+        assert!(errors[1].contains("audit"));
+    }
+
+    #[test]
+    fn rename_error_makes_summary_failed_after_every_snapshot_attempt() {
+        let attempted = RefCell::new(Vec::new());
+        let summary = RefCell::new(None);
+        let errors = attempt_all_then_audit(
+            &[1, 2],
+            vec!["restore canonical name: access denied".to_string()],
+            |item| {
+                attempted.borrow_mut().push(*item);
+                Ok(())
+            },
+            |all_errors| {
+                summary.replace(Some(rollback_summary(2, all_errors)));
+                Ok(())
+            },
+        );
+
+        assert_eq!(*attempted.borrow(), vec![1, 2]);
+        assert_eq!(errors.len(), 1);
+        let (status, details) = summary.take().expect("summary captured");
+        assert_eq!(status, AuditStatus::Failed);
+        assert!(details.contains("restore canonical name: access denied"));
+        assert!(details.contains("attempted all 2 snapshot"));
     }
 }

@@ -66,6 +66,10 @@ enum ClosePolicy {
 
 #[derive(Error, Debug)]
 enum TrustedInstallerLaunchError {
+    #[error(
+        "TrustedInstaller operation lock acquisition failed before audit or process effects: {0}"
+    )]
+    OperationLock(String),
     #[error("TrustedInstaller launch request audit failed before process acquisition: {0}")]
     RequestAudit(String),
     #[error("TrustedInstaller process launch failed: {0}")]
@@ -95,10 +99,24 @@ trait TrustedInstallerAudit {
     fn record(&self, operation: &str, status: AuditStatus, details: String) -> Result<(), String>;
 }
 
+trait TrustedInstallerOperationLock {
+    type Guard;
+
+    fn acquire_trustedinstaller_operation_guard(&self) -> Result<Self::Guard, String>;
+}
+
 impl TrustedInstallerAudit for AuditLogger {
     fn record(&self, operation: &str, status: AuditStatus, details: String) -> Result<(), String> {
         self.log(operation, TI_AUDIT_ACTOR, TI_AUDIT_TARGET, status, details)
             .map_err(|error| error.to_string())
+    }
+}
+
+impl TrustedInstallerOperationLock for AuditLogger {
+    type Guard = audit_journal::OperationGuard;
+
+    fn acquire_trustedinstaller_operation_guard(&self) -> Result<Self::Guard, String> {
+        AuditLogger::acquire_operation_guard(self).map_err(|error| error.to_string())
     }
 }
 
@@ -129,10 +147,13 @@ fn execute_trustedinstaller_launch<A, L, P>(
     launcher: L,
 ) -> Result<u32, TrustedInstallerLaunchError>
 where
-    A: TrustedInstallerAudit,
+    A: TrustedInstallerAudit + TrustedInstallerOperationLock,
     L: FnOnce() -> Result<(P, u32), String>,
     P: ManagedTrustedInstallerProcess,
 {
+    let _operation_guard = audit
+        .acquire_trustedinstaller_operation_guard()
+        .map_err(TrustedInstallerLaunchError::OperationLock)?;
     audit
         .record(
             TI_REQUEST_OPERATION,
@@ -794,6 +815,17 @@ mod tests {
     struct FakeAudit {
         outcomes: Mutex<VecDeque<Result<(), String>>>,
         events: Mutex<Vec<(String, AuditStatus)>>,
+        operation_lock_error: Option<String>,
+        operation_lock_alive: Arc<AtomicBool>,
+        observed_lock_states: Mutex<Vec<bool>>,
+    }
+
+    struct FakeOperationGuard(Arc<AtomicBool>);
+
+    impl Drop for FakeOperationGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
     }
 
     impl FakeAudit {
@@ -806,11 +838,39 @@ mod tests {
                         .collect(),
                 ),
                 events: Mutex::new(Vec::new()),
+                operation_lock_error: None,
+                operation_lock_alive: Arc::new(AtomicBool::new(false)),
+                observed_lock_states: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_operation_lock_error(error: &'static str) -> Self {
+            let mut audit = Self::new([]);
+            audit.operation_lock_error = Some(error.to_string());
+            audit
         }
 
         fn events(&self) -> Vec<(String, AuditStatus)> {
             self.events.lock().expect("events lock").clone()
+        }
+
+        fn observed_lock_states(&self) -> Vec<bool> {
+            self.observed_lock_states
+                .lock()
+                .expect("lock observations")
+                .clone()
+        }
+    }
+
+    impl TrustedInstallerOperationLock for FakeAudit {
+        type Guard = FakeOperationGuard;
+
+        fn acquire_trustedinstaller_operation_guard(&self) -> Result<Self::Guard, String> {
+            if let Some(error) = self.operation_lock_error.as_ref() {
+                return Err(error.clone());
+            }
+            self.operation_lock_alive.store(true, Ordering::SeqCst);
+            Ok(FakeOperationGuard(Arc::clone(&self.operation_lock_alive)))
         }
     }
 
@@ -821,6 +881,10 @@ mod tests {
             status: AuditStatus,
             _details: String,
         ) -> Result<(), String> {
+            self.observed_lock_states
+                .lock()
+                .expect("lock observations")
+                .push(self.operation_lock_alive.load(Ordering::SeqCst));
             self.events
                 .lock()
                 .expect("events lock")
@@ -987,6 +1051,40 @@ mod tests {
             audit.events(),
             vec![(TI_REQUEST_OPERATION.to_string(), AuditStatus::Success)]
         );
+    }
+
+    #[test]
+    fn trustedinstaller_operation_lock_failure_prevents_request_and_launcher() {
+        let audit = FakeAudit::with_operation_lock_error("another operation is active");
+        let launcher_called = AtomicBool::new(false);
+
+        let result = execute_trustedinstaller_launch(&audit, || {
+            launcher_called.store(true, Ordering::SeqCst);
+            let (process, _, _) = FakeProcess::successful(41);
+            Ok((process, 1))
+        });
+
+        assert!(matches!(
+            result,
+            Err(TrustedInstallerLaunchError::OperationLock(error))
+                if error == "another operation is active"
+        ));
+        assert!(!launcher_called.load(Ordering::SeqCst));
+        assert!(audit.events().is_empty(), "REQUEST must not be journaled");
+    }
+
+    #[test]
+    fn trustedinstaller_operation_guard_covers_request_and_terminal_audit() {
+        let audit = FakeAudit::new([Ok(()), Ok(())]);
+        let (process, _, _) = FakeProcess::successful(4242);
+
+        assert_eq!(
+            execute_trustedinstaller_launch(&audit, || Ok((process, 7)))
+                .expect("trustedinstaller launch"),
+            4242
+        );
+        assert_eq!(audit.observed_lock_states(), vec![true, true]);
+        assert!(!audit.operation_lock_alive.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -145,6 +145,7 @@ impl<'a> ProfileMigrationEngine<'a> {
         F: FnMut(&str, f32),
         C: FnMut() -> bool,
     {
+        let _operation_guard = self.audit_logger.acquire_operation_guard()?;
         let (source_root, target_root) = validate_plan(plan)?;
         self.audit_logger.log(
             "MigrationStarted",

@@ -17,7 +17,9 @@
 pub mod journal;
 pub mod rollback;
 pub mod snapshot;
+pub mod storage;
 
-pub use journal::{AuditEntry, AuditError, AuditLogger, AuditResult, AuditStatus};
+pub use journal::{AuditEntry, AuditError, AuditLogger, AuditResult, AuditStatus, OperationGuard};
 pub use rollback::{restore_registry_snapshot, RollbackError, RollbackResult};
 pub use snapshot::{SnapshotEngine, SnapshotError, SnapshotMetadata, SnapshotResult};
+pub use storage::{StorageError, StorageResult};

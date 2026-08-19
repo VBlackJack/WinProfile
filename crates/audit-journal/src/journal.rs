@@ -17,17 +17,20 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
+
+use crate::storage::{StorageError, StorageLock, StorageRoot};
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_ARCHIVES: usize = 5;
-const PROGRAM_DATA_ENV: &str = "ProgramData";
-const PROGRAM_DATA_FALLBACK: &str = r"C:\ProgramData";
-const PRODUCT_DIR: &str = "WinProfile";
 const AUDIT_FILE: &str = "audit_log.jsonl";
 const EXPORT_DIR: &str = "Exports";
 
@@ -39,17 +42,26 @@ pub enum AuditError {
     Serialization(#[from] serde_json::Error),
     #[error("Audit memory buffer is poisoned")]
     BufferPoisoned,
-    #[error("Audit file lock is poisoned")]
-    FileLockPoisoned,
     #[error("Audit log contains an invalid entry at line {line}: {reason}")]
     InvalidEntry { line: usize, reason: String },
     #[error("Invalid audit configuration: {0}")]
     InvalidConfiguration(String),
     #[error("Audit entry is {actual} bytes, exceeding the {maximum}-byte file limit")]
     EntryTooLarge { actual: u64, maximum: u64 },
+    #[error("Protected storage error: {0}")]
+    Storage(#[from] StorageError),
 }
 
 pub type AuditResult<T> = Result<T, AuditError>;
+
+/// Exclusive kernel-backed guard for one destructive WinProfile transaction.
+///
+/// It is deliberately independent from the journal's internal storage lock,
+/// so terminal audit writes remain possible while this guard is held.
+#[derive(Debug)]
+pub struct OperationGuard {
+    _lock: StorageLock,
+}
 
 /// Status of an audited administrative operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,9 +86,10 @@ pub struct AuditEntry {
 /// Thread-safe, bounded JSON-lines audit logger.
 #[derive(Clone)]
 pub struct AuditLogger {
+    storage: Arc<StorageRoot>,
+    log_file_name: String,
     log_file_path: PathBuf,
     memory_buffer: Arc<Mutex<VecDeque<AuditEntry>>>,
-    file_lock: Arc<Mutex<()>>,
     max_memory_entries: usize,
     max_log_bytes: u64,
     max_archives: usize,
@@ -110,16 +123,30 @@ impl AuditLogger {
                 "at least one archive must be retained".to_string(),
             ));
         }
-        let log_file_path = custom_path.unwrap_or_else(default_log_path);
-        if let Some(parent) = log_file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let entries = load_recent_entries(&log_file_path, max_memory)?;
+        let (storage, log_file_name) = match custom_path {
+            Some(path) => {
+                let parent = path.parent().ok_or_else(|| {
+                    AuditError::InvalidConfiguration(
+                        "custom audit path must have an absolute parent".to_string(),
+                    )
+                })?;
+                let file_name = path.file_name().and_then(OsStr::to_str).ok_or_else(|| {
+                    AuditError::InvalidConfiguration(
+                        "custom audit path must have a Unicode file name".to_string(),
+                    )
+                })?;
+                (StorageRoot::trusted(parent)?, file_name.to_string())
+            }
+            None => (StorageRoot::production()?, AUDIT_FILE.to_string()),
+        };
+        let log_file_path = storage.child_path(&log_file_name)?;
+        let _storage_lock = storage.acquire_lock()?;
+        let entries = load_recent_entries(&storage, &log_file_name, max_memory)?;
         Ok(Self {
+            storage,
+            log_file_name,
             log_file_path,
             memory_buffer: Arc::new(Mutex::new(entries)),
-            file_lock: Arc::new(Mutex::new(())),
             max_memory_entries: max_memory,
             max_log_bytes,
             max_archives,
@@ -151,10 +178,7 @@ impl AuditLogger {
                 maximum: self.max_log_bytes,
             });
         }
-        let _file_guard = self
-            .file_lock
-            .lock()
-            .map_err(|_| AuditError::FileLockPoisoned)?;
+        let _storage_lock = self.storage.acquire_lock()?;
         // Acquire every fallible in-process guard before the durable append. Once
         // sync_data succeeds, only infallible buffer updates remain and Ok is guaranteed.
         let mut buffer = self
@@ -163,10 +187,8 @@ impl AuditLogger {
             .map_err(|_| AuditError::BufferPoisoned)?;
         self.rotate_if_needed(entry_bytes)?;
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_file_path)?;
+        let mut file = self.open_log_for_append()?;
+        file.seek(SeekFrom::End(0))?;
         writeln!(file, "{json_line}")?;
         file.flush()?;
         file.sync_data()?;
@@ -178,6 +200,23 @@ impl AuditLogger {
             buffer.push_back(entry);
         }
         Ok(())
+    }
+
+    /// Acquires the cross-process lock for one destructive operation.
+    pub fn acquire_operation_guard(&self) -> AuditResult<OperationGuard> {
+        Ok(OperationGuard {
+            _lock: self.storage.acquire_operation_lock()?,
+        })
+    }
+
+    #[cfg(test)]
+    fn acquire_operation_guard_with_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> AuditResult<OperationGuard> {
+        Ok(OperationGuard {
+            _lock: self.storage.acquire_operation_lock_with_timeout(timeout)?,
+        })
     }
 
     /// Returns recent entries ordered newest first.
@@ -200,33 +239,26 @@ impl AuditLogger {
 
     /// Creates a verified, non-overwriting export beside the protected audit directory.
     pub fn export_copy(&self) -> AuditResult<PathBuf> {
-        let _file_guard = self
-            .file_lock
-            .lock()
-            .map_err(|_| AuditError::FileLockPoisoned)?;
-        let parent = self
-            .log_file_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        let export_dir = parent.join(EXPORT_DIR);
-        std::fs::create_dir_all(&export_dir)?;
+        let _storage_lock = self.storage.acquire_lock()?;
+        let export_dir = self.storage.open_or_create_directory(EXPORT_DIR)?;
         let timestamp = Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
-        let export_path = export_dir.join(format!("audit-{timestamp}.jsonl"));
+        let export_name = format!("audit-{timestamp}.jsonl");
+        let export_path = export_dir.path().join(&export_name);
 
-        let mut source = File::open(&self.log_file_path)?;
-        let mut target = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&export_path)?;
-        std::io::copy(&mut source, &mut target)?;
-        target.flush()?;
-        target.sync_all()?;
+        let mut source =
+            self.storage
+                .open_file(&self.log_file_name, FILE_GENERIC_READ, FILE_SHARE_READ)?;
+        let mut target = export_dir.create_file(OsStr::new(&export_name), FILE_SHARE_READ)?;
+        std::io::copy(&mut source, target.file_mut())?;
+        target.file_mut().flush()?;
+        target.file_mut().sync_all()?;
 
-        if std::fs::metadata(&self.log_file_path)?.len() != std::fs::metadata(&export_path)?.len() {
+        if source.metadata()?.len() != target.file_mut().metadata()?.len() {
             return Err(AuditError::Io(std::io::Error::other(
                 "audit export size verification failed",
             )));
         }
+        target.commit();
         Ok(export_path)
     }
 
@@ -236,9 +268,13 @@ impl AuditLogger {
     }
 
     fn rotate_if_needed(&self, additional_bytes: u64) -> AuditResult<()> {
-        let current_bytes = match std::fs::metadata(&self.log_file_path) {
-            Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        let current_bytes = match self.storage.open_file(
+            &self.log_file_name,
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ) {
+            Ok(file) => file.metadata()?.len(),
+            Err(error) if error.is_not_found() => 0,
             Err(error) => return Err(error.into()),
         };
         if current_bytes.saturating_add(additional_bytes) <= self.max_log_bytes {
@@ -246,42 +282,67 @@ impl AuditLogger {
         }
 
         for index in (1..=self.max_archives).rev() {
-            let current = archive_path(&self.log_file_path, index);
+            let current_name = archive_name(&self.log_file_name, index);
             if index == self.max_archives {
-                if current.exists() {
-                    std::fs::remove_file(&current)?;
+                if self.validate_optional_file(&current_name)? {
+                    self.storage.remove_file_if_exists(&current_name)?;
                 }
-            } else if current.exists() {
-                std::fs::rename(&current, archive_path(&self.log_file_path, index + 1))?;
+            } else if self.validate_optional_file(&current_name)? {
+                self.storage
+                    .durable_rename(&current_name, &archive_name(&self.log_file_name, index + 1))?;
             }
         }
-        if self.log_file_path.exists() {
-            std::fs::rename(&self.log_file_path, archive_path(&self.log_file_path, 1))?;
+        if self.validate_optional_file(&self.log_file_name)? {
+            self.storage
+                .durable_rename(&self.log_file_name, &archive_name(&self.log_file_name, 1))?;
         }
         Ok(())
     }
+
+    fn validate_optional_file(&self, name: &str) -> AuditResult<bool> {
+        match self.storage.open_file(
+            name,
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        ) {
+            Ok(_) => Ok(true),
+            Err(error) if error.is_not_found() => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn open_log_for_append(&self) -> AuditResult<File> {
+        match self
+            .storage
+            .create_file(&self.log_file_name, FILE_SHARE_READ)
+        {
+            Ok(created) => Ok(created.commit()),
+            Err(error) if error.is_collision() => Ok(self.storage.open_file(
+                &self.log_file_name,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+                FILE_SHARE_READ,
+            )?),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
-fn default_log_path() -> PathBuf {
-    let program_data =
-        std::env::var(PROGRAM_DATA_ENV).unwrap_or_else(|_| PROGRAM_DATA_FALLBACK.to_string());
-    PathBuf::from(program_data)
-        .join(PRODUCT_DIR)
-        .join(AUDIT_FILE)
+fn archive_name(file_name: &str, index: usize) -> String {
+    format!("{file_name}.{index}")
 }
 
-fn archive_path(log_path: &Path, index: usize) -> PathBuf {
-    let file_name = log_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(AUDIT_FILE);
-    log_path.with_file_name(format!("{file_name}.{index}"))
-}
-
-fn load_recent_entries(path: &Path, max_memory: usize) -> AuditResult<VecDeque<AuditEntry>> {
-    let file = match File::open(path) {
+fn load_recent_entries(
+    storage: &StorageRoot,
+    file_name: &str,
+    max_memory: usize,
+) -> AuditResult<VecDeque<AuditEntry>> {
+    let file = match storage.open_file(
+        file_name,
+        FILE_GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    ) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(VecDeque::new()),
+        Err(error) if error.is_not_found() => return Ok(VecDeque::new()),
         Err(error) => return Err(error.into()),
     };
     let mut entries = VecDeque::with_capacity(max_memory);
@@ -359,5 +420,92 @@ mod tests {
             !log_path.exists(),
             "an error result must not conceal a durable append"
         );
+    }
+
+    #[test]
+    fn separate_logger_instances_never_interleave_json_lines() {
+        let test_directory = TestDirectory::new();
+        let log_path = test_directory.0.join("audit.jsonl");
+        let first =
+            AuditLogger::with_limits(Some(log_path.clone()), 0, 4096, 16).expect("first logger");
+        let second =
+            AuditLogger::with_limits(Some(log_path.clone()), 0, 4096, 16).expect("second logger");
+        let first_thread = std::thread::spawn(move || {
+            for index in 0..100 {
+                first
+                    .log(
+                        "concurrent",
+                        "first",
+                        index.to_string(),
+                        AuditStatus::Success,
+                        "durable line",
+                    )
+                    .expect("first append");
+            }
+        });
+        let second_thread = std::thread::spawn(move || {
+            for index in 0..100 {
+                second
+                    .log(
+                        "concurrent",
+                        "second",
+                        index.to_string(),
+                        AuditStatus::Success,
+                        "durable line",
+                    )
+                    .expect("second append");
+            }
+        });
+        first_thread.join().expect("first thread");
+        second_thread.join().expect("second thread");
+
+        let mut parsed = Vec::new();
+        for path in std::iter::once(log_path.clone()).chain(
+            (1..=16).map(|index| log_path.with_file_name(archive_name("audit.jsonl", index))),
+        ) {
+            let Ok(lines) = std::fs::read_to_string(path) else {
+                continue;
+            };
+            parsed.extend(
+                lines.lines().map(|line| {
+                    serde_json::from_str::<AuditEntry>(line).expect("complete JSON line")
+                }),
+            );
+        }
+        assert_eq!(parsed.len(), 200);
+    }
+
+    #[test]
+    fn operation_lock_is_exclusive_released_on_drop_and_does_not_deadlock_audit() {
+        let test_directory = TestDirectory::new();
+        let log_path = test_directory.0.join("audit.jsonl");
+        let first = AuditLogger::new(Some(log_path.clone()), 10).expect("first logger");
+        let second = AuditLogger::new(Some(log_path), 10).expect("second logger");
+
+        let held = first
+            .acquire_operation_guard()
+            .expect("first operation guard");
+        assert!(matches!(
+            second.acquire_operation_guard_with_timeout(std::time::Duration::from_millis(30)),
+            Err(AuditError::Storage(StorageError::LockTimeout(_)))
+        ));
+
+        first
+            .log(
+                "OperationTerminal",
+                "test",
+                "guard",
+                AuditStatus::Success,
+                "journal storage lock remains independent",
+            )
+            .expect("terminal audit while operation guard is held");
+        first
+            .export_copy()
+            .expect("export must not take the destructive operation lock");
+
+        drop(held);
+        second
+            .acquire_operation_guard_with_timeout(std::time::Duration::from_millis(30))
+            .expect("operation guard after release");
     }
 }
