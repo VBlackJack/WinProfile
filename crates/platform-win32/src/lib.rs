@@ -17,6 +17,7 @@
 pub mod handles;
 pub mod registry;
 pub mod restart_manager;
+pub mod secure_fs;
 pub mod security;
 pub mod tokens;
 
@@ -30,6 +31,10 @@ pub use registry::{
 pub use restart_manager::{
     LockingProcessInfo, RestartManagerError, RestartManagerSession, RmResult, RM_FORCE_SHUTDOWN,
     RM_NORMAL_SHUTDOWN,
+};
+pub use secure_fs::{
+    SecureCreatedEntry, SecureDirEntry, SecureDirectory, SecureEntryKind, SecureFsError,
+    SecureFsResult,
 };
 pub use security::{
     is_process_elevated, lookup_account_by_sid_string, path_is_reparse_point, PrivilegeGuard,

@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use audit_journal::{AuditError, AuditLogger, AuditStatus};
-use platform_win32::path_is_reparse_point;
+use platform_win32::{
+    SecureCreatedEntry, SecureDirectory, SecureEntryKind, SecureFsError, SecureFsResult,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -71,24 +73,16 @@ pub struct MigrationReceipt {
 
 #[derive(Debug, Default)]
 struct CopyTransaction {
-    created_files: Vec<PathBuf>,
-    created_directories: Vec<PathBuf>,
+    created_entries: Vec<SecureCreatedEntry>,
     manifest: Vec<(String, u64, String)>,
 }
 
 impl CopyTransaction {
-    fn rollback(&mut self) -> std::io::Result<()> {
+    fn rollback(&mut self) -> SecureFsResult<()> {
         let mut first_error = None;
-        for path in self.created_files.iter().rev() {
-            if let Err(error) = std::fs::remove_file(path) {
-                if error.kind() != std::io::ErrorKind::NotFound && first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        for path in self.created_directories.iter().rev() {
-            if let Err(error) = std::fs::remove_dir(path) {
-                if error.kind() != std::io::ErrorKind::NotFound && first_error.is_none() {
+        while let Some(entry) = self.created_entries.pop() {
+            if let Err(error) = entry.remove() {
+                if first_error.is_none() {
                     first_error = Some(error);
                 }
             }
@@ -166,14 +160,20 @@ impl<'a> ProfileMigrationEngine<'a> {
 
         let mut transaction = CopyTransaction::default();
         let operation = (|| {
-            ensure_directory(&target_root, &mut transaction)?;
-            reject_reparse_point(&target_root)?;
+            let source_directory = SecureDirectory::open_absolute_existing(&source_root)
+                .map_err(|error| map_source_root_error(error, &source_root))?;
+            let (target_directory, created_target_entries) =
+                SecureDirectory::open_or_create_absolute(&target_root).map_err(map_secure_error)?;
+            transaction.created_entries.extend(created_target_entries);
+            validate_opened_roots(&source_directory, &target_directory)?;
 
-            let dpapi_path = source_root
-                .join(APPDATA_ROAMING_REL_PATH)
-                .join("Microsoft")
-                .join("Protect");
-            if dpapi_path.exists() {
+            if secure_directory_exists(
+                &source_directory,
+                Path::new(APPDATA_ROAMING_REL_PATH)
+                    .join("Microsoft")
+                    .join("Protect")
+                    .as_path(),
+            )? {
                 self.audit_logger.log(
                     "MigrationWarning",
                     "WinProfile-Admin",
@@ -201,23 +201,36 @@ impl<'a> ProfileMigrationEngine<'a> {
                 if is_cancelled() {
                     return Err(MigrationError::Cancelled);
                 }
-                let source = source_root.join(relative_root);
-                if !source.exists() {
+                let Some(source) = open_relative_directory_if_present(
+                    &source_directory,
+                    Path::new(relative_root),
+                )?
+                else {
                     continue;
-                }
-                let destination = target_root.join(relative_root);
+                };
+                let destination = ensure_relative_directory(
+                    &target_directory,
+                    Path::new(relative_root),
+                    &mut transaction,
+                )?;
                 on_progress(relative_root, 0.1 + (index as f32 / total_roots) * 0.8);
                 copy_tree_verified(
                     &source,
                     &destination,
-                    &source_root,
+                    Path::new(relative_root),
                     &mut transaction,
                     &mut is_cancelled,
                 )?;
             }
 
+            if is_cancelled() {
+                return Err(MigrationError::Cancelled);
+            }
             let receipt = transaction.receipt();
             on_progress("complete", 1.0);
+            if is_cancelled() {
+                return Err(MigrationError::Cancelled);
+            }
             self.audit_logger.log(
                 "MigrationSuccess",
                 "WinProfile-Admin",
@@ -278,31 +291,17 @@ fn validate_plan(plan: &MigrationPlan) -> MigrationResult<(PathBuf, PathBuf)> {
     if !source.is_dir() {
         return Err(MigrationError::SourceNotFound(plan.source_path.clone()));
     }
-    reject_reparse_point(source)?;
-    let source = source.canonicalize()?;
-    let target = canonicalize_allow_missing(Path::new(&plan.target_path))?;
-    if source == target || target.starts_with(&source) || source.starts_with(&target) {
+    let source = absolute_normalized(source)?;
+    let target = absolute_normalized(Path::new(&plan.target_path))?;
+    if paths_overlap(&source, &target) {
         return Err(MigrationError::InvalidPlan(
             "source and destination directories must not overlap".to_string(),
         ));
     }
-    if target.exists() {
-        if !target.is_dir() {
-            return Err(MigrationError::InvalidPlan(
-                "destination exists but is not a directory".to_string(),
-            ));
-        }
-        reject_reparse_point(&target)?;
-        let canonical_target = target.canonicalize()?;
-        if canonical_target == source
-            || canonical_target.starts_with(&source)
-            || source.starts_with(&canonical_target)
-        {
-            return Err(MigrationError::InvalidPlan(
-                "canonical source and destination directories overlap".to_string(),
-            ));
-        }
-        return Ok((source, canonical_target));
+    if target.exists() && !target.is_dir() {
+        return Err(MigrationError::InvalidPlan(
+            "destination exists but is not a directory".to_string(),
+        ));
     }
     Ok((source, target))
 }
@@ -326,132 +325,77 @@ fn absolute_normalized(path: &Path) -> std::io::Result<PathBuf> {
     Ok(normalized)
 }
 
-fn canonicalize_allow_missing(path: &Path) -> std::io::Result<PathBuf> {
-    let normalized = absolute_normalized(path)?;
-    if normalized.exists() {
-        return normalized.canonicalize();
-    }
-    let mut existing_ancestor = normalized.as_path();
-    let mut missing_components = Vec::new();
-    while !existing_ancestor.exists() {
-        let name = existing_ancestor.file_name().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no existing ancestor for {}", normalized.display()),
-            )
-        })?;
-        missing_components.push(name.to_os_string());
-        existing_ancestor = existing_ancestor.parent().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("no existing ancestor for {}", normalized.display()),
-            )
-        })?;
-    }
-    let mut canonical = existing_ancestor.canonicalize()?;
-    for component in missing_components.iter().rev() {
-        canonical.push(component);
-    }
-    Ok(canonical)
-}
-
-fn reject_reparse_point(path: &Path) -> MigrationResult<()> {
-    match path_is_reparse_point(path) {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(MigrationError::ReparsePoint(path.display().to_string())),
-        Err(error) => Err(MigrationError::Security(format!(
-            "{}: {error}",
-            path.display()
-        ))),
-    }
-}
-
-fn ensure_directory(path: &Path, transaction: &mut CopyTransaction) -> MigrationResult<()> {
-    if path.exists() {
-        if !path.is_dir() {
-            return Err(MigrationError::DestinationExists(
-                path.display().to_string(),
-            ));
-        }
-        reject_reparse_point(path)?;
-        return Ok(());
-    }
-    let parent = path.parent().ok_or_else(|| {
-        MigrationError::InvalidPlan(format!("directory has no parent: {}", path.display()))
-    })?;
-    ensure_directory(parent, transaction)?;
-    std::fs::create_dir(path)?;
-    transaction.created_directories.push(path.to_path_buf());
-    Ok(())
-}
-
 fn copy_tree_verified<C>(
-    source: &Path,
-    destination: &Path,
-    source_root: &Path,
+    source: &SecureDirectory,
+    destination: &SecureDirectory,
+    relative_directory: &Path,
     transaction: &mut CopyTransaction,
     is_cancelled: &mut C,
 ) -> MigrationResult<()>
 where
     C: FnMut() -> bool,
 {
-    reject_reparse_point(source)?;
-    ensure_directory(destination, transaction)?;
-    let mut entries = std::fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-
-    for entry in entries {
+    for entry in source.entries().map_err(map_secure_error)? {
         if is_cancelled() {
             return Err(MigrationError::Cancelled);
         }
-        let source_path = entry.path();
-        reject_reparse_point(&source_path)?;
-        let destination_path = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_tree_verified(
-                &source_path,
-                &destination_path,
-                source_root,
+        let relative_path = relative_directory.join(&entry.name);
+        match entry.kind {
+            SecureEntryKind::Directory => {
+                let source_child = source
+                    .open_directory(&entry.name)
+                    .map_err(map_secure_error)?;
+                let (destination_child, created) = destination
+                    .open_or_create_directory(&entry.name)
+                    .map_err(map_secure_error)?;
+                if let Some(created) = created {
+                    transaction.created_entries.push(created);
+                }
+                copy_tree_verified(
+                    &source_child,
+                    &destination_child,
+                    &relative_path,
+                    transaction,
+                    is_cancelled,
+                )?;
+            }
+            SecureEntryKind::File => copy_file_verified(
+                source,
+                destination,
+                &entry.name,
+                &relative_path,
                 transaction,
                 is_cancelled,
-            )?;
-        } else if file_type.is_file() {
-            copy_file_verified(&source_path, &destination_path, source_root, transaction)?;
-        } else {
-            return Err(MigrationError::InvalidPlan(format!(
-                "unsupported filesystem entry: {}",
-                source_path.display()
-            )));
+            )?,
         }
     }
     Ok(())
 }
 
-fn copy_file_verified(
-    source: &Path,
-    destination: &Path,
-    source_root: &Path,
+fn copy_file_verified<C>(
+    source_directory: &SecureDirectory,
+    destination_directory: &SecureDirectory,
+    name: &std::ffi::OsStr,
+    relative_path: &Path,
     transaction: &mut CopyTransaction,
-) -> MigrationResult<()> {
-    let mut input = File::open(source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                MigrationError::DestinationExists(destination.display().to_string())
-            } else {
-                error.into()
-            }
-        })?;
-    transaction.created_files.push(destination.to_path_buf());
+    is_cancelled: &mut C,
+) -> MigrationResult<()>
+where
+    C: FnMut() -> bool,
+{
+    let mut input = source_directory.open_file(name).map_err(map_secure_error)?;
+    let (mut output, created) = destination_directory
+        .create_file(name)
+        .map_err(map_secure_error)?;
+    transaction.created_entries.push(created);
 
     let mut source_hasher = Sha256::new();
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     let mut copied_bytes = 0u64;
     loop {
+        if is_cancelled() {
+            return Err(MigrationError::Cancelled);
+        }
         let count = input.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -460,33 +404,37 @@ fn copy_file_verified(
         source_hasher.update(&buffer[..count]);
         copied_bytes = copied_bytes.saturating_add(count as u64);
     }
+    if is_cancelled() {
+        return Err(MigrationError::Cancelled);
+    }
     output.flush()?;
     output.sync_all()?;
-    drop(output);
 
     let source_sha = format!("{:x}", source_hasher.finalize());
-    let destination_sha = sha256_file(destination)?;
-    if source_sha != destination_sha || copied_bytes != std::fs::metadata(destination)?.len() {
+    output.seek(SeekFrom::Start(0))?;
+    let destination_sha = sha256_file(&mut output, is_cancelled)?;
+    if source_sha != destination_sha || copied_bytes != output.metadata()?.len() {
         return Err(MigrationError::VerificationFailed(
-            destination.display().to_string(),
+            relative_path.display().to_string(),
         ));
     }
-    let relative = source
-        .strip_prefix(source_root)
-        .map_err(|_| MigrationError::VerificationFailed(source.display().to_string()))?
-        .to_string_lossy()
-        .replace('\\', "/");
+    let relative = relative_path.to_string_lossy().replace('\\', "/");
     transaction
         .manifest
         .push((relative, copied_bytes, source_sha));
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> std::io::Result<String> {
-    let mut file = File::open(path)?;
+fn sha256_file<C>(file: &mut File, is_cancelled: &mut C) -> MigrationResult<String>
+where
+    C: FnMut() -> bool,
+{
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     loop {
+        if is_cancelled() {
+            return Err(MigrationError::Cancelled);
+        }
         let count = file.read(&mut buffer)?;
         if count == 0 {
             break;
@@ -494,4 +442,103 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
         hasher.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn open_relative_directory_if_present(
+    root: &SecureDirectory,
+    relative: &Path,
+) -> MigrationResult<Option<SecureDirectory>> {
+    let mut current = None;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(MigrationError::InvalidPlan(format!(
+                "invalid relative migration root: {}",
+                relative.display()
+            )));
+        };
+        let parent = current.as_ref().unwrap_or(root);
+        match parent.open_directory(name) {
+            Ok(next) => current = Some(next),
+            Err(SecureFsError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(map_secure_error(error)),
+        }
+    }
+    Ok(current)
+}
+
+fn ensure_relative_directory(
+    root: &SecureDirectory,
+    relative: &Path,
+    transaction: &mut CopyTransaction,
+) -> MigrationResult<SecureDirectory> {
+    let mut current = None;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(MigrationError::InvalidPlan(format!(
+                "invalid relative migration destination: {}",
+                relative.display()
+            )));
+        };
+        let parent = current.as_ref().unwrap_or(root);
+        let (next, created) = parent
+            .open_or_create_directory(name)
+            .map_err(map_secure_error)?;
+        if let Some(created) = created {
+            transaction.created_entries.push(created);
+        }
+        current = Some(next);
+    }
+    current.ok_or_else(|| {
+        MigrationError::InvalidPlan("empty relative migration destination".to_string())
+    })
+}
+
+fn secure_directory_exists(root: &SecureDirectory, relative: &Path) -> MigrationResult<bool> {
+    Ok(open_relative_directory_if_present(root, relative)?.is_some())
+}
+
+fn validate_opened_roots(
+    source: &SecureDirectory,
+    target: &SecureDirectory,
+) -> MigrationResult<()> {
+    if source.overlaps(target) {
+        return Err(MigrationError::InvalidPlan(
+            "opened source and destination directory handles overlap".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn paths_overlap(first: &Path, second: &Path) -> bool {
+    let first = normalized_path_key(first);
+    let second = normalized_path_key(second);
+    first == second
+        || second
+            .strip_prefix(&first)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
+        || first
+            .strip_prefix(&second)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
+}
+
+fn normalized_path_key(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_lowercase()
+}
+
+fn map_source_root_error(error: SecureFsError, source: &Path) -> MigrationError {
+    match error {
+        SecureFsError::NotFound(_) => MigrationError::SourceNotFound(source.display().to_string()),
+        other => map_secure_error(other),
+    }
+}
+
+fn map_secure_error(error: SecureFsError) -> MigrationError {
+    match error {
+        SecureFsError::ReparsePoint(path) => MigrationError::ReparsePoint(path),
+        SecureFsError::AlreadyExists(path) => MigrationError::DestinationExists(path),
+        other => MigrationError::Security(other.to_string()),
+    }
 }

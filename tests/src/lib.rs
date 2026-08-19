@@ -22,7 +22,12 @@ mod tests {
     use core_profiles::i18n::{t, t_args, I18nManager};
     use core_profiles::models::{ProfileAnomaly, ProfileHealth, UserProfile};
     use core_profiles::{MigrationError, MigrationPlan, ProfileMigrationEngine};
+    use platform_win32::SecureDirectory;
+    use std::cell::Cell;
+    use std::ffi::OsStr;
+    use std::fs::OpenOptions;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -54,6 +59,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    struct SubstDrive(String);
+
+    impl SubstDrive {
+        fn new(target: &Path) -> Self {
+            for letter in ('T'..='Z').rev() {
+                let drive = format!("{letter}:");
+                if Path::new(&format!(r"{drive}\")).exists() {
+                    continue;
+                }
+                let status = Command::new("subst.exe")
+                    .arg(&drive)
+                    .arg(target)
+                    .status()
+                    .expect("run subst fixture");
+                if status.success() {
+                    return Self(drive);
+                }
+            }
+            panic!("no free drive letter for SUBST overlap fixture");
+        }
+
+        fn root(&self) -> PathBuf {
+            PathBuf::from(format!(r"{}\", self.0))
+        }
+    }
+
+    impl Drop for SubstDrive {
+        fn drop(&mut self) {
+            let _ = Command::new("subst.exe").arg(&self.0).arg("/D").status();
+        }
+    }
+
+    fn create_junction(link: &Path, target: &Path) {
+        let result = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("run mklink junction fixture");
+        assert!(
+            result.status.success(),
+            "mklink failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     #[test]
@@ -270,6 +321,180 @@ mod tests {
             Err(MigrationError::Cancelled)
         ));
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn test_migration_rejects_intermediate_junction_component() {
+        let temp = TestDirectory::new();
+        let real_source = temp.path().join("real-source");
+        let junction = temp.path().join("source-junction");
+        let source = junction.join("profile");
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(real_source.join("profile").join("Documents"))
+            .expect("real source directory");
+        std::fs::write(
+            real_source
+                .join("profile")
+                .join("Documents")
+                .join("data.txt"),
+            b"must not be reached through a junction",
+        )
+        .expect("source file");
+        create_junction(&junction, &real_source);
+
+        let logger =
+            AuditLogger::new(Some(temp.path().join("audit.jsonl")), 20).expect("audit logger");
+        let engine = ProfileMigrationEngine::new(&logger);
+        let plan = MigrationPlan {
+            source_sid: "S-1-5-21-1001".to_string(),
+            source_path: source.display().to_string(),
+            target_path: target.display().to_string(),
+            include_roaming_appdata: false,
+            include_personal_folders: true,
+        };
+
+        let result = engine.execute_migration(&plan, |_, _| {});
+        std::fs::remove_dir(&junction).expect("remove junction fixture");
+        assert!(matches!(result, Err(MigrationError::ReparsePoint(_))));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn test_migration_never_writes_through_intermediate_target_junction() {
+        let temp = TestDirectory::new();
+        let source = temp.path().join("source");
+        let real_target = temp.path().join("real-target");
+        let junction = temp.path().join("target-junction");
+        let target = junction.join("profile");
+        std::fs::create_dir_all(source.join("Documents")).expect("source directory");
+        std::fs::create_dir(&real_target).expect("real target directory");
+        std::fs::write(source.join("Documents").join("data.txt"), b"data").expect("source file");
+        create_junction(&junction, &real_target);
+
+        let logger =
+            AuditLogger::new(Some(temp.path().join("audit.jsonl")), 20).expect("audit logger");
+        let engine = ProfileMigrationEngine::new(&logger);
+        let plan = MigrationPlan {
+            source_sid: "S-1-5-21-1001".to_string(),
+            source_path: source.display().to_string(),
+            target_path: target.display().to_string(),
+            include_roaming_appdata: false,
+            include_personal_folders: true,
+        };
+
+        let result = engine.execute_migration(&plan, |_, _| {});
+        std::fs::remove_dir(&junction).expect("remove junction fixture");
+        assert!(matches!(result, Err(MigrationError::ReparsePoint(_))));
+        assert!(
+            !real_target.join("profile").exists(),
+            "migration must not create through a destination junction"
+        );
+    }
+
+    #[test]
+    fn test_migration_rejects_subst_alias_overlap_by_handle_identity() {
+        let temp = TestDirectory::new();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("Documents")).expect("source directory");
+        std::fs::write(source.join("Documents").join("data.txt"), b"data").expect("source file");
+        let alias = SubstDrive::new(&source);
+        let target = alias.root().join("nested-target");
+        let logger =
+            AuditLogger::new(Some(temp.path().join("audit.jsonl")), 20).expect("audit logger");
+        let engine = ProfileMigrationEngine::new(&logger);
+        let plan = MigrationPlan {
+            source_sid: "S-1-5-21-1001".to_string(),
+            source_path: source.display().to_string(),
+            target_path: target.display().to_string(),
+            include_roaming_appdata: false,
+            include_personal_folders: true,
+        };
+
+        assert!(matches!(
+            engine.execute_migration(&plan, |_, _| {}),
+            Err(MigrationError::InvalidPlan(_))
+        ));
+        assert!(
+            !source.join("nested-target").exists(),
+            "alias target created during validation must be rolled back"
+        );
+    }
+
+    #[test]
+    fn test_secure_file_handles_block_concurrent_write_and_delete() {
+        let temp = TestDirectory::new();
+        let source_path = temp.path().join("source.bin");
+        let destination_path = temp.path().join("destination.bin");
+        std::fs::write(&source_path, b"stable source").expect("source fixture");
+        let directory =
+            SecureDirectory::open_absolute_existing(temp.path()).expect("secure directory");
+
+        let source = directory
+            .open_file(OsStr::new("source.bin"))
+            .expect("secure source handle");
+        let source_write_error = OpenOptions::new()
+            .write(true)
+            .open(&source_path)
+            .expect_err("concurrent source write must be denied");
+        assert_eq!(source_write_error.raw_os_error(), Some(32));
+        let source_delete_error = std::fs::remove_file(&source_path)
+            .expect_err("concurrent source delete must be denied");
+        assert_eq!(source_delete_error.raw_os_error(), Some(32));
+        drop(source);
+
+        let (destination, created) = directory
+            .create_file(OsStr::new("destination.bin"))
+            .expect("secure destination handle");
+        drop(destination);
+        let destination_write_error = OpenOptions::new()
+            .write(true)
+            .open(&destination_path)
+            .expect_err("transaction handle must retain the destination write lock");
+        assert_eq!(destination_write_error.raw_os_error(), Some(32));
+        let destination_delete_error = std::fs::remove_file(&destination_path)
+            .expect_err("transaction handle must retain the destination delete lock");
+        assert_eq!(destination_delete_error.raw_os_error(), Some(32));
+
+        created.remove().expect("remove exact created handle");
+        assert!(!destination_path.exists());
+    }
+
+    #[test]
+    fn test_cancellation_during_large_file_rolls_back_exact_created_handles() {
+        let temp = TestDirectory::new();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(source.join("Documents")).expect("source directory");
+        std::fs::write(
+            source.join("Documents").join("large.bin"),
+            vec![0x5a; 8 * 1024 * 1024],
+        )
+        .expect("large source file");
+        let logger =
+            AuditLogger::new(Some(temp.path().join("audit.jsonl")), 20).expect("audit logger");
+        let engine = ProfileMigrationEngine::new(&logger);
+        let plan = MigrationPlan {
+            source_sid: "S-1-5-21-1001".to_string(),
+            source_path: source.display().to_string(),
+            target_path: target.display().to_string(),
+            include_roaming_appdata: false,
+            include_personal_folders: true,
+        };
+        let checks = Cell::new(0usize);
+
+        let result = engine.execute_migration_with_cancel(
+            &plan,
+            |_, _| {},
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next >= 5
+            },
+        );
+
+        assert!(matches!(result, Err(MigrationError::Cancelled)));
+        assert!(checks.get() >= 5, "cancellation was not polled per chunk");
+        assert!(!target.exists(), "cancelled target must be rolled back");
     }
 
     #[test]

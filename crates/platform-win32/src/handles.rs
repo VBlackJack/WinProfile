@@ -15,9 +15,13 @@
  */
 
 use std::ffi::c_void;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+use std::ptr::null_mut;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::Environment::DestroyEnvironmentBlock;
 use windows_sys::Win32::System::Services::{CloseServiceHandle, SC_HANDLE};
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 /// RAII wrapper around a Win32 generic HANDLE.
 /// Automatically invokes `CloseHandle` on drop if valid.
@@ -52,6 +56,27 @@ impl OwnedHandle {
         let h = self.handle;
         std::mem::forget(self);
         h
+    }
+
+    /// Duplicates this handle while preserving its granted access rights.
+    pub fn try_clone(&self) -> Result<Self, std::io::Error> {
+        let mut duplicate = null_mut();
+        let process = unsafe { GetCurrentProcess() };
+        let duplicated = unsafe {
+            DuplicateHandle(
+                process,
+                self.handle,
+                process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if duplicated == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Self::from_raw_checked(duplicate)
     }
 }
 
