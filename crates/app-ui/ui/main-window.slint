@@ -49,6 +49,8 @@ export global AppStrings {
     in-out property <string> app-subtitle;
     in-out property <string> app-version;
     in-out property <string> app-license;
+    in-out property <string> language-english;
+    in-out property <string> language-french;
     in-out property <string> nav-dashboard;
     in-out property <string> nav-repair;
     in-out property <string> nav-migration;
@@ -110,6 +112,26 @@ export global AppStrings {
     in-out property <string> cancel;
 }
 
+component LanguageSelector inherits HorizontalLayout {
+    in property <string> current-locale;
+    in property <bool> selector-enabled: true;
+    callback selected(string);
+    spacing: 4px;
+
+    Button {
+        text: AppStrings.language-english;
+        checked: root.current-locale == "en";
+        enabled: root.selector-enabled;
+        clicked => { root.selected("en"); }
+    }
+    Button {
+        text: AppStrings.language-french;
+        checked: root.current-locale == "fr";
+        enabled: root.selector-enabled;
+        clicked => { root.selected("fr"); }
+    }
+}
+
 component StatCard inherits Rectangle {
     in property <string> card-title;
     in property <string> value;
@@ -140,6 +162,7 @@ export component MainWindow inherits Window {
     in-out property <string> status-message;
     in-out property <bool> is-elevated: false;
     in-out property <bool> operation-busy: false;
+    in-out property <string> current-locale: "en";
     in-out property <bool> migration-running: false;
     in-out property <[ProfileEntry]> profiles: [];
     in-out property <[AuditLogEntry]> audit-entries: [];
@@ -177,6 +200,9 @@ export component MainWindow inherits Window {
     in-out property <bool> startup-consent-required: false;
     in-out property <bool> startup-consent-granted: false;
     property <bool> modal-visible: root.startup-visible || root.confirmation-visible || root.about-visible;
+    out property <bool> language-switch-enabled: root.startup-visible || (!root.operation-busy && !root.modal-visible);
+    property <bool> startup-quit-has-focus: false;
+    out property <bool> startup-quit-focused: root.startup-visible && root.startup-quit-has-focus;
 
     callback scan-profiles();
     callback select-profile(int);
@@ -190,6 +216,7 @@ export component MainWindow inherits Window {
     callback clear-audit-logs();
     callback startup-proceed();
     callback startup-quit();
+    callback change-locale(string);
 
     Rectangle {
         background: DraculaTheme.background;
@@ -212,6 +239,11 @@ export component MainWindow inherits Window {
                     HorizontalLayout {
                         alignment: end;
                         spacing: DraculaTheme.spacing-md;
+                        LanguageSelector {
+                            current-locale: root.current-locale;
+                            selector-enabled: root.language-switch-enabled;
+                            selected(locale) => { root.change-locale(locale); }
+                        }
                         Button {
                             text: AppStrings.about;
                             enabled: !root.operation-busy && !root.modal-visible;
@@ -611,7 +643,7 @@ export component MainWindow inherits Window {
         if root.startup-visible && !root.about-visible: Rectangle {
             background: DraculaTheme.background;
             FocusScope {
-                forward-focus: startup-quit;
+                forward-focus: startup-quit-button;
                 init => { self.focus(); }
                 key-pressed(event) => {
                     if event.text == Key.Escape && !root.startup-busy {
@@ -659,11 +691,21 @@ export component MainWindow inherits Window {
                             }
                             HorizontalLayout {
                                 alignment: end;
+                                LanguageSelector {
+                                    current-locale: root.current-locale;
+                                    selector-enabled: true;
+                                    selected(locale) => { root.change-locale(locale); }
+                                }
+                            }
+                            HorizontalLayout {
+                                alignment: end;
                                 spacing: DraculaTheme.spacing-md;
-                                startup-quit := Button {
+                                startup-quit-button := Button {
                                     text: root.startup-quit-text;
                                     enabled: !root.startup-busy;
                                     primary: true;
+                                    changed enabled => { if self.enabled { self.focus(); } }
+                                    changed has-focus => { root.startup-quit-has-focus = self.has-focus; }
                                     clicked => { root.startup-quit(); }
                                 }
                                 Button {

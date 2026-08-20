@@ -15,6 +15,8 @@
  */
 
 use std::rc::Rc;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -62,6 +64,44 @@ enum ClosePolicy {
     Allow,
     Block,
     CancelMigration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MigrationTerminalPresentation {
+    Success {
+        files: usize,
+        bytes: u64,
+        manifest_hash: String,
+    },
+    Cancelled,
+    Error {
+        details: String,
+    },
+}
+
+impl MigrationTerminalPresentation {
+    fn render(&self) -> String {
+        match self {
+            Self::Success {
+                files,
+                bytes,
+                manifest_hash,
+            } => {
+                let files = files.to_string();
+                let bytes = bytes.to_string();
+                t_args(
+                    "migration.success",
+                    &[
+                        ("files", files.as_str()),
+                        ("bytes", bytes.as_str()),
+                        ("hash", manifest_hash.as_str()),
+                    ],
+                )
+            }
+            Self::Cancelled => t("status.cancelled"),
+            Self::Error { details } => details.clone(),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -300,6 +340,13 @@ pub struct AppController {
     audit_logger: Arc<AuditLogger>,
     operation_state: OperationState,
     migration_cancellation: Mutex<Option<Arc<AtomicBool>>>,
+    last_report: Mutex<Option<DiagnosticReport>>,
+    last_audit_entries: Mutex<Option<Vec<AuditEntry>>>,
+    last_migration_terminal: Mutex<Option<MigrationTerminalPresentation>>,
+    #[cfg(test)]
+    scanner_calls: AtomicUsize,
+    #[cfg(test)]
+    journal_read_calls: AtomicUsize,
 }
 
 impl AppController {
@@ -309,7 +356,52 @@ impl AppController {
             audit_logger,
             operation_state: OperationState::new(),
             migration_cancellation: Mutex::new(None),
+            last_report: Mutex::new(None),
+            last_audit_entries: Mutex::new(None),
+            last_migration_terminal: Mutex::new(None),
+            #[cfg(test)]
+            scanner_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            journal_read_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Re-renders cached UI models in a new session locale without touching services.
+    pub fn change_locale(&self, ui: &MainWindow, locale: &str) -> Result<bool, String> {
+        if self.operation_state.active_operation() != OperationKind::Idle
+            || ui.get_operation_busy()
+            || !ui.get_language_switch_enabled()
+        {
+            return Ok(false);
+        }
+        let report = self
+            .last_report
+            .lock()
+            .map_err(|_| "profile report cache is unavailable".to_string())?
+            .clone();
+        let audit_entries = self
+            .last_audit_entries
+            .lock()
+            .map_err(|_| "audit entry cache is unavailable".to_string())?
+            .clone();
+        let migration_terminal = self
+            .last_migration_terminal
+            .lock()
+            .map_err(|_| "migration status cache is unavailable".to_string())?
+            .clone();
+
+        crate::locale::set_locale_and_app_strings(ui, locale).map_err(|error| error.to_string())?;
+        if let Some(report) = report.as_ref() {
+            render_report(ui, report, false);
+        }
+        if let Some(entries) = audit_entries.as_ref() {
+            render_audit_entries(ui, entries);
+        }
+        if let Some(presentation) = migration_terminal.as_ref() {
+            ui.set_migration_status(presentation.render().into());
+        }
+        ui.set_status_message(t("status.ready").into());
+        Ok(true)
     }
 
     /// Starts a complete profile scan on a worker thread.
@@ -321,7 +413,7 @@ impl AppController {
         let controller = Arc::clone(self);
         let weak = ui.as_weak();
         std::thread::spawn(move || {
-            let result = match ProfileScanner::scan_all() {
+            let result = match controller.scan_all_profiles() {
                 Ok(report) => match controller.audit_logger.log(
                     "ProfileScan",
                     "WinProfile-Admin",
@@ -352,9 +444,9 @@ impl AppController {
                     }
                 },
             };
-            let audit_entries = controller.audit_logger.get_entries();
+            let audit_entries = controller.read_audit_entries();
             controller.finish_operation();
-            queue_scan_result(weak, result, audit_entries);
+            queue_scan_result(controller, weak, result, audit_entries);
         });
     }
 
@@ -431,11 +523,15 @@ impl AppController {
             );
             let repair_result = engine.execute_plan(&plan, is_loaded);
             let report = if repair_result.is_ok() && !dry_run {
-                Some(ProfileScanner::scan_all().map_err(|error| error.to_string()))
+                Some(
+                    controller
+                        .scan_all_profiles()
+                        .map_err(|error| error.to_string()),
+                )
             } else {
                 None
             };
-            let audit_entries = controller.audit_logger.get_entries();
+            let audit_entries = controller.read_audit_entries();
             controller.finish_operation();
             let result = repair_result.map_err(|error| error.to_string());
             if let Err(error) = weak.upgrade_in_event_loop(move |ui| {
@@ -443,8 +539,10 @@ impl AppController {
                 match result {
                     Ok(()) => match report {
                         Some(Ok(report)) => {
-                            apply_report(&ui, report);
-                            ui.set_status_message(t("repair.success.message").into());
+                            match controller.cache_and_apply_report(&ui, report, true) {
+                                Ok(()) => ui.set_status_message(t("repair.success.message").into()),
+                                Err(error) => set_error(&ui, &error),
+                            }
                         }
                         Some(Err(error)) => {
                             let success = t("repair.success.message");
@@ -460,7 +558,7 @@ impl AppController {
                     },
                     Err(error) => set_error(&ui, &error),
                 }
-                apply_audit_result(&ui, audit_entries);
+                controller.apply_audit_result(&ui, audit_entries);
             }) {
                 eprintln!("failed to queue repair result: {error}");
             }
@@ -543,37 +641,52 @@ impl AppController {
                     )));
                 }
             }
-            let audit_entries = controller.audit_logger.get_entries();
+            let audit_entries = controller.read_audit_entries();
             let close_after_operation = controller.finish_operation();
             if let Err(error) = weak.upgrade_in_event_loop(move |ui| {
                 ui.set_operation_busy(false);
                 ui.set_migration_running(false);
                 match result {
                     Ok(receipt) => {
-                        let file_count = receipt.copied_files.to_string();
-                        let short_hash =
-                            receipt.manifest_sha256.chars().take(16).collect::<String>();
-                        let message = t_args(
-                            "migration.success",
-                            &[
-                                ("files", file_count.as_str()),
-                                ("hash", short_hash.as_str()),
-                            ],
-                        );
+                        let presentation = MigrationTerminalPresentation::Success {
+                            files: receipt.copied_files,
+                            bytes: receipt.copied_bytes,
+                            manifest_hash: receipt
+                                .manifest_sha256
+                                .chars()
+                                .take(16)
+                                .collect::<String>(),
+                        };
                         ui.set_migration_progress(1.0);
-                        ui.set_migration_status(message.clone().into());
-                        ui.set_status_message(message.into());
+                        match controller.cache_and_apply_migration_terminal(&ui, presentation) {
+                            Ok(message) => ui.set_status_message(message.into()),
+                            Err(error) => set_error(&ui, &error),
+                        }
                     }
                     Err(MigrationError::Cancelled) => {
-                        ui.set_migration_status(t("status.cancelled").into());
-                        ui.set_status_message(t("status.cancelled").into());
+                        match controller.cache_and_apply_migration_terminal(
+                            &ui,
+                            MigrationTerminalPresentation::Cancelled,
+                        ) {
+                            Ok(message) => ui.set_status_message(message.into()),
+                            Err(error) => set_error(&ui, &error),
+                        }
                     }
                     Err(error) => {
-                        ui.set_migration_status(error.to_string().into());
-                        set_error(&ui, &error.to_string());
+                        let details = error.to_string();
+                        if let Err(cache_error) = controller.cache_and_apply_migration_terminal(
+                            &ui,
+                            MigrationTerminalPresentation::Error {
+                                details: details.clone(),
+                            },
+                        ) {
+                            set_error(&ui, &cache_error);
+                        } else {
+                            set_error(&ui, &details);
+                        }
                     }
                 }
-                apply_audit_result(&ui, audit_entries);
+                controller.apply_audit_result(&ui, audit_entries);
                 if close_after_operation {
                     if let Err(error) = ui.hide() {
                         eprintln!("failed to close the window after migration rollback: {error}");
@@ -645,7 +758,7 @@ impl AppController {
                     Ok((process, session_id))
                 })
                 .map_err(|error| error.to_string());
-            let audit_entries = controller.audit_logger.get_entries();
+            let audit_entries = controller.read_audit_entries();
             controller.finish_operation();
             if let Err(error) = weak.upgrade_in_event_loop(move |ui| {
                 ui.set_operation_busy(false);
@@ -658,7 +771,7 @@ impl AppController {
                     }
                     Err(error) => set_error(&ui, &error),
                 }
-                apply_audit_result(&ui, audit_entries);
+                controller.apply_audit_result(&ui, audit_entries);
             }) {
                 eprintln!("failed to queue TrustedInstaller result: {error}");
             }
@@ -695,19 +808,17 @@ impl AppController {
     /// Clears only the display buffer and preserves the durable journal.
     pub fn clear_audit_logs(&self, ui: &MainWindow) {
         match self.audit_logger.clear_memory() {
-            Ok(()) => {
-                ui.set_audit_entries(ModelRc::from(Rc::new(VecModel::from(
-                    Vec::<AuditLogEntry>::new(),
-                ))));
-                ui.set_status_message(t("status.audit_cleared").into());
-            }
+            Ok(()) => match self.cache_and_apply_audit_entries(ui, Vec::new()) {
+                Ok(()) => ui.set_status_message(t("status.audit_cleared").into()),
+                Err(error) => set_error(ui, &error),
+            },
             Err(error) => set_error(ui, &error.to_string()),
         }
     }
 
     /// Loads the initial audit display and reports read errors visibly.
     pub fn refresh_audit_logs(&self, ui: &MainWindow) {
-        apply_audit_result(ui, self.audit_logger.get_entries());
+        self.apply_audit_result(ui, self.read_audit_entries());
     }
 
     fn begin_operation(&self, ui: &MainWindow, operation: OperationKind) -> bool {
@@ -721,6 +832,76 @@ impl AppController {
 
     fn finish_operation(&self) -> bool {
         self.operation_state.finish()
+    }
+
+    fn scan_all_profiles(&self) -> core_profiles::ScannerResult<DiagnosticReport> {
+        #[cfg(test)]
+        self.scanner_calls.fetch_add(1, Ordering::SeqCst);
+        ProfileScanner::scan_all()
+    }
+
+    fn read_audit_entries(&self) -> audit_journal::AuditResult<Vec<AuditEntry>> {
+        #[cfg(test)]
+        self.journal_read_calls.fetch_add(1, Ordering::SeqCst);
+        self.audit_logger.get_entries()
+    }
+
+    fn cache_and_apply_report(
+        &self,
+        ui: &MainWindow,
+        report: DiagnosticReport,
+        reset_selection: bool,
+    ) -> Result<(), String> {
+        let rendered_report = report.clone();
+        *self
+            .last_report
+            .lock()
+            .map_err(|_| "profile report cache is unavailable".to_string())? = Some(report);
+        render_report(ui, &rendered_report, reset_selection);
+        Ok(())
+    }
+
+    fn cache_and_apply_audit_entries(
+        &self,
+        ui: &MainWindow,
+        entries: Vec<AuditEntry>,
+    ) -> Result<(), String> {
+        let rendered_entries = entries.clone();
+        *self
+            .last_audit_entries
+            .lock()
+            .map_err(|_| "audit entry cache is unavailable".to_string())? = Some(entries);
+        render_audit_entries(ui, &rendered_entries);
+        Ok(())
+    }
+
+    fn cache_and_apply_migration_terminal(
+        &self,
+        ui: &MainWindow,
+        presentation: MigrationTerminalPresentation,
+    ) -> Result<String, String> {
+        let message = presentation.render();
+        *self
+            .last_migration_terminal
+            .lock()
+            .map_err(|_| "migration status cache is unavailable".to_string())? = Some(presentation);
+        ui.set_migration_status(message.clone().into());
+        Ok(message)
+    }
+
+    fn apply_audit_result(
+        &self,
+        ui: &MainWindow,
+        result: Result<Vec<AuditEntry>, audit_journal::AuditError>,
+    ) {
+        match result {
+            Ok(entries) => {
+                if let Err(error) = self.cache_and_apply_audit_entries(ui, entries) {
+                    set_error(ui, &error);
+                }
+            }
+            Err(error) => set_error(ui, &error.to_string()),
+        }
     }
 }
 
@@ -753,6 +934,7 @@ fn selected_repair_actions(ui: &MainWindow) -> Vec<String> {
 }
 
 fn queue_scan_result(
+    controller: Arc<AppController>,
     weak: Weak<MainWindow>,
     result: Result<DiagnosticReport, String>,
     audit_entries: Result<Vec<AuditEntry>, audit_journal::AuditError>,
@@ -760,48 +942,59 @@ fn queue_scan_result(
     if let Err(error) = weak.upgrade_in_event_loop(move |ui| {
         ui.set_operation_busy(false);
         match result {
-            Ok(report) => {
-                apply_report(&ui, report);
-                ui.set_status_message(t("status.completed").into());
-            }
+            Ok(report) => match controller.cache_and_apply_report(&ui, report, true) {
+                Ok(()) => ui.set_status_message(t("status.completed").into()),
+                Err(error) => set_error(&ui, &error),
+            },
             Err(error) => set_error(&ui, &error),
         }
-        apply_audit_result(&ui, audit_entries);
+        controller.apply_audit_result(&ui, audit_entries);
     }) {
         eprintln!("failed to queue profile scan result: {error}");
     }
 }
 
-fn apply_report(ui: &MainWindow, report: DiagnosticReport) {
+fn render_report(ui: &MainWindow, report: &DiagnosticReport, reset_selection: bool) {
     let profiles = report
         .profiles
         .iter()
         .map(user_profile_to_slint)
         .collect::<Vec<ProfileEntry>>();
+    let selected_anomalies = if reset_selection {
+        None
+    } else {
+        usize::try_from(ui.get_selected_idx())
+            .ok()
+            .and_then(|index| profiles.get(index))
+            .filter(|profile| {
+                profile.sid.as_str() == ui.get_selected_sid().as_str()
+                    && profile.profile_path.as_str() == ui.get_selected_path().as_str()
+            })
+            .map(|profile| profile.anomalies.clone())
+    };
     ui.set_profiles(ModelRc::from(Rc::new(VecModel::from(profiles))));
     ui.set_total_profiles_count(report.total_count as i32);
     ui.set_healthy_count(report.healthy_count as i32);
     ui.set_corrupted_count(report.corrupted_count as i32);
     ui.set_temp_count(report.temporary_count as i32);
-    ui.set_selected_idx(-1);
-    ui.set_selected_sid("".into());
-    ui.set_selected_path("".into());
-    ui.set_selected_username("".into());
-    ui.set_selected_anomalies("".into());
-    ui.set_selected_loaded(false);
+    if reset_selection {
+        ui.set_selected_idx(-1);
+        ui.set_selected_sid("".into());
+        ui.set_selected_path("".into());
+        ui.set_selected_username("".into());
+        ui.set_selected_anomalies("".into());
+        ui.set_selected_loaded(false);
+    } else if let Some(anomalies) = selected_anomalies {
+        ui.set_selected_anomalies(anomalies);
+    }
 }
 
-fn apply_audit_result(ui: &MainWindow, result: Result<Vec<AuditEntry>, audit_journal::AuditError>) {
-    match result {
-        Ok(entries) => {
-            let model = entries
-                .iter()
-                .map(audit_entry_to_slint)
-                .collect::<Vec<AuditLogEntry>>();
-            ui.set_audit_entries(ModelRc::from(Rc::new(VecModel::from(model))));
-        }
-        Err(error) => set_error(ui, &error.to_string()),
-    }
+fn render_audit_entries(ui: &MainWindow, entries: &[AuditEntry]) {
+    let model = entries
+        .iter()
+        .map(audit_entry_to_slint)
+        .collect::<Vec<AuditLogEntry>>();
+    ui.set_audit_entries(ModelRc::from(Rc::new(VecModel::from(model))));
 }
 
 fn set_error(ui: &MainWindow, error: &str) {
@@ -811,7 +1004,10 @@ fn set_error(ui: &MainWindow, error: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use core_profiles::{I18nManager, ProfileAnomaly, ProfileHealth, UserProfile};
     use std::collections::VecDeque;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
 
     struct FakeAudit {
@@ -905,6 +1101,114 @@ mod tests {
         wait_calls: Arc<AtomicUsize>,
         terminate_result: Result<(), String>,
         wait_result: Result<(), String>,
+    }
+
+    struct LocaleTestDirectory(PathBuf);
+
+    impl LocaleTestDirectory {
+        fn new() -> Self {
+            static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "winprofile-controller-locale-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create locale test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for LocaleTestDirectory {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "failed to remove locale test directory {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    fn locale_test_controller(directory: &LocaleTestDirectory) -> AppController {
+        let snapshots = Arc::new(
+            SnapshotEngine::new(Some(directory.0.join("Snapshots")))
+                .expect("create snapshot engine"),
+        );
+        let audit = Arc::new(
+            AuditLogger::new(Some(directory.0.join("audit.jsonl")), 10)
+                .expect("create audit logger"),
+        );
+        AppController::new(snapshots, audit)
+    }
+
+    fn locale_report() -> DiagnosticReport {
+        DiagnosticReport {
+            timestamp: Utc::now(),
+            total_count: 1,
+            healthy_count: 0,
+            corrupted_count: 1,
+            temporary_count: 0,
+            profiles: vec![UserProfile {
+                sid: "S-1-5-21-1000.bak".to_string(),
+                canonical_sid: "S-1-5-21-1000".to_string(),
+                username: "LocaleUser".to_string(),
+                domain: "TEST".to_string(),
+                profile_path: "C:\\Users\\LocaleUser".to_string(),
+                loaded: false,
+                is_bak: true,
+                state_mask: 0,
+                ref_count: 0,
+                guid: None,
+                ntuser_exists: true,
+                usrclass_exists: true,
+                disk_size_bytes: 0,
+                anomalies: vec![ProfileAnomaly::BakSuffix],
+                health: ProfileHealth::Corrupted,
+            }],
+        }
+    }
+
+    fn locale_audit_entries() -> Vec<AuditEntry> {
+        vec![AuditEntry {
+            timestamp: Utc::now(),
+            operation: "LocaleFixture".to_string(),
+            actor: "test".to_string(),
+            target: "profile".to_string(),
+            status: AuditStatus::RolledBack,
+            details: "raw audit details".to_string(),
+        }]
+    }
+
+    fn displayed_models(ui: &MainWindow) -> String {
+        let profile = ui.get_profiles().row_data(0).expect("displayed profile");
+        let audit = ui
+            .get_audit_entries()
+            .row_data(0)
+            .expect("displayed audit entry");
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            profile.sid,
+            profile.canonical_sid,
+            profile.username,
+            profile.domain,
+            profile.profile_path,
+            profile.status_text,
+            profile.health_type,
+            profile.loaded,
+            profile.is_bak,
+            profile.suggest_fix_bak,
+            profile.suggest_reset_state,
+            profile.suggest_unlock_hive,
+            profile.state_raw,
+            profile.anomalies,
+            audit.timestamp,
+            audit.operation,
+            audit.target,
+            audit.status,
+            audit.status_type,
+            audit.details,
+            ui.get_total_profiles_count()
+        )
     }
 
     impl FakeProcess {
@@ -1039,6 +1343,196 @@ mod tests {
             validate_migration_source(true),
             Err(MIGRATION_SOURCE_LOADED_ERROR)
         );
+    }
+
+    #[test]
+    fn locale_change_remaps_cached_models_without_scanner_or_journal_reads() {
+        crate::locale::with_test_window(|ui| {
+            let directory = LocaleTestDirectory::new();
+            let controller = locale_test_controller(&directory);
+            ui.set_startup_visible(false);
+            crate::locale::set_locale_and_app_strings(ui, "en").expect("English locale");
+            controller
+                .cache_and_apply_report(ui, locale_report(), true)
+                .expect("cache report");
+            controller
+                .cache_and_apply_audit_entries(ui, locale_audit_entries())
+                .expect("cache audit entries");
+            controller
+                .cache_and_apply_migration_terminal(
+                    ui,
+                    MigrationTerminalPresentation::Success {
+                        files: 7,
+                        bytes: 4_096,
+                        manifest_hash: "0123456789abcdef".to_string(),
+                    },
+                )
+                .expect("cache migration success");
+            controller.select_profile(ui, 0);
+            ui.set_repair_reset_state(true);
+            ui.set_migration_include_roaming(true);
+            ui.set_migration_progress(0.42);
+            ui.set_startup_consent_granted(true);
+
+            let english_profile = ui.get_profiles().row_data(0).expect("English profile");
+            let english_audit = ui
+                .get_audit_entries()
+                .row_data(0)
+                .expect("English audit entry");
+            assert!(english_profile.status_text.as_str().contains(".bak suffix"));
+            assert_eq!(english_audit.status.as_str(), "Rolled back");
+            assert_eq!(
+                ui.get_migration_status().as_str(),
+                "Migration verified: 7 files, manifest 0123456789abcdef"
+            );
+            let preserved_identity = (
+                ui.get_selected_idx(),
+                ui.get_selected_sid(),
+                ui.get_selected_path(),
+                ui.get_selected_username(),
+                ui.get_total_profiles_count(),
+                ui.get_healthy_count(),
+                ui.get_corrupted_count(),
+                ui.get_temp_count(),
+            );
+            let preserved_state = (
+                english_profile.health_type,
+                english_audit.status_type,
+                ui.get_repair_fix_bak(),
+                ui.get_repair_reset_state(),
+                ui.get_repair_unlock_hive(),
+                ui.get_migration_include_roaming(),
+                ui.get_migration_progress(),
+                ui.get_startup_consent_granted(),
+            );
+
+            assert!(controller.change_locale(ui, "fr").expect("French rerender"));
+
+            let french_profile = ui.get_profiles().row_data(0).expect("French profile");
+            let french_audit = ui
+                .get_audit_entries()
+                .row_data(0)
+                .expect("French audit entry");
+            assert!(french_profile.status_text.as_str().contains("suffixe .bak"));
+            assert_eq!(french_audit.status.as_str(), "Rollback effectué");
+            assert!(ui
+                .get_selected_anomalies()
+                .as_str()
+                .contains("suffixe .bak"));
+            assert_eq!(
+                ui.get_migration_status().as_str(),
+                "Migration vérifiée : 7 fichiers, manifeste 0123456789abcdef"
+            );
+            assert_eq!(
+                preserved_identity,
+                (
+                    ui.get_selected_idx(),
+                    ui.get_selected_sid(),
+                    ui.get_selected_path(),
+                    ui.get_selected_username(),
+                    ui.get_total_profiles_count(),
+                    ui.get_healthy_count(),
+                    ui.get_corrupted_count(),
+                    ui.get_temp_count(),
+                )
+            );
+            assert_eq!(
+                preserved_state,
+                (
+                    french_profile.health_type,
+                    french_audit.status_type,
+                    ui.get_repair_fix_bak(),
+                    ui.get_repair_reset_state(),
+                    ui.get_repair_unlock_hive(),
+                    ui.get_migration_include_roaming(),
+                    ui.get_migration_progress(),
+                    ui.get_startup_consent_granted(),
+                )
+            );
+            assert_eq!(ui.get_status_message().as_str(), "Prêt");
+            assert_eq!(controller.scanner_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controller.journal_read_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn locale_change_rerenders_cancelled_but_preserves_raw_migration_error() {
+        crate::locale::with_test_window(|ui| {
+            let directory = LocaleTestDirectory::new();
+            let controller = locale_test_controller(&directory);
+            ui.set_startup_visible(false);
+            ui.set_migration_progress(0.73);
+            crate::locale::set_locale_and_app_strings(ui, "en").expect("English locale");
+            controller
+                .cache_and_apply_migration_terminal(ui, MigrationTerminalPresentation::Cancelled)
+                .expect("cache cancelled status");
+            assert_eq!(
+                ui.get_migration_status().as_str(),
+                "Operation cancelled and rolled back"
+            );
+
+            assert!(controller.change_locale(ui, "fr").expect("French rerender"));
+            assert_eq!(
+                ui.get_migration_status().as_str(),
+                "Opération annulée et changements annulés"
+            );
+            assert_eq!(ui.get_migration_progress(), 0.73);
+
+            let raw_error = "RAW-MIGRATION-ERROR-0x1234";
+            controller
+                .cache_and_apply_migration_terminal(
+                    ui,
+                    MigrationTerminalPresentation::Error {
+                        details: raw_error.to_string(),
+                    },
+                )
+                .expect("cache raw migration error");
+            assert!(controller
+                .change_locale(ui, "en")
+                .expect("English rerender"));
+            assert_eq!(ui.get_migration_status().as_str(), raw_error);
+            assert_eq!(ui.get_migration_progress(), 0.73);
+            assert_eq!(controller.scanner_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controller.journal_read_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn busy_or_modal_locale_change_preserves_locale_and_models() {
+        crate::locale::with_test_window(|ui| {
+            let directory = LocaleTestDirectory::new();
+            let controller = locale_test_controller(&directory);
+            ui.set_startup_visible(false);
+            crate::locale::set_locale_and_app_strings(ui, "en").expect("English locale");
+            controller
+                .cache_and_apply_report(ui, locale_report(), true)
+                .expect("cache report");
+            controller
+                .cache_and_apply_audit_entries(ui, locale_audit_entries())
+                .expect("cache audit entries");
+            let original_models = displayed_models(ui);
+
+            assert!(controller.operation_state.try_begin(OperationKind::Scan));
+            ui.set_operation_busy(true);
+            assert!(!controller
+                .change_locale(ui, "fr")
+                .expect("busy change refusal"));
+            assert_eq!(I18nManager::get_locale(), "en");
+            assert_eq!(ui.get_current_locale().as_str(), "en");
+            assert_eq!(displayed_models(ui), original_models);
+            controller.finish_operation();
+            ui.set_operation_busy(false);
+
+            ui.set_confirmation_visible(true);
+            assert!(!ui.get_language_switch_enabled());
+            assert!(!controller
+                .change_locale(ui, "fr")
+                .expect("modal change refusal"));
+            assert_eq!(I18nManager::get_locale(), "en");
+            assert_eq!(displayed_models(ui), original_models);
+            assert_eq!(controller.scanner_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controller.journal_read_calls.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]

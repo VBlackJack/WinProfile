@@ -20,29 +20,66 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use app_ui::locale::{self, StartupPresentation};
 use app_ui::startup::{self, StartupDecision};
-use app_ui::{AppController, AppStrings, MainWindow};
+use app_ui::{AppController, MainWindow};
 use audit_journal::LegacyStorageRecovery;
-use core_profiles::{t, t_args, I18nManager};
+use core_profiles::{t, I18nManager};
 use platform_win32::is_process_elevated;
 use slint::{CloseRequestResponse, ComponentHandle};
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     I18nManager::validate()?;
-    I18nManager::set_locale("fr")?;
 
     let main_window = MainWindow::new()?;
-    load_translations(&main_window);
+    locale::set_locale_and_app_strings(&main_window, locale::detect_initial_locale())?;
     main_window.set_is_elevated(is_process_elevated()?);
-    main_window.set_startup_title(t("startup.checking.title").into());
-    main_window.set_startup_message(t("startup.checking.message").into());
-    main_window.set_startup_details("".into());
-    main_window.set_startup_action_text(t("startup.retry").into());
-    main_window.set_startup_quit_text(t("startup.quit").into());
-    main_window.set_startup_consent_text(t("startup.legacy.consent").into());
 
     let runtime = Arc::new(StartupRuntime::new());
+    present_startup(&main_window, &runtime, StartupPresentation::Checking);
+
+    {
+        let runtime = Arc::clone(&runtime);
+        let weak = main_window.as_weak();
+        main_window.on_change_locale(move |requested_locale| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let requested_locale = requested_locale.to_string();
+            if ui.get_startup_visible() {
+                let presentation = match runtime.presentation.lock() {
+                    Ok(presentation) => presentation.clone(),
+                    Err(_) => {
+                        tracing::error!("Startup presentation state is unavailable");
+                        return;
+                    }
+                };
+                if let Err(error) =
+                    locale::set_locale_and_app_strings(&ui, requested_locale.as_str())
+                {
+                    tracing::error!(%error, "Startup locale change was rejected");
+                    return;
+                }
+                presentation.apply(&ui);
+                return;
+            }
+            if !ui.get_language_switch_enabled() {
+                return;
+            }
+            match runtime.controller.lock() {
+                Ok(controller) => {
+                    if let Some(controller) = controller.as_ref() {
+                        if let Err(error) = controller.change_locale(&ui, requested_locale.as_str())
+                        {
+                            tracing::error!(%error, "Application locale change failed");
+                        }
+                    }
+                }
+                Err(_) => tracing::error!("Startup controller state is unavailable"),
+            }
+        });
+    }
 
     {
         let runtime = Arc::clone(&runtime);
@@ -101,6 +138,7 @@ fn main() -> anyhow::Result<()> {
 struct StartupRuntime {
     controller: Mutex<Option<Arc<AppController>>>,
     recovery: Mutex<Option<LegacyStorageRecovery>>,
+    presentation: Mutex<StartupPresentation>,
     startup_busy: AtomicBool,
 }
 
@@ -109,6 +147,7 @@ impl StartupRuntime {
         Self {
             controller: Mutex::new(None),
             recovery: Mutex::new(None),
+            presentation: Mutex::new(StartupPresentation::Checking),
             startup_busy: AtomicBool::new(true),
         }
     }
@@ -127,9 +166,7 @@ fn start_or_retry(runtime: Arc<StartupRuntime>, weak: slint::Weak<MainWindow>) {
     }
     if let Some(ui) = weak.upgrade() {
         ui.set_startup_busy(true);
-        ui.set_startup_title(t("startup.working.title").into());
-        ui.set_startup_message(t("startup.working.message").into());
-        ui.set_startup_details(t("startup.working.details").into());
+        present_startup(&ui, &runtime, StartupPresentation::Working);
     }
     let recovery = runtime
         .recovery
@@ -202,25 +239,12 @@ fn present_startup_decision(
             let consent_required = startup::requires_fresh_consent(resume);
             ui.set_startup_consent_required(consent_required);
             ui.set_startup_consent_granted(!consent_required);
-            ui.set_startup_title(
-                t(if resume {
-                    "startup.resume.title"
-                } else {
-                    "startup.legacy.title"
-                })
-                .into(),
-            );
-            ui.set_startup_message(t("startup.legacy.message").into());
-            ui.set_startup_details(t_args("startup.legacy.details", &[("reason", &reason)]).into());
-            ui.set_startup_action_text(
-                t(if resume {
-                    "startup.resume.action"
-                } else {
-                    "startup.legacy.action"
-                })
-                .into(),
-            );
-            ui.set_startup_quit_text(t("startup.quit").into());
+            let presentation = if resume {
+                StartupPresentation::ResumeRecovery { reason }
+            } else {
+                StartupPresentation::FreshRecovery { reason }
+            };
+            present_startup(ui, runtime, presentation);
         }
     }
 }
@@ -234,11 +258,15 @@ fn present_startup_error(ui: &MainWindow, runtime: &Arc<StartupRuntime>, error: 
     ui.set_startup_busy(false);
     ui.set_startup_consent_required(false);
     ui.set_startup_consent_granted(true);
-    ui.set_startup_title(t("startup.error.title").into());
-    ui.set_startup_message(t("startup.error.message").into());
-    ui.set_startup_details(error.into());
-    ui.set_startup_action_text(t("startup.retry").into());
-    ui.set_startup_quit_text(t("startup.quit").into());
+    present_startup(ui, runtime, StartupPresentation::Error { details: error });
+}
+
+fn present_startup(ui: &MainWindow, runtime: &StartupRuntime, presentation: StartupPresentation) {
+    match runtime.presentation.lock() {
+        Ok(mut current) => *current = presentation.clone(),
+        Err(_) => tracing::error!("Startup presentation state is unavailable"),
+    }
+    presentation.apply(ui);
 }
 
 fn bind_controller(main_window: &MainWindow, controller: Arc<AppController>) {
@@ -336,72 +364,4 @@ fn bind_controller(main_window: &MainWindow, controller: Arc<AppController>) {
             }
         });
     }
-}
-
-fn load_translations(ui: &MainWindow) {
-    let strings = ui.global::<AppStrings>();
-    strings.set_window_title(t("app.window_title").into());
-    strings.set_app_title(t("app.title").into());
-    strings.set_app_subtitle(t("app.subtitle").into());
-    strings.set_app_version(t("app.version").into());
-    strings.set_app_license(t("app.license").into());
-    strings.set_nav_dashboard(t("nav.dashboard").into());
-    strings.set_nav_repair(t("nav.repair").into());
-    strings.set_nav_migration(t("nav.migration").into());
-    strings.set_nav_maintenance(t("nav.maintenance").into());
-    strings.set_nav_logs(t("nav.logs").into());
-    strings.set_elevated(t("status.elevated").into());
-    strings.set_unelevated(t("status.unelevated").into());
-    strings.set_scan(t("dashboard.scan_btn").into());
-    strings.set_total(t("dashboard.total_profiles").into());
-    strings.set_healthy(t("dashboard.healthy_profiles").into());
-    strings.set_corrupted(t("dashboard.corrupted_profiles").into());
-    strings.set_temporary(t("dashboard.temporary_profiles").into());
-    strings.set_column_account(t("dashboard.column.username").into());
-    strings.set_column_sid(t("dashboard.column.sid").into());
-    strings.set_column_path(t("dashboard.column.path").into());
-    strings.set_column_status(t("dashboard.column.status").into());
-    strings.set_column_loaded(t("dashboard.column.loaded").into());
-    strings.set_column_action(t("dashboard.column.actions").into());
-    strings.set_select(t("common.select").into());
-    strings.set_yes(t("common.yes").into());
-    strings.set_no(t("common.no").into());
-    strings.set_no_profiles(t("dashboard.no_profiles").into());
-    strings.set_repair_title(t("repair.title").into());
-    strings.set_target_account(t("repair.target_account").into());
-    strings.set_target_sid(t("repair.target_sid").into());
-    strings.set_profile_path(t("repair.profile_path").into());
-    strings.set_anomalies(t("repair.anomalies").into());
-    strings.set_none_selected(t("common.none").into());
-    strings.set_loaded_warning(t("repair.warning.loaded_session").into());
-    strings.set_repair_pipeline(t("repair.pipeline").into());
-    strings.set_fix_bak(t("repair.action.fix_bak").into());
-    strings.set_reset_state(t("repair.action.reset_state").into());
-    strings.set_unlock_hive(t("repair.action.unlock_hive").into());
-    strings.set_dry_run(t("repair.btn.dry_run").into());
-    strings.set_execute_repair(t("repair.btn.execute").into());
-    strings.set_migration_title(t("migration.title").into());
-    strings.set_migration_warning(t("migration.warning_dpapi").into());
-    strings.set_migration_source(t("migration.source").into());
-    strings.set_migration_target(t("migration.target").into());
-    strings.set_migration_placeholder(t("migration.target_placeholder").into());
-    strings.set_include_roaming(t("migration.include_roaming").into());
-    strings.set_include_docs(t("migration.include_docs").into());
-    strings.set_start_migration(t("migration.btn.start").into());
-    strings.set_cancel_migration(t("migration.btn.cancel").into());
-    strings.set_maintenance_title(t("maintenance.title").into());
-    strings.set_maintenance_description(t("maintenance.description").into());
-    strings.set_launch_ti(t("maintenance.btn.launch_ti").into());
-    strings.set_audit_title(t("audit.title").into());
-    strings.set_clear_audit(t("audit.btn.clear").into());
-    strings.set_export_audit(t("audit.btn.export").into());
-    strings.set_audit_timestamp(t("audit.column.timestamp").into());
-    strings.set_audit_operation(t("audit.column.operation").into());
-    strings.set_audit_target(t("audit.column.target").into());
-    strings.set_audit_result(t("audit.column.result").into());
-    strings.set_audit_details(t("audit.column.details").into());
-    strings.set_about(t("about.title").into());
-    strings.set_close(t("common.close").into());
-    strings.set_confirm(t("common.confirm").into());
-    strings.set_cancel(t("common.cancel").into());
 }

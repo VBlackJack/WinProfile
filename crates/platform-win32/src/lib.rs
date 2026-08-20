@@ -15,6 +15,7 @@
  */
 
 pub mod handles;
+pub mod locale;
 pub mod registry;
 pub mod restart_manager;
 pub mod secure_fs;
@@ -22,6 +23,7 @@ pub mod security;
 pub mod tokens;
 
 pub use handles::{OwnedEnvironmentBlock, OwnedHandle, OwnedScHandle};
+pub use locale::{user_preferred_ui_languages, LocaleError, LocaleResult};
 pub use registry::{
     create_key, delete_tree, delete_value, enum_subkeys, from_wide_null, load_hive, open_key,
     open_subkey, query_value_string, query_value_u32, rename_subkey, save_key, set_value_string,

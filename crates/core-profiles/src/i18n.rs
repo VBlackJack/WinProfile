@@ -25,6 +25,8 @@ static INSTANCE: OnceLock<Result<I18nManager, I18nError>> = OnceLock::new();
 
 const EN_JSON: &str = include_str!("../../../locales/en.json");
 const FR_JSON: &str = include_str!("../../../locales/fr.json");
+pub const ENGLISH_LOCALE: &str = "en";
+pub const FRENCH_LOCALE: &str = "fr";
 
 #[derive(Error, Debug, Clone)]
 pub enum I18nError {
@@ -61,20 +63,20 @@ impl I18nManager {
     /// Sets the active locale code.
     pub fn set_locale(locale: &str) -> Result<(), I18nError> {
         let code = match locale {
-            "fr" => 0,
-            "en" => 1,
+            ENGLISH_LOCALE => 0,
+            FRENCH_LOCALE => 1,
             value => return Err(I18nError::UnsupportedLocale(value.to_string())),
         };
-        CURRENT_LOCALE.store(code, Ordering::Relaxed);
+        CURRENT_LOCALE.store(code, Ordering::Release);
         Ok(())
     }
 
     /// Gets the active locale code.
     pub fn get_locale() -> &'static str {
-        if CURRENT_LOCALE.load(Ordering::Relaxed) == 1 {
-            "en"
+        if CURRENT_LOCALE.load(Ordering::Acquire) == 1 {
+            FRENCH_LOCALE
         } else {
-            "fr"
+            ENGLISH_LOCALE
         }
     }
 
@@ -126,6 +128,41 @@ impl I18nManager {
     }
 }
 
+/// Selects the first supported, well-formed Windows language tag.
+///
+/// Unsupported tags are skipped in preference order. Any malformed tag makes
+/// the result fall back to English instead of guessing from partial input.
+pub fn resolve_supported_locale<'a>(tags: impl IntoIterator<Item = &'a str>) -> &'static str {
+    let tags = tags.into_iter().collect::<Vec<_>>();
+    if tags.iter().any(|tag| !is_well_formed_language_tag(tag)) {
+        return ENGLISH_LOCALE;
+    }
+    for tag in tags {
+        let primary = tag.split('-').next().unwrap_or_default();
+        if primary.eq_ignore_ascii_case(FRENCH_LOCALE) {
+            return FRENCH_LOCALE;
+        }
+        if primary.eq_ignore_ascii_case(ENGLISH_LOCALE) {
+            return ENGLISH_LOCALE;
+        }
+    }
+    ENGLISH_LOCALE
+}
+
+fn is_well_formed_language_tag(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    let Some(primary) = parts.next() else {
+        return false;
+    };
+    if !(2..=8).contains(&primary.len()) || !primary.bytes().all(|byte| byte.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    parts.all(|part| {
+        !part.is_empty() && part.len() <= 8 && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
+}
+
 fn parse_bundle(locale: &str, json: &str) -> Result<HashMap<String, String>, I18nError> {
     serde_json::from_str(json).map_err(|error| I18nError::InvalidBundle {
         locale: locale.to_string(),
@@ -146,5 +183,32 @@ pub fn t_args(key: &str, args: &[(&str, &str)]) -> String {
     match I18nManager::global() {
         Ok(manager) => manager.translate_args(key, args),
         Err(error) => format!("[i18n:{error}]"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_locale_resolver_follows_windows_preference_order() {
+        assert_eq!(resolve_supported_locale(["fr-CA", "en-US"]), FRENCH_LOCALE);
+        assert_eq!(resolve_supported_locale(["de-DE", "en-GB"]), ENGLISH_LOCALE);
+    }
+
+    #[test]
+    fn default_empty_and_malformed_language_lists_fall_back_to_english() {
+        assert_eq!(I18nManager::get_locale(), ENGLISH_LOCALE);
+        assert_eq!(resolve_supported_locale(std::iter::empty()), ENGLISH_LOCALE);
+        assert_eq!(resolve_supported_locale(["fr_CA"]), ENGLISH_LOCALE);
+        assert_eq!(resolve_supported_locale([""]), ENGLISH_LOCALE);
+        assert_eq!(
+            resolve_supported_locale(["fr-CA", "bad_tag"]),
+            ENGLISH_LOCALE
+        );
+        assert_eq!(
+            resolve_supported_locale(["fr-FR-u-ca-gregory"]),
+            FRENCH_LOCALE
+        );
     }
 }

@@ -15,6 +15,7 @@
  */
 
 pub mod controller;
+pub mod locale;
 pub mod startup;
 mod state;
 

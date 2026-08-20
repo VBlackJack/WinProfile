@@ -52,6 +52,7 @@ embed-resource = "3.0.11"
 # Windows API Low-level bindings
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Registry",
