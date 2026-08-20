@@ -15,8 +15,10 @@
  */
 
 pub mod controller;
+pub mod startup;
 mod state;
 
 pub use controller::AppController;
+pub use startup::{StartupDecision, StartupError};
 
 slint::include_modules!();

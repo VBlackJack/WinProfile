@@ -12,6 +12,18 @@
 
 `webbrowser-shim` is a narrow compatibility adapter for Slint's Windows backend. It replaces a transitive dependency on a separately packaged MinGW `shlwapi` archive with `ShellExecuteW` from the Windows bindings already used by the workspace. WinProfile does not currently expose a browser-opening control.
 
+## Legacy storage boundary
+
+No audit, snapshot, controller, scan, or profile service is created until startup has classified `%ProgramData%\WinProfile`. A canonical root is accepted only through its retained handle, exact protected SYSTEM/Administrators DACL, owner, type, and non-reparse checks. A legacy root is treated as one opaque, untrusted namespace object: its children, journals, and snapshots are never enumerated, parsed, imported, restored, or deleted.
+
+Recovery requires explicit consent in the top-level Slint startup view. Quit and window close perform no recovery mutation. After consent, a protected sibling `%ProgramData%\WinProfile.Bootstrap` directory and an exclusive share-zero lock serialize all instances. ProgramData, bootstrap, the legacy object, and the pre-created replacement root are opened relative to verified directory handles. Persistent `FILE_ID_INFO` identities detect substitution. The exact legacy object is renamed with `NtSetInformationFile(FileRenameInformation)`, a non-null `RootDirectory` handle, a validated single-component relative name, and replacement disabled. Reparse traversal and absolute-path fallback are absent; a junction at the exact legacy name is detached as a junction without opening its target.
+
+The startup check runs after the Slint event loop begins, so the blocking recovery view is painted and responsive before services can be constructed. A fresh detachment requires an initially unchecked consent control; durable recovery resumes are exempt. The view exposes the same `AboutSlint` attribution as normal operation.
+
+The append-only bootstrap phases are synchronized before namespace cutovers and advance monotonically through `Prepared`, `Detached`, `RootReady`, `AuditPending`, and `Done`. After `Detached`, recovery never moves the untrusted object back to the production name. `SeBackupPrivilege` and `SeRestorePrivilege` are scoped only around namespace work and explicitly restored, with operation and restore failures preserved together. A terminal event is synchronized in the new journal before `Done`; only then is the controller constructed. The logger and snapshot engine retain the same validated `StorageRoot` token.
+
+The detached name is `WinProfile.Legacy.Untrusted.<random-id>`. Its old permissions are deliberately unchanged, so it may remain accessible to principals that could access it before detachment. It is not a forensic copy and is never automatically removed. The bootstrap lock coordinates this and later releases only; it cannot retroactively coordinate an older binary that does not implement the lock. Operators must close every other WinProfile instance before fresh consent. Operator handling is documented in [storage recovery](storage-recovery.md).
+
 ## Repair transaction
 
 1. Validate the selected SID, live `HKEY_USERS` state, registry key, profile path, and requested actions.

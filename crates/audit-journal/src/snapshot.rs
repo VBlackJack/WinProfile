@@ -45,6 +45,7 @@ use crate::storage::{
     delete_open_file, file_identity, CreatedStorageFile, FileIdentity, StorageDirectory,
     StorageError, StorageRoot,
 };
+use crate::ProductionStorage;
 
 const SNAPSHOT_DIR: &str = "Snapshots";
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
@@ -165,6 +166,22 @@ pub struct SnapshotEngine {
 }
 
 impl SnapshotEngine {
+    /// Builds the snapshot engine from the exact production storage token
+    /// already approved by startup recovery.
+    pub fn from_storage(storage: &ProductionStorage) -> SnapshotResult<Self> {
+        let root = Arc::clone(&storage.root);
+        let directory = root.open_or_create_directory(SNAPSHOT_DIR)?;
+        Ok(Self {
+            storage: root,
+            directory,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_token(&self) -> *const StorageRoot {
+        Arc::as_ptr(&self.storage)
+    }
+
     /// Initializes production storage through FOLDERID_ProgramData, or a
     /// separately trusted test injection when an explicit directory is given.
     pub fn new(custom_dir: Option<PathBuf>) -> SnapshotResult<Self> {

@@ -13,6 +13,7 @@ WinProfile 2026.819.0 is the first public release of the Windows profile inspect
 - The audit journal is serialized, durable, bounded, rotated, and exportable without overwriting an existing export.
 - Long-running work runs outside the Slint event loop, with keyboard navigation and English/French catalog validation.
 - The About dialog includes Slint's official `AboutSlint` attribution widget.
+- Startup now refuses to initialize services from an older permissive ProgramData root. An explicit recovery view can detach the entire opaque legacy object and create a new protected root through a crash-recoverable, handle-verified transition.
 
 ## Release integrity
 
@@ -33,5 +34,7 @@ The executable is not published if signing, timestamping, Authenticode verificat
 ## Operational caution
 
 Profile repair, Restart Manager shutdown, and TrustedInstaller console launch are expert operations. Use a tested backup and validate the workflow on a disposable machine before operating on production profiles.
+
+If startup reports legacy storage, quitting is the zero-change choice. Close every other WinProfile instance, including older versions that do not know the new recovery lock, before checking the explicit consent box. Recovery does not inspect or import the old journal or snapshots. It preserves the exact top-level object under `WinProfile.Legacy.Untrusted.<id>` with its previous permissions unchanged; that detached object is untrusted, is not a forensic image, and is never automatically deleted. Follow [the storage recovery runbook](storage-recovery.md) for interruption and escalation guidance.
 
 Sign the source user out and scan again before migration. File handles stabilize each file while it is copied, but WinProfile does not create a VSS snapshot of the complete tree; directory membership and cross-file state can therefore change if another process modifies the offline profile. This release makes no compatibility claim for UNC/SMB or ReFS migration paths.

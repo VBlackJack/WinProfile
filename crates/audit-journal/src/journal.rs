@@ -28,6 +28,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::storage::{StorageError, StorageLock, StorageRoot};
+use crate::ProductionStorage;
 
 const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_ARCHIVES: usize = 5;
@@ -106,6 +107,24 @@ impl AuditLogger {
         )
     }
 
+    /// Builds the production logger from the exact storage token approved by
+    /// startup recovery. Snapshot and journal services can therefore share one
+    /// retained root handle.
+    pub fn from_storage(storage: &ProductionStorage, max_memory: usize) -> AuditResult<Self> {
+        Self::build(
+            Arc::clone(&storage.root),
+            AUDIT_FILE.to_string(),
+            max_memory,
+            DEFAULT_MAX_LOG_BYTES,
+            DEFAULT_MAX_ARCHIVES,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_token(&self) -> *const StorageRoot {
+        Arc::as_ptr(&self.storage)
+    }
+
     /// Initializes the logger with explicit limits for tests and controlled deployments.
     pub fn with_limits(
         custom_path: Option<PathBuf>,
@@ -139,6 +158,32 @@ impl AuditLogger {
             }
             None => (StorageRoot::production()?, AUDIT_FILE.to_string()),
         };
+        Self::build(
+            storage,
+            log_file_name,
+            max_memory,
+            max_log_bytes,
+            max_archives,
+        )
+    }
+
+    fn build(
+        storage: Arc<StorageRoot>,
+        log_file_name: String,
+        max_memory: usize,
+        max_log_bytes: u64,
+        max_archives: usize,
+    ) -> AuditResult<Self> {
+        if max_log_bytes == 0 {
+            return Err(AuditError::InvalidConfiguration(
+                "maximum log size must be greater than zero".to_string(),
+            ));
+        }
+        if max_archives == 0 {
+            return Err(AuditError::InvalidConfiguration(
+                "at least one archive must be retained".to_string(),
+            ));
+        }
         let log_file_path = storage.child_path(&log_file_name)?;
         let _storage_lock = storage.acquire_lock()?;
         let entries = load_recent_entries(&storage, &log_file_name, max_memory)?;

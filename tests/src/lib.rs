@@ -169,6 +169,65 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovery_catalog_is_complete_in_english_and_french() {
+        let required = [
+            "startup.checking.title",
+            "startup.checking.message",
+            "startup.legacy.title",
+            "startup.legacy.message",
+            "startup.legacy.details",
+            "startup.legacy.consent",
+            "startup.legacy.action",
+            "startup.resume.title",
+            "startup.resume.action",
+            "startup.working.title",
+            "startup.working.message",
+            "startup.working.details",
+            "startup.error.title",
+            "startup.error.message",
+            "startup.retry",
+            "startup.quit",
+            "startup.close_blocked",
+        ];
+
+        for locale in ["en", "fr"] {
+            I18nManager::set_locale(locale).expect("recovery locale must exist");
+            for key in required {
+                let value = t(key);
+                assert!(!value.trim().is_empty(), "{locale}:{key} is empty");
+                assert_ne!(value, key, "{locale}:{key} is missing");
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_storage_documentation_states_the_non_forensic_boundary() {
+        let readme = include_str!("../../README.md");
+        let architecture = include_str!("../../docs/architecture.md");
+        let runbook = include_str!("../../docs/storage-recovery.md");
+        for document in [readme, architecture, runbook] {
+            assert!(document.contains("permissions"));
+            assert!(document.contains("forensic"));
+            assert!(document.contains("never automatically"));
+        }
+    }
+
+    #[test]
+    fn recovery_ui_requires_fresh_consent_and_keeps_about_accessible() {
+        let ui = include_str!("../../crates/app-ui/ui/main-window.slint");
+        let main = include_str!("../../crates/app-ui/src/main.rs");
+        assert!(ui.contains("if root.startup-visible && !root.about-visible"));
+        assert!(ui.contains("checked <=> root.startup-consent-granted"));
+        assert!(ui.contains(
+            "enabled: !root.startup-busy && (!root.startup-consent-required || root.startup-consent-granted)"
+        ));
+        assert!(ui.contains("clicked => { root.about-visible = true; }"));
+        assert!(ui.contains("AboutSlint"));
+        assert!(main.contains("slint::Timer::single_shot(Duration::ZERO"));
+        assert!(!main.contains("match startup::inspect()"));
+    }
+
+    #[test]
     fn test_packaging_version_and_elevation_contract() {
         let workspace_manifest = include_str!("../../Cargo.toml");
         let windows_manifest = include_str!("../../resources/app.manifest");

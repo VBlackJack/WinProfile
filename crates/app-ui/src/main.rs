@@ -16,11 +16,14 @@
 
 #![windows_subsystem = "windows"]
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use app_ui::startup::{self, StartupDecision};
 use app_ui::{AppController, AppStrings, MainWindow};
-use audit_journal::{AuditLogger, SnapshotEngine};
-use core_profiles::{t, I18nManager};
+use audit_journal::LegacyStorageRecovery;
+use core_profiles::{t, t_args, I18nManager};
 use platform_win32::is_process_elevated;
 use slint::{CloseRequestResponse, ComponentHandle};
 
@@ -29,27 +32,216 @@ fn main() -> anyhow::Result<()> {
     I18nManager::validate()?;
     I18nManager::set_locale("fr")?;
 
-    let snapshot_engine = Arc::new(SnapshotEngine::new(None)?);
-    let audit_logger = Arc::new(AuditLogger::new(None, 500)?);
-    let controller = Arc::new(AppController::new(snapshot_engine, audit_logger));
     let main_window = MainWindow::new()?;
-
     load_translations(&main_window);
-    main_window.set_status_message(t("status.ready").into());
     main_window.set_is_elevated(is_process_elevated()?);
-    controller.refresh_audit_logs(&main_window);
+    main_window.set_startup_title(t("startup.checking.title").into());
+    main_window.set_startup_message(t("startup.checking.message").into());
+    main_window.set_startup_details("".into());
+    main_window.set_startup_action_text(t("startup.retry").into());
+    main_window.set_startup_quit_text(t("startup.quit").into());
+    main_window.set_startup_consent_text(t("startup.legacy.consent").into());
+
+    let runtime = Arc::new(StartupRuntime::new());
 
     {
-        let controller = Arc::clone(&controller);
+        let runtime = Arc::clone(&runtime);
         let weak = main_window.as_weak();
         main_window.window().on_close_requested(move || {
-            weak.upgrade()
-                .map_or(CloseRequestResponse::HideWindow, |ui| {
-                    controller.handle_close_requested(&ui)
-                })
+            let Some(ui) = weak.upgrade() else {
+                return CloseRequestResponse::HideWindow;
+            };
+            if runtime.startup_busy.load(Ordering::Acquire) {
+                ui.set_status_message(t("startup.close_blocked").into());
+                return CloseRequestResponse::KeepWindowShown;
+            }
+            match runtime.controller.lock() {
+                Ok(controller) => controller
+                    .as_ref()
+                    .map_or(CloseRequestResponse::HideWindow, |controller| {
+                        controller.handle_close_requested(&ui)
+                    }),
+                Err(_) => CloseRequestResponse::KeepWindowShown,
+            }
         });
     }
 
+    {
+        let runtime = Arc::clone(&runtime);
+        let weak = main_window.as_weak();
+        main_window.on_startup_quit(move || {
+            if !runtime.startup_busy.load(Ordering::Acquire) {
+                if let Some(ui) = weak.upgrade() {
+                    let _ = ui.hide();
+                }
+            }
+        });
+    }
+
+    {
+        let runtime = Arc::clone(&runtime);
+        let weak = main_window.as_weak();
+        main_window.on_startup_proceed(move || {
+            start_or_retry(Arc::clone(&runtime), weak.clone());
+        });
+    }
+
+    {
+        let runtime = Arc::clone(&runtime);
+        let weak = main_window.as_weak();
+        slint::Timer::single_shot(Duration::ZERO, move || {
+            spawn_startup_work(runtime, weak, None);
+        });
+    }
+
+    main_window.run()?;
+    Ok(())
+}
+
+struct StartupRuntime {
+    controller: Mutex<Option<Arc<AppController>>>,
+    recovery: Mutex<Option<LegacyStorageRecovery>>,
+    startup_busy: AtomicBool,
+}
+
+impl StartupRuntime {
+    fn new() -> Self {
+        Self {
+            controller: Mutex::new(None),
+            recovery: Mutex::new(None),
+            startup_busy: AtomicBool::new(true),
+        }
+    }
+}
+
+fn start_or_retry(runtime: Arc<StartupRuntime>, weak: slint::Weak<MainWindow>) {
+    let Some(ui) = weak.upgrade() else {
+        return;
+    };
+    if ui.get_startup_consent_required() && !ui.get_startup_consent_granted() {
+        return;
+    }
+    drop(ui);
+    if runtime.startup_busy.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if let Some(ui) = weak.upgrade() {
+        ui.set_startup_busy(true);
+        ui.set_startup_title(t("startup.working.title").into());
+        ui.set_startup_message(t("startup.working.message").into());
+        ui.set_startup_details(t("startup.working.details").into());
+    }
+    let recovery = runtime
+        .recovery
+        .lock()
+        .ok()
+        .and_then(|mut recovery| recovery.take());
+    spawn_startup_work(runtime, weak, recovery);
+}
+
+fn spawn_startup_work(
+    runtime: Arc<StartupRuntime>,
+    weak: slint::Weak<MainWindow>,
+    recovery: Option<LegacyStorageRecovery>,
+) {
+    std::thread::spawn(move || {
+        let result = match recovery {
+            Some(recovery) => startup::complete_recovery(recovery).map(StartupDecision::Ready),
+            None => startup::inspect(),
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(ui) = weak.upgrade() {
+                match result {
+                    Ok(decision) => present_startup_decision(&ui, &runtime, decision),
+                    Err(error) => present_startup_error(&ui, &runtime, error.to_string()),
+                }
+            }
+        });
+    });
+}
+
+fn present_startup_decision(
+    ui: &MainWindow,
+    runtime: &Arc<StartupRuntime>,
+    decision: StartupDecision,
+) {
+    match decision {
+        StartupDecision::Ready(controller) => {
+            if let Ok(mut slot) = runtime.controller.lock() {
+                *slot = Some(Arc::clone(&controller));
+            } else {
+                present_startup_error(
+                    ui,
+                    runtime,
+                    "startup controller state is unavailable".into(),
+                );
+                return;
+            }
+            bind_controller(ui, Arc::clone(&controller));
+            runtime.startup_busy.store(false, Ordering::Release);
+            ui.set_startup_busy(false);
+            ui.set_startup_consent_required(false);
+            ui.set_startup_consent_granted(true);
+            ui.set_startup_visible(false);
+            ui.set_status_message(t("status.ready").into());
+            controller.refresh_audit_logs(ui);
+            controller.scan_profiles(ui);
+        }
+        StartupDecision::Recovery(recovery) => {
+            let resume = recovery.is_resume();
+            let reason = recovery.reason().to_string();
+            if let Ok(mut slot) = runtime.recovery.lock() {
+                *slot = Some(recovery);
+            } else {
+                present_startup_error(ui, runtime, "startup recovery state is unavailable".into());
+                return;
+            }
+            runtime.startup_busy.store(false, Ordering::Release);
+            ui.set_startup_visible(true);
+            ui.set_startup_busy(false);
+            let consent_required = startup::requires_fresh_consent(resume);
+            ui.set_startup_consent_required(consent_required);
+            ui.set_startup_consent_granted(!consent_required);
+            ui.set_startup_title(
+                t(if resume {
+                    "startup.resume.title"
+                } else {
+                    "startup.legacy.title"
+                })
+                .into(),
+            );
+            ui.set_startup_message(t("startup.legacy.message").into());
+            ui.set_startup_details(t_args("startup.legacy.details", &[("reason", &reason)]).into());
+            ui.set_startup_action_text(
+                t(if resume {
+                    "startup.resume.action"
+                } else {
+                    "startup.legacy.action"
+                })
+                .into(),
+            );
+            ui.set_startup_quit_text(t("startup.quit").into());
+        }
+    }
+}
+
+fn present_startup_error(ui: &MainWindow, runtime: &Arc<StartupRuntime>, error: String) {
+    if let Ok(mut recovery) = runtime.recovery.lock() {
+        recovery.take();
+    }
+    runtime.startup_busy.store(false, Ordering::Release);
+    ui.set_startup_visible(true);
+    ui.set_startup_busy(false);
+    ui.set_startup_consent_required(false);
+    ui.set_startup_consent_granted(true);
+    ui.set_startup_title(t("startup.error.title").into());
+    ui.set_startup_message(t("startup.error.message").into());
+    ui.set_startup_details(error.into());
+    ui.set_startup_action_text(t("startup.retry").into());
+    ui.set_startup_quit_text(t("startup.quit").into());
+}
+
+fn bind_controller(main_window: &MainWindow, controller: Arc<AppController>) {
     {
         let controller = Arc::clone(&controller);
         let weak = main_window.as_weak();
@@ -144,10 +336,6 @@ fn main() -> anyhow::Result<()> {
             }
         });
     }
-
-    controller.scan_profiles(&main_window);
-    main_window.run()?;
-    Ok(())
 }
 
 fn load_translations(ui: &MainWindow) {

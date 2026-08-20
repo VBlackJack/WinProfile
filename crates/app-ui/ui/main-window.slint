@@ -166,7 +166,17 @@ export component MainWindow inherits Window {
     in-out property <string> confirmation-title;
     in-out property <string> confirmation-message;
     in-out property <bool> about-visible: false;
-    property <bool> modal-visible: root.confirmation-visible || root.about-visible;
+    in-out property <bool> startup-visible: true;
+    in-out property <bool> startup-busy: true;
+    in-out property <string> startup-title;
+    in-out property <string> startup-message;
+    in-out property <string> startup-details;
+    in-out property <string> startup-action-text;
+    in-out property <string> startup-quit-text;
+    in-out property <string> startup-consent-text;
+    in-out property <bool> startup-consent-required: false;
+    in-out property <bool> startup-consent-granted: false;
+    property <bool> modal-visible: root.startup-visible || root.confirmation-visible || root.about-visible;
 
     callback scan-profiles();
     callback select-profile(int);
@@ -178,6 +188,8 @@ export component MainWindow inherits Window {
     callback confirm-action(int);
     callback export-audit-json();
     callback clear-audit-logs();
+    callback startup-proceed();
+    callback startup-quit();
 
     Rectangle {
         background: DraculaTheme.background;
@@ -588,6 +600,81 @@ export component MainWindow inherits Window {
                                 about-close := Button {
                                     text: AppStrings.close;
                                     clicked => { root.about-visible = false; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.startup-visible && !root.about-visible: Rectangle {
+            background: DraculaTheme.background;
+            FocusScope {
+                forward-focus: startup-quit;
+                init => { self.focus(); }
+                key-pressed(event) => {
+                    if event.text == Key.Escape && !root.startup-busy {
+                        root.startup-quit();
+                        return accept;
+                    }
+                    return reject;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 680px;
+                        height: 390px;
+                        background: DraculaTheme.card-bg;
+                        border-radius: DraculaTheme.border-radius;
+                        border-width: 2px;
+                        border-color: root.startup-busy ? DraculaTheme.purple : DraculaTheme.orange;
+                        accessible-role: groupbox;
+                        accessible-label: root.startup-title;
+                        VerticalLayout {
+                            padding: DraculaTheme.spacing-lg;
+                            spacing: DraculaTheme.spacing-md;
+                            Text { text: AppStrings.app-title; color: DraculaTheme.purple; font-size: 22px; font-weight: 800; }
+                            Text { text: root.startup-title; color: DraculaTheme.orange; font-size: 19px; font-weight: 700; }
+                            Text { text: root.startup-message; color: DraculaTheme.foreground; wrap: word-wrap; vertical-stretch: 1; }
+                            Rectangle {
+                                background: DraculaTheme.current-line;
+                                border-radius: DraculaTheme.border-radius;
+                                min-height: 92px;
+                                Text {
+                                    x: DraculaTheme.spacing-md;
+                                    y: DraculaTheme.spacing-md;
+                                    width: parent.width - 2 * DraculaTheme.spacing-md;
+                                    height: parent.height - 2 * DraculaTheme.spacing-md;
+                                    text: root.startup-details;
+                                    color: DraculaTheme.text-secondary;
+                                    font-size: 11px;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            if root.startup-consent-required: CheckBox {
+                                text: root.startup-consent-text;
+                                checked <=> root.startup-consent-granted;
+                                enabled: !root.startup-busy;
+                            }
+                            HorizontalLayout {
+                                alignment: end;
+                                spacing: DraculaTheme.spacing-md;
+                                startup-quit := Button {
+                                    text: root.startup-quit-text;
+                                    enabled: !root.startup-busy;
+                                    primary: true;
+                                    clicked => { root.startup-quit(); }
+                                }
+                                Button {
+                                    text: AppStrings.about;
+                                    enabled: !root.startup-busy;
+                                    clicked => { root.about-visible = true; }
+                                }
+                                Button {
+                                    text: root.startup-action-text;
+                                    enabled: !root.startup-busy && (!root.startup-consent-required || root.startup-consent-granted);
+                                    clicked => { root.startup-proceed(); }
                                 }
                             }
                         }

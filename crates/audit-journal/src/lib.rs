@@ -15,11 +15,16 @@
  */
 
 pub mod journal;
+pub mod legacy;
 pub mod rollback;
 pub mod snapshot;
 pub mod storage;
 
 pub use journal::{AuditEntry, AuditError, AuditLogger, AuditResult, AuditStatus, OperationGuard};
+pub use legacy::{
+    inspect_production_storage, LegacyStorageError, LegacyStorageRecovery, LegacyStorageResult,
+    PendingProductionStorage, ProductionStorage, ProductionStorageState,
+};
 pub use rollback::{restore_registry_snapshot, RollbackError, RollbackResult};
 pub use snapshot::{SnapshotEngine, SnapshotError, SnapshotMetadata, SnapshotResult};
 pub use storage::{StorageError, StorageResult};

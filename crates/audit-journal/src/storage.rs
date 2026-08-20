@@ -27,7 +27,7 @@ use std::io;
 use std::mem::{size_of, zeroed};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{addr_of, null, null_mut};
 use std::sync::Arc;
 use std::thread;
@@ -37,14 +37,14 @@ use platform_win32::{SecureDirectory, SecureFsError};
 use thiserror::Error;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-    FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_IF,
+    FILE_OPEN_REPARSE_POINT, FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_ALREADY_EXISTS,
-    ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, STATUS_OBJECT_NAME_COLLISION,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION,
-    UNICODE_STRING,
+    CloseHandle, DuplicateHandle, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_SUCCESS, HANDLE,
+    INVALID_HANDLE_VALUE, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION, UNICODE_STRING,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetSecurityInfo,
@@ -53,13 +53,13 @@ use windows_sys::Win32::Security::Authorization::{
 use windows_sys::Win32::Security::{
     AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl,
     ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION,
-    OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
+    OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, FileDispositionInfo, GetFileInformationByHandle, MoveFileExW,
-    SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    CreateFileW, FileDispositionInfo, FileIdInfo, GetFileInformationByHandle,
+    GetFileInformationByHandleEx, MoveFileExW, SetFileInformationByHandle,
+    BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DISPOSITION_INFO, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_INFO,
     FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
     FILE_SHARE_WRITE, FILE_TRAVERSE, MOVEFILE_WRITE_THROUGH, OPEN_EXISTING, READ_CONTROL,
     SYNCHRONIZE,
@@ -72,10 +72,11 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::UI::Shell::{FOLDERID_ProgramData, SHGetKnownFolderPath};
 
-const PRODUCT_DIRECTORY: &str = "WinProfile";
+pub(crate) const PRODUCT_DIRECTORY: &str = "WinProfile";
+pub(crate) const BOOTSTRAP_DIRECTORY: &str = "WinProfile.Bootstrap";
 const STORAGE_LOCK_FILE: &str = ".storage.lock";
 const OPERATION_LOCK_FILE: &str = ".operation.lock";
-const ROOT_SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+pub(crate) const ROOT_SDDL: &str = "O:BAG:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 const SYSTEM_SID: &str = "S-1-5-18";
 const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
@@ -119,6 +120,13 @@ pub enum StorageError {
 
 pub type StorageResult<T> = Result<T, StorageError>;
 
+/// Persistent identity of an opened filesystem object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StorageObjectIdentity {
+    pub volume_serial: u64,
+    pub file_id: [u8; 16],
+}
+
 impl StorageError {
     pub(crate) fn is_not_found(&self) -> bool {
         matches!(
@@ -143,7 +151,7 @@ pub(crate) struct FileIdentity {
 }
 
 #[derive(Debug)]
-struct StorageHandle(HANDLE);
+pub(crate) struct StorageHandle(HANDLE);
 
 // Windows kernel handles may be used and closed from any thread. Access to
 // mutable file content is separately serialized by the exclusive lock handle.
@@ -159,7 +167,7 @@ impl StorageHandle {
         }
     }
 
-    fn raw(&self) -> HANDLE {
+    pub(crate) fn raw(&self) -> HANDLE {
         self.0
     }
 
@@ -202,8 +210,8 @@ impl Drop for StorageHandle {
 
 #[derive(Debug)]
 pub(crate) struct StorageDirectory {
-    handle: StorageHandle,
-    path: PathBuf,
+    pub(crate) handle: StorageHandle,
+    pub(crate) path: PathBuf,
 }
 
 impl StorageDirectory {
@@ -229,6 +237,171 @@ impl StorageDirectory {
         )?;
         validate_kind(&handle, &path, true)?;
         Ok(Self { handle, path })
+    }
+
+    pub(crate) fn open_existing_child(&self, name: &str) -> StorageResult<Self> {
+        self.open_child(OsStr::new(name))
+    }
+
+    pub(crate) fn open_existing_child_for_rename(&self, name: &str) -> StorageResult<Self> {
+        let path = child_path(&self.path, OsStr::new(name))?;
+        let handle = nt_open_relative(
+            self.handle.raw(),
+            OsStr::new(name),
+            &path,
+            DIRECTORY_ACCESS | DELETE,
+            DIRECTORY_SHARES,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE
+                | FILE_OPEN_REPARSE_POINT
+                | FILE_OPEN_FOR_BACKUP_INTENT
+                | FILE_SYNCHRONOUS_IO_NONALERT,
+        )?;
+        validate_kind(&handle, &path, true)?;
+        Ok(Self { handle, path })
+    }
+
+    pub(crate) fn create_protected_child(&self, name: &str) -> StorageResult<Self> {
+        let path = child_path(&self.path, OsStr::new(name))?;
+        let descriptor = LocalSecurityDescriptor::parse(ROOT_SDDL, &path)?;
+        let handle = nt_open_relative_with_descriptor(
+            self.handle.raw(),
+            OsStr::new(name),
+            &path,
+            DIRECTORY_ACCESS | DELETE,
+            DIRECTORY_SHARES,
+            FILE_CREATE,
+            FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            descriptor.raw(),
+        )?;
+        validate_kind(&handle, &path, true)?;
+        validate_production_root(&handle, &path)?;
+        Ok(Self { handle, path })
+    }
+
+    pub(crate) fn open_object_for_detach(&self, name: &str) -> StorageResult<StorageObject> {
+        let path = child_path(&self.path, OsStr::new(name))?;
+        let handle = nt_open_relative(
+            self.handle.raw(),
+            OsStr::new(name),
+            &path,
+            DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
+            FILE_SHARE_READ,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )?;
+        let identity = storage_object_identity(&handle, &path)?;
+        Ok(StorageObject {
+            handle,
+            path,
+            identity,
+        })
+    }
+
+    pub(crate) fn open_object_identity(&self, name: &str) -> StorageResult<StorageObjectIdentity> {
+        let path = child_path(&self.path, OsStr::new(name))?;
+        let handle = nt_open_relative(
+            self.handle.raw(),
+            OsStr::new(name),
+            &path,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_SYNCHRONOUS_IO_NONALERT,
+        )?;
+        storage_object_identity(&handle, &path)
+    }
+
+    pub(crate) fn acquire_named_lock(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> StorageResult<StorageLock> {
+        let start = Instant::now();
+        loop {
+            let path = child_path(&self.path, OsStr::new(name))?;
+            match nt_open_relative(
+                self.handle.raw(),
+                OsStr::new(name),
+                &path,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE,
+                0,
+                FILE_OPEN_IF,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ) {
+                Ok(handle) => {
+                    validate_kind(&handle, &path, false)?;
+                    return Ok(StorageLock { _handle: handle });
+                }
+                Err(StorageError::Native { status, .. }) if status == STATUS_SHARING_VIOLATION => {
+                    if start.elapsed() >= timeout {
+                        return Err(StorageError::LockTimeout(timeout));
+                    }
+                    thread::sleep(LOCK_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) fn acquire_protected_named_lock(
+        &self,
+        name: &str,
+        timeout: Duration,
+    ) -> StorageResult<StorageLock> {
+        let path = child_path(&self.path, OsStr::new(name))?;
+        let descriptor = LocalSecurityDescriptor::parse(ROOT_SDDL, &path)?;
+        let start = Instant::now();
+        loop {
+            match nt_open_relative_with_descriptor(
+                self.handle.raw(),
+                OsStr::new(name),
+                &path,
+                FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE,
+                0,
+                FILE_OPEN_IF,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+                descriptor.raw(),
+            ) {
+                Ok(handle) => {
+                    validate_kind(&handle, &path, false)?;
+                    validate_production_root(&handle, &path)?;
+                    return Ok(StorageLock { _handle: handle });
+                }
+                Err(StorageError::Native { status, .. }) if status == STATUS_SHARING_VIOLATION => {
+                    if start.elapsed() >= timeout {
+                        return Err(StorageError::LockTimeout(timeout));
+                    }
+                    thread::sleep(LOCK_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    pub(crate) fn identity(&self) -> StorageResult<StorageObjectIdentity> {
+        storage_object_identity(&self.handle, &self.path)
+    }
+
+    pub(crate) fn rename_to(
+        mut self,
+        target_parent: &StorageDirectory,
+        target_name: &str,
+    ) -> StorageResult<Self> {
+        let target_path = child_path(&target_parent.path, OsStr::new(target_name))?;
+        rename_by_handle(
+            &self.handle,
+            &self.path,
+            &target_parent.handle,
+            target_name,
+            &target_path,
+        )?;
+        self.path = target_path;
+        Ok(self)
+    }
+
+    pub(crate) fn remove(self) -> StorageResult<()> {
+        delete_by_handle(&self.handle, &self.path)
     }
 
     fn open_or_create_child(&self, name: &OsStr) -> StorageResult<Self> {
@@ -308,6 +481,10 @@ impl StorageDirectory {
         })
     }
 
+    pub(crate) fn create_state_file(&self, name: &str) -> StorageResult<CreatedStorageFile> {
+        self.create_file(OsStr::new(name), FILE_SHARE_READ)
+    }
+
     pub(crate) fn entries(&self) -> StorageResult<Vec<OsString>> {
         let secure = SecureDirectory::open_absolute_existing(&self.path)?;
         Ok(secure
@@ -346,6 +523,34 @@ impl StorageDirectory {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct StorageObject {
+    handle: StorageHandle,
+    path: PathBuf,
+    identity: StorageObjectIdentity,
+}
+
+impl StorageObject {
+    pub(crate) fn identity(&self) -> StorageObjectIdentity {
+        self.identity
+    }
+
+    pub(crate) fn rename_to(
+        &self,
+        target_parent: &StorageDirectory,
+        target_name: &str,
+    ) -> StorageResult<()> {
+        let target_path = child_path(&target_parent.path, OsStr::new(target_name))?;
+        rename_by_handle(
+            &self.handle,
+            &self.path,
+            &target_parent.handle,
+            target_name,
+            &target_path,
+        )
+    }
+}
+
 /// A create-new file which deletes the exact created object unless committed.
 #[derive(Debug)]
 pub(crate) struct CreatedStorageFile {
@@ -362,6 +567,28 @@ impl CreatedStorageFile {
     pub(crate) fn commit(mut self) -> File {
         self.cleanup_handle.take();
         self.file.take().expect("created file remains present")
+    }
+
+    pub(crate) fn publish(
+        mut self,
+        target_parent: &StorageDirectory,
+        target_name: &str,
+    ) -> StorageResult<File> {
+        let target_path = child_path(&target_parent.path, OsStr::new(target_name))?;
+        let cleanup_handle = self
+            .cleanup_handle
+            .as_ref()
+            .expect("created file cleanup handle remains present");
+        rename_by_handle(
+            cleanup_handle,
+            &self.path,
+            &target_parent.handle,
+            target_name,
+            &target_path,
+        )?;
+        self.path = target_path;
+        self.cleanup_handle.take();
+        Ok(self.file.take().expect("created file remains present"))
     }
 
     pub(crate) fn rollback(mut self) -> StorageResult<()> {
@@ -408,14 +635,36 @@ impl StorageRoot {
     }
 
     fn production_at(program_data: &Path) -> StorageResult<Arc<Self>> {
-        let root_path = program_data.join(PRODUCT_DIRECTORY);
-        create_protected_root_if_missing(&root_path)?;
-        let directory = open_absolute_directory(&root_path)?;
-        validate_production_root(&directory.handle, &root_path)?;
+        let program_data = open_absolute_directory(program_data)?;
+        Self::open_or_create_under(&program_data)
+    }
+
+    pub(crate) fn open_existing_under(program_data: &StorageDirectory) -> StorageResult<Arc<Self>> {
+        let directory = program_data.open_existing_child(PRODUCT_DIRECTORY)?;
+        validate_production_root(&directory.handle, &directory.path)?;
         Ok(Arc::new(Self {
             directory,
             trust: StorageTrust::Production,
         }))
+    }
+
+    pub(crate) fn open_or_create_under(
+        program_data: &StorageDirectory,
+    ) -> StorageResult<Arc<Self>> {
+        match Self::open_existing_under(program_data) {
+            Ok(storage) => Ok(storage),
+            Err(error) if error.is_not_found() => {
+                match program_data.create_protected_child(PRODUCT_DIRECTORY) {
+                    Ok(directory) => Ok(Arc::new(Self {
+                        directory,
+                        trust: StorageTrust::Production,
+                    })),
+                    Err(error) if error.is_collision() => Self::open_existing_under(program_data),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Explicitly trusted injection for tests. It never participates in the
@@ -453,6 +702,10 @@ impl StorageRoot {
 
     pub(crate) fn child_path(&self, name: &str) -> StorageResult<PathBuf> {
         child_path(&self.directory.path, OsStr::new(name))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.directory.path
     }
 
     pub(crate) fn remove_file_if_exists(&self, name: &str) -> StorageResult<bool> {
@@ -517,31 +770,7 @@ impl StorageRoot {
 
     fn acquire_named_lock(&self, name: &str, timeout: Duration) -> StorageResult<StorageLock> {
         self.revalidate()?;
-        let start = Instant::now();
-        loop {
-            let path = child_path(&self.directory.path, OsStr::new(name))?;
-            match nt_open_relative(
-                self.directory.handle.raw(),
-                OsStr::new(name),
-                &path,
-                FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE,
-                0,
-                FILE_OPEN_IF,
-                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            ) {
-                Ok(handle) => {
-                    validate_kind(&handle, &path, false)?;
-                    return Ok(StorageLock { _handle: handle });
-                }
-                Err(StorageError::Native { status, .. }) if status == STATUS_SHARING_VIOLATION => {
-                    if start.elapsed() >= timeout {
-                        return Err(StorageError::LockTimeout(timeout));
-                    }
-                    thread::sleep(LOCK_RETRY_DELAY.min(timeout.saturating_sub(start.elapsed())));
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        self.directory.acquire_named_lock(name, timeout)
     }
 
     fn revalidate(&self) -> StorageResult<()> {
@@ -551,6 +780,11 @@ impl StorageRoot {
         }
         Ok(())
     }
+}
+
+pub(crate) fn production_program_data_directory() -> StorageResult<StorageDirectory> {
+    let program_data = resolve_program_data_with(&KnownFolderProgramData)?;
+    open_absolute_directory(&program_data)
 }
 
 trait ProgramDataResolver {
@@ -595,43 +829,9 @@ fn resolve_known_folder_program_data() -> StorageResult<PathBuf> {
     Ok(path)
 }
 
-fn create_protected_root_if_missing(path: &Path) -> StorageResult<()> {
-    let sddl = wide_null(OsStr::new(ROOT_SDDL));
-    let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
-    let converted = unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl.as_ptr(),
-            SECURITY_DESCRIPTOR_REVISION,
-            &mut descriptor,
-            null_mut(),
-        )
-    };
-    if converted == 0 {
-        return Err(io_error("parse protected root SDDL", path));
-    }
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor,
-        bInheritHandle: 0,
-    };
-    let wide_path = wide_null(path.as_os_str());
-    let created = unsafe { CreateDirectoryW(wide_path.as_ptr(), &attributes) };
-    let error = io::Error::last_os_error();
-    unsafe {
-        LocalFree(descriptor.cast());
-    }
-    if created == 0 && error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
-        return Err(StorageError::Io {
-            operation: "create protected storage root",
-            path: path.display().to_string(),
-            source: error,
-        });
-    }
-    Ok(())
-}
-
-fn open_absolute_directory(path: &Path) -> StorageResult<StorageDirectory> {
-    let wide = wide_null(path.as_os_str());
+pub(crate) fn open_absolute_directory(path: &Path) -> StorageResult<StorageDirectory> {
+    let (root_path, components) = split_absolute(path)?;
+    let wide = wide_null(root_path.as_os_str());
     let raw = unsafe {
         CreateFileW(
             wide.as_ptr(),
@@ -644,15 +844,47 @@ fn open_absolute_directory(path: &Path) -> StorageResult<StorageDirectory> {
             null_mut(),
         )
     };
-    let handle = StorageHandle::new(raw, "open storage root", path)?;
-    validate_kind(&handle, path, true)?;
-    Ok(StorageDirectory {
+    let handle = StorageHandle::new(raw, "open storage volume root", &root_path)?;
+    validate_kind(&handle, &root_path, true)?;
+    let mut current = StorageDirectory {
         handle,
-        path: path.to_path_buf(),
-    })
+        path: root_path,
+    };
+    for component in components {
+        current = current.open_child(&component)?;
+    }
+    Ok(current)
 }
 
-fn validate_production_root(handle: &StorageHandle, path: &Path) -> StorageResult<()> {
+fn split_absolute(path: &Path) -> StorageResult<(PathBuf, Vec<OsString>)> {
+    let mut iter = path.components();
+    let prefix = match iter.next() {
+        Some(Component::Prefix(prefix)) => prefix,
+        _ => return Err(StorageError::InvalidComponent(path.display().to_string())),
+    };
+    if !matches!(iter.next(), Some(Component::RootDir)) {
+        return Err(StorageError::InvalidComponent(path.display().to_string()));
+    }
+    let root = match prefix.kind() {
+        Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {
+            let mut root = PathBuf::from(prefix.as_os_str());
+            root.push(Path::new(r"\"));
+            root
+        }
+        _ => return Err(StorageError::InvalidComponent(path.display().to_string())),
+    };
+    let mut components = Vec::new();
+    for component in iter {
+        match component {
+            Component::Normal(value) => components.push(value.to_os_string()),
+            Component::CurDir => {}
+            _ => return Err(StorageError::InvalidComponent(path.display().to_string())),
+        }
+    }
+    Ok((root, components))
+}
+
+pub(crate) fn validate_production_root(handle: &StorageHandle, path: &Path) -> StorageResult<()> {
     let mut owner: PSID = null_mut();
     let mut dacl = null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
@@ -787,6 +1019,39 @@ impl Drop for LocalSid {
     }
 }
 
+struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl LocalSecurityDescriptor {
+    fn parse(sddl: &str, path: &Path) -> StorageResult<Self> {
+        let wide = wide_null(OsStr::new(sddl));
+        let mut descriptor = null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SECURITY_DESCRIPTOR_REVISION,
+                &mut descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io_error("parse protected storage descriptor", path));
+        }
+        Ok(Self(descriptor))
+    }
+
+    fn raw(&self) -> *mut c_void {
+        self.0.cast()
+    }
+}
+
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe {
+            LocalFree(self.0.cast());
+        }
+    }
+}
+
 fn nt_open_relative(
     parent: HANDLE,
     name: &OsStr,
@@ -795,6 +1060,29 @@ fn nt_open_relative(
     share_access: u32,
     disposition: u32,
     options: u32,
+) -> StorageResult<StorageHandle> {
+    nt_open_relative_with_descriptor(
+        parent,
+        name,
+        path,
+        desired_access,
+        share_access,
+        disposition,
+        options,
+        null_mut(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn nt_open_relative_with_descriptor(
+    parent: HANDLE,
+    name: &OsStr,
+    path: &Path,
+    desired_access: u32,
+    share_access: u32,
+    disposition: u32,
+    options: u32,
+    descriptor: *mut c_void,
 ) -> StorageResult<StorageHandle> {
     validate_component(name)?;
     let mut wide: Vec<u16> = name.encode_wide().collect();
@@ -813,7 +1101,7 @@ fn nt_open_relative(
         RootDirectory: parent,
         ObjectName: &unicode,
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: null(),
+        SecurityDescriptor: descriptor,
         SecurityQualityOfService: null(),
     };
     let mut raw = null_mut();
@@ -841,6 +1129,78 @@ fn nt_open_relative(
         });
     }
     StorageHandle::new(raw, "open relative storage object", path)
+}
+
+fn storage_object_identity(
+    handle: &StorageHandle,
+    path: &Path,
+) -> StorageResult<StorageObjectIdentity> {
+    let mut info: FILE_ID_INFO = unsafe { zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle.raw(),
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            size_of::<FILE_ID_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io_error("read persistent storage object identity", path));
+    }
+    Ok(StorageObjectIdentity {
+        volume_serial: info.VolumeSerialNumber,
+        file_id: info.FileId.Identifier,
+    })
+}
+
+fn rename_by_handle(
+    source: &StorageHandle,
+    source_path: &Path,
+    target_parent: &StorageHandle,
+    target_name: &str,
+    target_path: &Path,
+) -> StorageResult<()> {
+    validate_component(OsStr::new(target_name))?;
+    let wide: Vec<u16> = OsStr::new(target_name).encode_wide().collect();
+    let name_bytes = wide
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|length| u32::try_from(length).ok())
+        .ok_or_else(|| StorageError::InvalidComponent(target_name.to_string()))?;
+    let total = size_of::<FILE_RENAME_INFORMATION>()
+        .checked_add(name_bytes as usize)
+        .ok_or_else(|| StorageError::InvalidComponent(target_name.to_string()))?;
+    let word_count = total.div_ceil(size_of::<usize>());
+    let mut buffer = vec![0usize; word_count];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = 0;
+        (*info).RootDirectory = target_parent.raw();
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            wide.len(),
+        );
+    }
+    let mut io_status: IO_STATUS_BLOCK = unsafe { zeroed() };
+    let status = unsafe {
+        NtSetInformationFile(
+            source.raw(),
+            &mut io_status,
+            info.cast_const().cast(),
+            total as u32,
+            FileRenameInformation,
+        )
+    };
+    if status < 0 {
+        return Err(StorageError::Native {
+            operation: "rename exact storage object by handle",
+            path: format!("{} -> {}", source_path.display(), target_path.display()),
+            status,
+        });
+    }
+    Ok(())
 }
 
 fn validate_kind(handle: &StorageHandle, path: &Path, directory: bool) -> StorageResult<()> {
