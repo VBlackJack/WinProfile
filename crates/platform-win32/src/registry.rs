@@ -18,7 +18,10 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use thiserror::Error;
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::{
+    GetLastError, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS,
+};
+use windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW;
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegDeleteValueW, RegEnumKeyExW, RegLoadKeyW,
     RegOpenKeyExW, RegQueryValueExW, RegRenameKey, RegSaveKeyExW, RegSetValueExW, RegUnLoadKeyW,
@@ -43,6 +46,8 @@ pub enum RegistryError {
     },
     #[error("Invalid UTF-16 registry data")]
     InvalidUtf16,
+    #[error("Environment expansion failed with Win32 error code: {0}")]
+    EnvironmentExpansionFailed(u32),
     #[error("Registry key path cannot be converted to wide string")]
     InvalidPath,
     #[error("IO error: {0}")]
@@ -255,10 +260,53 @@ pub fn query_value_string(hkey: &OwnedHKey, value_name: &str) -> RegResult<Strin
         )
     };
 
-    if status == ERROR_SUCCESS {
-        from_wide_null(&buffer)
+    if status != ERROR_SUCCESS {
+        return Err(RegistryError::Win32Error(status));
+    }
+
+    decode_registry_string(val_type, &buffer)
+}
+
+fn decode_registry_string(value_type: REG_VALUE_TYPE, buffer: &[u16]) -> RegResult<String> {
+    let value = from_wide_null(buffer)?;
+    if value_type == REG_EXPAND_SZ {
+        expand_environment_string(&value)
     } else {
-        Err(RegistryError::Win32Error(status))
+        Ok(value)
+    }
+}
+
+fn expand_environment_string(value: &str) -> RegResult<String> {
+    let source = to_wide_null(value);
+    expand_environment_string_with(
+        |destination, capacity| unsafe {
+            ExpandEnvironmentStringsW(source.as_ptr(), destination, capacity)
+        },
+        || unsafe { GetLastError() },
+    )
+}
+
+fn expand_environment_string_with<E, L>(mut expand: E, mut last_error: L) -> RegResult<String>
+where
+    E: FnMut(*mut u16, u32) -> u32,
+    L: FnMut() -> u32,
+{
+    let mut required = expand(std::ptr::null_mut(), 0);
+    if required == 0 {
+        return Err(RegistryError::EnvironmentExpansionFailed(last_error()));
+    }
+
+    loop {
+        let mut buffer = vec![0u16; required as usize];
+        let written = expand(buffer.as_mut_ptr(), required);
+        if written == 0 {
+            return Err(RegistryError::EnvironmentExpansionFailed(last_error()));
+        }
+        if written > required {
+            required = written;
+            continue;
+        }
+        return from_wide_null(&buffer);
     }
 }
 
@@ -436,6 +484,87 @@ pub fn unload_hive(root: RegistryRoot, subkey: &str) -> RegResult<()> {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::path::Path;
+
+    #[test]
+    fn expand_environment_string_retries_when_required_size_grows() {
+        let calls = Cell::new(0usize);
+        let expected = to_wide_null(r"C:\Windows\System32");
+        let expanded = expand_environment_string_with(
+            |destination, capacity| {
+                let call = calls.get();
+                calls.set(call + 1);
+                match call {
+                    0 => 4,
+                    1 => expected.len() as u32,
+                    _ => {
+                        assert_eq!(capacity, expected.len() as u32);
+                        // SAFETY: the seam supplies a buffer of `capacity` UTF-16 elements,
+                        // and `expected.len()` is asserted to be exactly that capacity.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                expected.as_ptr(),
+                                destination,
+                                expected.len(),
+                            );
+                        }
+                        (expected.len() - 1) as u32
+                    }
+                }
+            },
+            || u32::MAX,
+        )
+        .expect("dynamic environment expansion");
+
+        assert_eq!(expanded, r"C:\Windows\System32");
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn expand_environment_string_surfaces_windows_error() {
+        let error = expand_environment_string_with(|_, _| 0, || 203)
+            .expect_err("failed expansion must be explicit");
+
+        assert!(matches!(
+            error,
+            RegistryError::EnvironmentExpansionFailed(203)
+        ));
+    }
+
+    #[test]
+    fn windows_expansion_changes_expandable_input_but_not_plain_registry_text() {
+        let plain = r"%SystemRoot%\System32";
+        let encoded = to_wide_null(plain);
+        let unchanged =
+            decode_registry_string(REG_SZ, &encoded).expect("plain registry string decode");
+        let expanded = decode_registry_string(REG_EXPAND_SZ, &encoded)
+            .expect("expandable registry string decode");
+
+        assert_eq!(unchanged, plain);
+        assert_ne!(expanded, plain);
+        assert!(Path::new(&expanded).is_dir(), "expanded path: {expanded}");
+    }
+
+    #[test]
+    #[ignore = "requires IntelTelemetryAgent to be installed on the test machine"]
+    fn installed_intel_telemetry_profile_path_is_expanded_and_exists() {
+        const INTEL_TELEMETRY_PROFILE_KEY: &str = concat!(
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\",
+            "S-1-5-80-863171341-2975503981-1811344707-3769924460-3995132968"
+        );
+        let key = open_key(
+            RegistryRoot::LocalMachine,
+            INTEL_TELEMETRY_PROFILE_KEY,
+            windows_sys::Win32::System::Registry::KEY_READ,
+        )
+        .expect("open installed IntelTelemetryAgent profile key");
+        let path = query_value_string(&key, "ProfileImagePath")
+            .expect("query installed IntelTelemetryAgent profile path");
+
+        assert!(!path.contains('%'), "path was not expanded: {path}");
+        assert!(Path::new(&path).is_dir(), "expanded path: {path}");
+        eprintln!("IntelTelemetryAgent expanded profile path: {path}");
+    }
 
     #[test]
     fn registry_snapshot_uses_latest_format_without_no_compression() {

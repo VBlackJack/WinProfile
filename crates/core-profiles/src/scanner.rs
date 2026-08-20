@@ -15,15 +15,17 @@
  */
 
 use std::collections::HashMap;
+use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 
 use thiserror::Error;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 use windows_sys::Win32::System::Registry::KEY_READ;
 
 use platform_win32::{
-    enum_subkeys, lookup_account_by_sid_string, open_key, path_is_reparse_point,
-    query_value_string, query_value_u32, RegistryError, RegistryRoot, RestartManagerSession,
+    enum_subkeys, lookup_account_by_sid_string, open_key, query_value_string, query_value_u32,
+    RegistryError, RegistryRoot, RestartManagerSession,
 };
 
 use crate::constants::*;
@@ -255,10 +257,9 @@ fn inspect_locks(path: &Path, anomalies: &mut Vec<ProfileAnomaly>) {
 }
 
 fn directory_size(root: &Path) -> Result<u64, String> {
-    match path_is_reparse_point(root) {
-        Ok(false) => {}
-        Ok(true) => return Err(format!("reparse point refused: {}", root.display())),
-        Err(error) => return Err(format!("{}: {error}", root.display())),
+    let root_metadata = metadata_without_follow(root)?;
+    if is_reparse_metadata(&root_metadata) {
+        return Err(format!("reparse point refused: {}", root.display()));
     }
     let mut total = 0u64;
     let entries =
@@ -266,28 +267,27 @@ fn directory_size(root: &Path) -> Result<u64, String> {
     for entry in entries {
         let entry = entry.map_err(|error| format!("{}: {error}", root.display()))?;
         let path = entry.path();
-        match path_is_reparse_point(&path) {
-            Ok(false) => {}
-            Ok(true) => return Err(format!("reparse point refused: {}", path.display())),
-            Err(error) => return Err(format!("{}: {error}", path.display())),
+        let metadata = metadata_without_follow(&path)?;
+        if is_reparse_metadata(&metadata) {
+            continue;
         }
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        if file_type.is_dir() {
+        if metadata.is_dir() {
             total = total.saturating_add(directory_size(&path)?);
-        } else if file_type.is_file() {
-            total = total.saturating_add(
-                entry
-                    .metadata()
-                    .map_err(|error| format!("{}: {error}", path.display()))?
-                    .len(),
-            );
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
         } else {
             return Err(format!("unsupported filesystem entry: {}", path.display()));
         }
     }
     Ok(total)
+}
+
+fn metadata_without_follow(path: &Path) -> Result<std::fs::Metadata, String> {
+    std::fs::symlink_metadata(path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn is_reparse_metadata(metadata: &std::fs::Metadata) -> bool {
+    (metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
 }
 
 fn mark_path_collisions(profiles: &mut [UserProfile]) {
@@ -315,8 +315,66 @@ fn mark_path_collisions(profiles: &mut [UserProfile]) {
 
 #[cfg(test)]
 mod tests {
-    use super::mark_path_collisions;
+    use super::{directory_size, mark_path_collisions};
     use crate::models::{ProfileAnomaly, ProfileHealth, UserProfile};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct DirectoryFixture {
+        base: PathBuf,
+        scan_root: PathBuf,
+        junction: PathBuf,
+    }
+
+    impl DirectoryFixture {
+        fn new() -> Self {
+            let id = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
+            let base = std::env::temp_dir()
+                .join(format!("winprofile-scanner-{}-{id}", std::process::id()));
+            let scan_root = base.join("profile");
+            let sentinel_root = base.join("sentinel");
+            let junction = scan_root.join("linked-data");
+            std::fs::create_dir(&base).expect("create directory-size fixture root");
+            std::fs::create_dir(&scan_root).expect("create scanned profile fixture");
+            std::fs::create_dir(&sentinel_root).expect("create sentinel fixture");
+            std::fs::write(scan_root.join("local.bin"), b"profile")
+                .expect("write local fixture file");
+            std::fs::write(sentinel_root.join("sentinel.bin"), vec![0x5a; 32])
+                .expect("write sentinel fixture file");
+            create_junction(&junction, &sentinel_root);
+            Self {
+                base,
+                scan_root,
+                junction,
+            }
+        }
+    }
+
+    impl Drop for DirectoryFixture {
+        fn drop(&mut self) {
+            if self.junction.exists() {
+                let _ = std::fs::remove_dir(&self.junction);
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn create_junction(link: &Path, target: &Path) {
+        let result = Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("run mklink junction fixture");
+        assert!(
+            result.status.success(),
+            "mklink failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 
     fn profile(sid: &str, path: &str) -> UserProfile {
         UserProfile {
@@ -356,5 +414,43 @@ mod tests {
             .anomalies
             .iter()
             .any(|anomaly| matches!(anomaly, ProfileAnomaly::PathCollision(_))));
+    }
+
+    #[test]
+    fn directory_size_skips_child_junction_without_counting_target() {
+        let fixture = DirectoryFixture::new();
+
+        let size = directory_size(&fixture.scan_root).expect("scan profile with child junction");
+
+        assert_eq!(size, 7);
+    }
+
+    #[test]
+    fn directory_size_refuses_reparse_root() {
+        let fixture = DirectoryFixture::new();
+
+        let error = directory_size(&fixture.junction).expect_err("reparse root must be refused");
+
+        assert!(error.contains("reparse point refused"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "machine-specific scan of the current Windows user profile"]
+    fn current_user_profile_scan_skips_standard_child_reparse_points() {
+        let profile = std::env::var_os("USERPROFILE").expect("USERPROFILE for machine proof");
+        let profile = PathBuf::from(profile);
+
+        match directory_size(&profile) {
+            Ok(size) => eprintln!("Current user profile scan: {size} bytes"),
+            Err(error) => {
+                assert!(
+                    !error.contains("reparse point refused"),
+                    "standard child reparse point still failed the scan: {error}"
+                );
+                eprintln!(
+                    "Current user profile scan failed closed for a non-reparse error: {error}"
+                );
+            }
+        }
     }
 }
