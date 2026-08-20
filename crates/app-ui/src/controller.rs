@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -24,7 +26,8 @@ use std::time::Duration;
 use audit_journal::{AuditEntry, AuditLogger, AuditStatus, SnapshotEngine};
 use chrono::{DateTime, Utc};
 use core_profiles::{
-    t, t_args, DiagnosticReport, MigrationError, MigrationPlan, ProfileMigrationEngine,
+    prevalidate_migration_plan, t, t_args, DiagnosticReport, MigrationError, MigrationPhase,
+    MigrationPlan, MigrationPreflight, MigrationProgress, ProfileMigrationEngine,
     ProfileRepairEngine, ProfileScanner, RepairPlan,
 };
 use platform_win32::{
@@ -78,6 +81,69 @@ enum MigrationTerminalPresentation {
     Error {
         details: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MigrationPreflightToken {
+    source_sid: String,
+    source_path: String,
+    target_path: String,
+    include_roaming_appdata: bool,
+    include_personal_folders: bool,
+    validated: MigrationPreflight,
+}
+
+impl MigrationPreflightToken {
+    fn new(plan: &MigrationPlan, validated: MigrationPreflight) -> Self {
+        Self {
+            source_sid: plan.source_sid.clone(),
+            source_path: plan.source_path.clone(),
+            target_path: plan.target_path.clone(),
+            include_roaming_appdata: plan.include_roaming_appdata,
+            include_personal_folders: plan.include_personal_folders,
+            validated,
+        }
+    }
+
+    fn matches(&self, plan: &MigrationPlan) -> bool {
+        self.source_sid == plan.source_sid
+            && self.source_path == plan.source_path
+            && self.target_path == plan.target_path
+            && self.include_roaming_appdata == plan.include_roaming_appdata
+            && self.include_personal_folders == plan.include_personal_folders
+            && self.validated.source_path == Path::new(&plan.source_path)
+            && self.validated.target_path == Path::new(&plan.target_path)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MigrationPreflightPresentation {
+    None,
+    Ready { target: String },
+    Changed,
+    ValidationError { summary_key: &'static str },
+    RawFailure { details: String },
+}
+
+impl MigrationPreflightPresentation {
+    fn render(&self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::Ready { target } => Some(t_args(
+                "migration.validation.ready",
+                &[("target", target.as_str())],
+            )),
+            Self::Changed => Some(t("migration.validation.changed")),
+            Self::ValidationError { summary_key } => Some(t(summary_key)),
+            Self::RawFailure { details } => Some(details.clone()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MigrationProgressQueue {
+    pending: Option<MigrationProgress>,
+    scheduled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,11 +617,166 @@ fn validate_migration_source(loaded: bool) -> Result<(), &'static str> {
     }
 }
 
+fn migration_plan_from_ui(ui: &MainWindow) -> MigrationPlan {
+    MigrationPlan {
+        source_sid: ui.get_selected_sid().to_string(),
+        source_path: ui.get_selected_path().to_string(),
+        target_path: ui.get_migration_target_path().to_string(),
+        include_roaming_appdata: ui.get_migration_include_roaming(),
+        include_personal_folders: ui.get_migration_include_docs(),
+    }
+}
+
+fn valid_target_leaf(candidate: &OsStr) -> bool {
+    let value = candidate.to_string_lossy();
+    if value.is_empty()
+        || value.ends_with(['.', ' '])
+        || value
+            .chars()
+            .any(|character| character <= '\u{1f}' || r#"<>:"/\|?*"#.contains(character))
+    {
+        return false;
+    }
+    let upper = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    !matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) && !upper.strip_prefix("COM").is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    }) && !upper.strip_prefix("LPT").is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    })
+}
+
+fn default_target_leaf(username: &str) -> OsString {
+    let mut sanitized = String::with_capacity(username.len() + "-migrated".len());
+    let mut previous_replacement = false;
+    for character in username.trim().chars() {
+        let invalid = character <= '\u{1f}' || r#"<>:"/\|?*"#.contains(character);
+        if invalid {
+            if !previous_replacement {
+                sanitized.push('-');
+            }
+            previous_replacement = true;
+        } else {
+            sanitized.push(character);
+            previous_replacement = false;
+        }
+    }
+    let sanitized = sanitized.trim_matches(['.', ' ', '-']);
+    let base = if sanitized.is_empty() {
+        "profile"
+    } else {
+        sanitized
+    };
+    OsString::from(format!("{base}-migrated"))
+}
+
+fn migration_validation_summary_key(error: &MigrationError) -> &'static str {
+    match error {
+        MigrationError::DestinationExists(_) => "error.migration_target_exists",
+        MigrationError::SourceLoaded(_) => MIGRATION_SOURCE_LOADED_ERROR,
+        _ => "error.migration_validation",
+    }
+}
+
+fn migration_phase_key(phase: MigrationPhase) -> &'static str {
+    match phase {
+        MigrationPhase::Enumerating => "migration.phase.enumerating",
+        MigrationPhase::Copying => "migration.phase.copying",
+        MigrationPhase::Verifying => "migration.phase.verifying",
+        MigrationPhase::Finalizing => "migration.phase.finalizing",
+        MigrationPhase::RollingBack => "migration.phase.rolling_back",
+    }
+}
+
+fn apply_migration_progress(ui: &MainWindow, progress: &MigrationProgress) {
+    let phase = t(migration_phase_key(progress.phase));
+    let path = progress
+        .relative_path
+        .clone()
+        .unwrap_or_else(|| t("migration.progress.no_file"));
+    let files = progress.completed_files.to_string();
+    let bytes = progress.copied_bytes.to_string();
+    ui.set_migration_phase(phase.as_str().into());
+    ui.set_migration_relative_path(path.as_str().into());
+    ui.set_migration_completed_files(i32::try_from(progress.completed_files).unwrap_or(i32::MAX));
+    ui.set_migration_copied_bytes(bytes.clone().into());
+    ui.set_migration_status(
+        t_args(
+            "migration.progress.detail",
+            &[
+                ("phase", phase.as_str()),
+                ("path", path.as_str()),
+                ("files", files.as_str()),
+                ("bytes", bytes.as_str()),
+            ],
+        )
+        .into(),
+    );
+}
+
+fn queue_migration_progress(
+    weak: Weak<MainWindow>,
+    queue: Arc<Mutex<MigrationProgressQueue>>,
+    progress: MigrationProgress,
+) {
+    let should_schedule = match queue.lock() {
+        Ok(mut state) => {
+            state.pending = Some(progress);
+            if state.scheduled {
+                false
+            } else {
+                state.scheduled = true;
+                true
+            }
+        }
+        Err(_) => {
+            tracing::error!("Migration progress queue is unavailable");
+            false
+        }
+    };
+    if !should_schedule {
+        return;
+    }
+    let update_queue = Arc::clone(&queue);
+    if let Err(error) = weak.upgrade_in_event_loop(move |ui| {
+        let pending = match update_queue.lock() {
+            Ok(mut state) => {
+                state.scheduled = false;
+                state.pending.take()
+            }
+            Err(_) => None,
+        };
+        if let Some(progress) = pending {
+            apply_migration_progress(&ui, &progress);
+        }
+    }) {
+        if let Ok(mut state) = queue.lock() {
+            state.scheduled = false;
+            state.pending = None;
+        }
+        tracing::error!(%error, "Failed to queue migration progress");
+    }
+}
+
 pub struct AppController {
     snapshot_engine: Arc<SnapshotEngine>,
     audit_logger: Arc<AuditLogger>,
     operation_state: OperationState,
     migration_cancellation: Mutex<Option<Arc<AtomicBool>>>,
+    migration_preflight: Mutex<Option<MigrationPreflightToken>>,
+    migration_preflight_presentation: Mutex<MigrationPreflightPresentation>,
     last_report: Mutex<Option<DiagnosticReport>>,
     last_audit_entries: Mutex<Option<Vec<AuditEntry>>>,
     last_migration_terminal: Mutex<Option<MigrationTerminalPresentation>>,
@@ -564,6 +785,8 @@ pub struct AppController {
     scanner_calls: AtomicUsize,
     #[cfg(test)]
     journal_read_calls: AtomicUsize,
+    #[cfg(test)]
+    migration_prevalidation_calls: AtomicUsize,
 }
 
 impl AppController {
@@ -573,6 +796,8 @@ impl AppController {
             audit_logger,
             operation_state: OperationState::new(),
             migration_cancellation: Mutex::new(None),
+            migration_preflight: Mutex::new(None),
+            migration_preflight_presentation: Mutex::new(MigrationPreflightPresentation::None),
             last_report: Mutex::new(None),
             last_audit_entries: Mutex::new(None),
             last_migration_terminal: Mutex::new(None),
@@ -587,6 +812,8 @@ impl AppController {
             scanner_calls: AtomicUsize::new(0),
             #[cfg(test)]
             journal_read_calls: AtomicUsize::new(0),
+            #[cfg(test)]
+            migration_prevalidation_calls: AtomicUsize::new(0),
         }
     }
 
@@ -613,6 +840,7 @@ impl AppController {
             .lock()
             .map_err(|_| "migration status cache is unavailable".to_string())?
             .clone();
+        let migration_preflight = self.migration_preflight_presentation()?;
         let operator_status = self
             .last_operator_status
             .lock()
@@ -626,7 +854,9 @@ impl AppController {
         if let Some(entries) = audit_entries.as_ref() {
             render_audit_entries(ui, entries);
         }
-        if let Some(presentation) = migration_terminal.as_ref() {
+        if let Some(message) = migration_preflight.render() {
+            ui.set_migration_status(message.into());
+        } else if let Some(presentation) = migration_terminal.as_ref() {
             ui.set_migration_status(presentation.render().into());
         }
         apply_operator_status(ui, &operator_status);
@@ -695,11 +925,189 @@ impl AppController {
     /// Loads the selected row into repair and migration state.
     pub fn select_profile(&self, ui: &MainWindow, index: usize) {
         if let Some(profile) = ui.get_profiles().row_data(index) {
+            let profile_changed = ui.get_selected_sid().as_str() != profile.sid.as_str()
+                || ui.get_selected_path().as_str() != profile.profile_path.as_str();
+            if profile_changed {
+                self.reset_migration_draft(ui);
+            }
             ui.set_selected_idx(index as i32);
             apply_selected_profile(ui, &profile);
             ui.set_repair_fix_bak(profile.suggest_fix_bak);
             ui.set_repair_reset_state(profile.suggest_reset_state);
         }
+    }
+
+    /// Applies a parent chosen by the native picker and derives an absent final target leaf.
+    pub fn apply_migration_parent(&self, ui: &MainWindow, parent: &Path) {
+        if self.operation_state.active_operation() != OperationKind::Idle
+            || ui.get_operation_busy()
+            || !ui.get_language_switch_enabled()
+        {
+            return;
+        }
+        let current = PathBuf::from(ui.get_migration_target_path().as_str());
+        let leaf = current
+            .file_name()
+            .filter(|candidate| valid_target_leaf(candidate))
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| default_target_leaf(ui.get_selected_username().as_str()));
+        ui.set_migration_target_path(parent.join(leaf).to_string_lossy().into_owned().into());
+        self.invalidate_migration_preflight(ui);
+    }
+
+    /// Invalidates the authorization token after any user edit of the plan.
+    pub fn invalidate_migration_preflight(&self, ui: &MainWindow) {
+        self.clear_migration_preflight(ui, true);
+    }
+
+    /// Performs the complete read-only core validation before elevation or mutation.
+    pub fn prevalidate_migration(&self, ui: &MainWindow) {
+        if self.operation_state.active_operation() != OperationKind::Idle
+            || ui.get_operation_busy()
+            || !ui.get_language_switch_enabled()
+        {
+            return;
+        }
+        #[cfg(test)]
+        self.migration_prevalidation_calls
+            .fetch_add(1, Ordering::SeqCst);
+        let plan = migration_plan_from_ui(ui);
+        if let Err(message_key) = validate_migration_source(ui.get_selected_loaded()) {
+            self.clear_migration_preflight(ui, false);
+            self.cache_and_apply_migration_preflight_presentation(
+                ui,
+                MigrationPreflightPresentation::ValidationError {
+                    summary_key: message_key,
+                },
+            );
+            self.publish_localized_status(
+                ui,
+                OperatorStatusOperation::Migration,
+                OperatorStatusOutcome::Warning,
+                plan.source_path,
+                message_key,
+            );
+            return;
+        }
+        match prevalidate_migration_plan(&plan) {
+            Ok(validated) => {
+                let target = validated.target_path.display().to_string();
+                match self.migration_preflight.lock() {
+                    Ok(mut token) => {
+                        *token = Some(MigrationPreflightToken::new(&plan, validated));
+                        ui.set_migration_preflight_valid(true);
+                        self.cache_and_apply_migration_preflight_presentation(
+                            ui,
+                            MigrationPreflightPresentation::Ready {
+                                target: target.clone(),
+                            },
+                        );
+                    }
+                    Err(_) => self.publish_failure(
+                        ui,
+                        OperatorStatusOperation::Migration,
+                        target,
+                        "migration preflight token state is unavailable",
+                        Some("status.recovery.retry"),
+                    ),
+                }
+            }
+            Err(error) => {
+                self.clear_migration_preflight(ui, false);
+                let details = error.to_string();
+                self.cache_and_apply_migration_preflight_presentation(
+                    ui,
+                    MigrationPreflightPresentation::ValidationError {
+                        summary_key: migration_validation_summary_key(&error),
+                    },
+                );
+                self.publish_failure(
+                    ui,
+                    OperatorStatusOperation::Migration,
+                    plan.target_path,
+                    details,
+                    Some("status.recovery.retry"),
+                );
+            }
+        }
+    }
+
+    /// Surfaces a native picker failure without changing the current target or token.
+    pub fn report_migration_picker_failure(&self, ui: &MainWindow, details: String) {
+        self.cache_and_apply_migration_preflight_presentation(
+            ui,
+            MigrationPreflightPresentation::RawFailure {
+                details: details.clone(),
+            },
+        );
+        self.publish_failure(
+            ui,
+            OperatorStatusOperation::Migration,
+            ui.get_migration_target_path().to_string(),
+            details,
+            Some("status.recovery.retry"),
+        );
+    }
+
+    fn clear_migration_preflight(&self, ui: &MainWindow, announce_edit: bool) {
+        match self.migration_preflight.lock() {
+            Ok(mut token) => *token = None,
+            Err(_) => tracing::error!("Migration preflight token state is unavailable"),
+        }
+        ui.set_migration_preflight_valid(false);
+        if announce_edit {
+            self.cache_and_apply_migration_preflight_presentation(
+                ui,
+                MigrationPreflightPresentation::Changed,
+            );
+        } else {
+            self.cache_and_apply_migration_preflight_presentation(
+                ui,
+                MigrationPreflightPresentation::None,
+            );
+        }
+    }
+
+    fn migration_preflight_presentation(&self) -> Result<MigrationPreflightPresentation, String> {
+        self.migration_preflight_presentation
+            .lock()
+            .map_err(|_| "migration preflight presentation is unavailable".to_string())
+            .map(|presentation| presentation.clone())
+    }
+
+    fn cache_and_apply_migration_preflight_presentation(
+        &self,
+        ui: &MainWindow,
+        presentation: MigrationPreflightPresentation,
+    ) {
+        let rendered = presentation.render();
+        match self.migration_preflight_presentation.lock() {
+            Ok(mut cache) => *cache = presentation,
+            Err(_) => {
+                tracing::error!("Migration preflight presentation is unavailable");
+                return;
+            }
+        }
+        if let Some(message) = rendered {
+            ui.set_migration_status(message.into());
+        }
+    }
+
+    fn reset_migration_draft(&self, ui: &MainWindow) {
+        self.clear_migration_preflight(ui, false);
+        match self.last_migration_terminal.lock() {
+            Ok(mut terminal) => *terminal = None,
+            Err(_) => tracing::error!("Migration status cache is unavailable"),
+        }
+        ui.set_migration_target_path("".into());
+        ui.set_migration_include_roaming(false);
+        ui.set_migration_include_docs(false);
+        ui.set_migration_progress(0.0);
+        ui.set_migration_phase("".into());
+        ui.set_migration_relative_path("".into());
+        ui.set_migration_completed_files(0);
+        ui.set_migration_copied_bytes("0".into());
+        ui.set_migration_status("".into());
     }
 
     /// Builds a localized, explicit confirmation for the selected repair actions.
@@ -890,18 +1298,7 @@ impl AppController {
             );
             return;
         }
-        if !self.require_elevation(ui, OperatorStatusOperation::Migration)
-            || !self.begin_operation(ui, OperationKind::Migration)
-        {
-            return;
-        }
-        let plan = MigrationPlan {
-            source_sid: ui.get_selected_sid().to_string(),
-            source_path: ui.get_selected_path().to_string(),
-            target_path: ui.get_migration_target_path().to_string(),
-            include_roaming_appdata: ui.get_migration_include_roaming(),
-            include_personal_folders: ui.get_migration_include_docs(),
-        };
+        let plan = migration_plan_from_ui(ui);
         if plan.source_path.is_empty()
             || plan.target_path.is_empty()
             || (!plan.include_roaming_appdata && !plan.include_personal_folders)
@@ -915,6 +1312,45 @@ impl AppController {
                 plan.source_path,
                 "error.migration_scope",
             );
+            return;
+        }
+
+        let preflight = match self.migration_preflight.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => {
+                self.publish_failure(
+                    ui,
+                    OperatorStatusOperation::Migration,
+                    plan.target_path,
+                    "migration preflight token state is unavailable",
+                    Some("status.recovery.retry"),
+                );
+                return;
+            }
+        };
+        if !preflight.as_ref().is_some_and(|token| token.matches(&plan)) {
+            self.cache_and_apply_migration_preflight_presentation(
+                ui,
+                MigrationPreflightPresentation::Changed,
+            );
+            ui.set_migration_preflight_valid(false);
+            self.publish_localized_status(
+                ui,
+                OperatorStatusOperation::Migration,
+                OperatorStatusOutcome::Warning,
+                plan.target_path,
+                "error.migration_prevalidation_required",
+            );
+            return;
+        }
+        self.cache_and_apply_migration_preflight_presentation(
+            ui,
+            MigrationPreflightPresentation::None,
+        );
+        ui.set_migration_preflight_valid(false);
+        if !self.require_elevation(ui, OperatorStatusOperation::Migration)
+            || !self.begin_operation(ui, OperationKind::Migration)
+        {
             return;
         }
 
@@ -958,15 +1394,13 @@ impl AppController {
         std::thread::spawn(move || {
             let engine = ProfileMigrationEngine::new(controller.audit_logger.as_ref());
             let progress_weak = weak.clone();
-            let progress = move |item: &str, value: f32| {
-                let message = t_args("migration.progress.copying", &[("file", item)]);
-                let update_weak = progress_weak.clone();
-                if let Err(error) = update_weak.upgrade_in_event_loop(move |ui| {
-                    ui.set_migration_status(message.into());
-                    ui.set_migration_progress(value);
-                }) {
-                    eprintln!("failed to queue migration progress: {error}");
-                }
+            let progress_queue = Arc::new(Mutex::new(MigrationProgressQueue::default()));
+            let progress = move |progress: MigrationProgress| {
+                queue_migration_progress(
+                    progress_weak.clone(),
+                    Arc::clone(&progress_queue),
+                    progress,
+                );
             };
             let mut result = engine.execute_migration_with_cancel(&plan, progress, || {
                 cancellation.load(Ordering::Acquire)
@@ -1391,10 +1825,29 @@ impl AppController {
         } else {
             None
         };
+        let mut migration_preflight = if reset_selection {
+            Some(
+                self.migration_preflight
+                    .lock()
+                    .map_err(|_| "migration preflight token state is unavailable".to_string())?,
+            )
+        } else {
+            None
+        };
         *report_cache = Some(report);
         if let Some(cache) = migration_terminal_cache.as_mut() {
             **cache = None;
         }
+        if let Some(token) = migration_preflight.as_mut() {
+            **token = None;
+        }
+        if reset_selection {
+            match self.migration_preflight_presentation.lock() {
+                Ok(mut presentation) => *presentation = MigrationPreflightPresentation::None,
+                Err(_) => return Err("migration preflight presentation is unavailable".to_string()),
+            }
+        }
+        drop(migration_preflight);
         drop(migration_terminal_cache);
         drop(report_cache);
         render_report(ui, &rendered_report, reset_selection);
@@ -1425,6 +1878,12 @@ impl AppController {
             .last_migration_terminal
             .lock()
             .map_err(|_| "migration status cache is unavailable".to_string())? = Some(presentation);
+        match self.migration_preflight_presentation.lock() {
+            Ok(mut migration_preflight) => {
+                *migration_preflight = MigrationPreflightPresentation::None;
+            }
+            Err(_) => return Err("migration preflight presentation is unavailable".to_string()),
+        }
         ui.set_migration_status(message.clone().into());
         Ok(message)
     }
@@ -1609,7 +2068,12 @@ fn render_report(ui: &MainWindow, report: &DiagnosticReport, reset_selection: bo
         ui.set_migration_target_path("".into());
         ui.set_migration_include_roaming(false);
         ui.set_migration_include_docs(false);
+        ui.set_migration_preflight_valid(false);
         ui.set_migration_progress(0.0);
+        ui.set_migration_phase("".into());
+        ui.set_migration_relative_path("".into());
+        ui.set_migration_completed_files(0);
+        ui.set_migration_copied_bytes("0".into());
         ui.set_migration_status("".into());
     } else if let Some(profile) = selected_profile.as_ref() {
         apply_selected_profile(ui, profile);
@@ -2190,6 +2654,285 @@ mod tests {
     }
 
     #[test]
+    fn migration_preflight_token_is_invalidated_before_operation_or_audit() {
+        crate::locale::with_test_window(|ui| {
+            let directory = LocaleTestDirectory::new();
+            let source = directory.0.join("source");
+            std::fs::create_dir(&source).expect("source profile");
+            let target = directory.0.join("AbsentTarget");
+            let controller = Arc::new(locale_test_controller(&directory));
+            ui.set_startup_visible(false);
+            crate::locale::set_locale_and_app_strings(ui, "en").expect("English locale");
+            ui.set_selected_sid("S-1-5-21-987654".into());
+            ui.set_selected_path(source.to_string_lossy().into_owned().into());
+            ui.set_selected_username("TokenUser".into());
+            ui.set_selected_loaded(false);
+            ui.set_migration_target_path(target.to_string_lossy().into_owned().into());
+            ui.set_migration_include_docs(true);
+
+            controller.prevalidate_migration(ui);
+            assert!(ui.get_migration_preflight_valid());
+            let token_before_locale = controller
+                .migration_preflight
+                .lock()
+                .expect("preflight token")
+                .clone()
+                .expect("validated token");
+            assert!(!target.exists(), "preflight must not create the target");
+            let ready_english = ui.get_migration_status().to_string();
+            let target_before_locale = ui.get_migration_target_path().to_string();
+            let roaming_before_locale = ui.get_migration_include_roaming();
+            let personal_before_locale = ui.get_migration_include_docs();
+            controller.scanner_calls.store(0, Ordering::SeqCst);
+            controller.journal_read_calls.store(0, Ordering::SeqCst);
+            controller
+                .migration_prevalidation_calls
+                .store(0, Ordering::SeqCst);
+
+            assert!(controller.change_locale(ui, "fr").expect("French locale"));
+            assert_ne!(ui.get_migration_status().as_str(), ready_english);
+            assert_eq!(
+                ui.get_migration_status().as_str(),
+                t_args(
+                    "migration.validation.ready",
+                    &[("target", target.to_string_lossy().as_ref())]
+                )
+            );
+            assert_eq!(
+                ui.get_migration_target_path().as_str(),
+                target_before_locale
+            );
+            assert_eq!(ui.get_migration_include_roaming(), roaming_before_locale);
+            assert_eq!(ui.get_migration_include_docs(), personal_before_locale);
+            assert_eq!(
+                controller
+                    .migration_preflight
+                    .lock()
+                    .expect("preflight token after locale")
+                    .as_ref(),
+                Some(&token_before_locale)
+            );
+            assert_eq!(controller.scanner_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controller.journal_read_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                controller
+                    .migration_prevalidation_calls
+                    .load(Ordering::SeqCst),
+                0
+            );
+
+            let raw_picker_error = "RAW-PICKER-HRESULT-0x80004005";
+            controller.report_migration_picker_failure(ui, raw_picker_error.to_string());
+            assert_eq!(ui.get_migration_status().as_str(), raw_picker_error);
+            assert!(controller.change_locale(ui, "en").expect("English locale"));
+            assert_eq!(ui.get_migration_status().as_str(), raw_picker_error);
+            assert_eq!(
+                controller
+                    .migration_preflight
+                    .lock()
+                    .expect("preflight token after picker failure")
+                    .as_ref(),
+                Some(&token_before_locale)
+            );
+
+            controller.invalidate_migration_preflight(ui);
+            let changed_english = ui.get_migration_status().to_string();
+            assert!(!ui.get_migration_preflight_valid());
+            assert!(controller
+                .migration_preflight
+                .lock()
+                .expect("invalidated token")
+                .is_none());
+            assert!(controller.change_locale(ui, "fr").expect("French locale"));
+            assert_ne!(ui.get_migration_status().as_str(), changed_english);
+            assert_eq!(
+                ui.get_migration_status().as_str(),
+                t("migration.validation.changed")
+            );
+            assert_eq!(controller.scanner_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controller.journal_read_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                controller
+                    .migration_prevalidation_calls
+                    .load(Ordering::SeqCst),
+                0
+            );
+
+            controller
+                .cache_and_apply_migration_terminal(
+                    ui,
+                    MigrationTerminalPresentation::Success {
+                        files: 1,
+                        bytes: 13,
+                        manifest_hash: "deadbeef".to_string(),
+                    },
+                )
+                .expect("old terminal presentation");
+            std::fs::create_dir(&target).expect("target created before validation");
+            controller.prevalidate_migration(ui);
+            let validation_error_french = ui.get_migration_status().to_string();
+            assert_eq!(validation_error_french, t("error.migration_target_exists"));
+            controller
+                .migration_prevalidation_calls
+                .store(0, Ordering::SeqCst);
+            assert!(controller.change_locale(ui, "en").expect("English locale"));
+            assert_ne!(ui.get_migration_status().as_str(), validation_error_french);
+            assert_eq!(
+                ui.get_migration_status().as_str(),
+                t("error.migration_target_exists")
+            );
+            assert_eq!(controller.scanner_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controller.journal_read_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                controller
+                    .migration_prevalidation_calls
+                    .load(Ordering::SeqCst),
+                0
+            );
+            controller.start_migration(ui);
+            assert_eq!(
+                controller.operation_state.active_operation(),
+                OperationKind::Idle,
+                "missing token must be rejected before operation acquisition"
+            );
+            assert!(!controller
+                .audit_logger
+                .get_entries()
+                .expect("audit entries")
+                .iter()
+                .any(|entry| entry.operation == "MigrationStarted"));
+            assert!(
+                target.exists(),
+                "validation must preserve the colliding target"
+            );
+        });
+    }
+
+    #[test]
+    fn picker_parent_derives_or_preserves_a_valid_final_leaf() {
+        crate::locale::with_test_window(|ui| {
+            let directory = LocaleTestDirectory::new();
+            let controller = locale_test_controller(&directory);
+            ui.set_startup_visible(false);
+            ui.set_selected_username("Alice/Operations".into());
+            controller.apply_migration_parent(ui, &directory.0);
+            assert_eq!(
+                PathBuf::from(ui.get_migration_target_path().as_str()),
+                directory.0.join("Alice-Operations-migrated")
+            );
+            assert!(!ui.get_migration_preflight_valid());
+
+            ui.set_migration_target_path(r"D:\Previous\OperatorChosenLeaf".into());
+            let alternate_parent = directory.0.join("parent");
+            std::fs::create_dir(&alternate_parent).expect("alternate parent");
+            controller.apply_migration_parent(ui, &alternate_parent);
+            assert_eq!(
+                PathBuf::from(ui.get_migration_target_path().as_str()),
+                alternate_parent.join("OperatorChosenLeaf")
+            );
+        });
+    }
+
+    #[test]
+    fn selecting_a_different_profile_resets_the_entire_migration_draft() {
+        crate::locale::with_test_window(|ui| {
+            let directory = LocaleTestDirectory::new();
+            let controller = locale_test_controller(&directory);
+            ui.set_startup_visible(false);
+            controller
+                .cache_and_apply_report(ui, operator_flow_report(), true)
+                .expect("profile inventory");
+            controller.select_profile(ui, 0);
+
+            let plan = MigrationPlan {
+                source_sid: ui.get_selected_sid().to_string(),
+                source_path: ui.get_selected_path().to_string(),
+                target_path: r"D:\Migrated\OldProfile".to_string(),
+                include_roaming_appdata: true,
+                include_personal_folders: true,
+            };
+            *controller
+                .migration_preflight
+                .lock()
+                .expect("preflight token") = Some(MigrationPreflightToken::new(
+                &plan,
+                MigrationPreflight {
+                    source_path: PathBuf::from(&plan.source_path),
+                    target_path: PathBuf::from(&plan.target_path),
+                },
+            ));
+            ui.set_migration_preflight_valid(true);
+            ui.set_migration_target_path(plan.target_path.clone().into());
+            ui.set_migration_include_roaming(true);
+            ui.set_migration_include_docs(true);
+            ui.set_migration_progress(0.71);
+            ui.set_migration_phase("Copying".into());
+            ui.set_migration_relative_path("Documents/old.bin".into());
+            ui.set_migration_completed_files(4);
+            ui.set_migration_copied_bytes("8192".into());
+            controller
+                .cache_and_apply_migration_terminal(ui, MigrationTerminalPresentation::Cancelled)
+                .expect("old terminal status");
+
+            controller.select_profile(ui, 1);
+            assert!(ui.get_migration_target_path().is_empty());
+            assert!(!ui.get_migration_include_roaming());
+            assert!(!ui.get_migration_include_docs());
+            assert!(!ui.get_migration_preflight_valid());
+            assert_eq!(ui.get_migration_progress(), 0.0);
+            assert!(ui.get_migration_phase().is_empty());
+            assert!(ui.get_migration_relative_path().is_empty());
+            assert_eq!(ui.get_migration_completed_files(), 0);
+            assert_eq!(ui.get_migration_copied_bytes().as_str(), "0");
+            assert!(ui.get_migration_status().is_empty());
+            assert!(controller
+                .migration_preflight
+                .lock()
+                .expect("reset token")
+                .is_none());
+            assert!(controller
+                .last_migration_terminal
+                .lock()
+                .expect("reset terminal")
+                .is_none());
+
+            ui.set_migration_target_path(r"D:\Migrated\PreservedOnSameProfile".into());
+            controller.select_profile(ui, 1);
+            assert_eq!(
+                ui.get_migration_target_path().as_str(),
+                r"D:\Migrated\PreservedOnSameProfile"
+            );
+        });
+    }
+
+    #[test]
+    fn typed_migration_progress_is_indeterminate_and_preserves_exact_counters() {
+        crate::locale::with_test_window(|ui| {
+            crate::locale::set_locale_and_app_strings(ui, "en").expect("English locale");
+            ui.set_migration_progress(0.0);
+            ui.set_migration_running(true);
+            apply_migration_progress(
+                ui,
+                &MigrationProgress {
+                    phase: MigrationPhase::Copying,
+                    relative_path: Some("Documents/RAW-file.bin".to_string()),
+                    completed_files: 17,
+                    copied_bytes: 9_007_199_254_740_991,
+                },
+            );
+            assert_eq!(ui.get_migration_phase().as_str(), "Copying");
+            assert_eq!(
+                ui.get_migration_relative_path().as_str(),
+                "Documents/RAW-file.bin"
+            );
+            assert_eq!(ui.get_migration_completed_files(), 17);
+            assert_eq!(ui.get_migration_copied_bytes().as_str(), "9007199254740991");
+            assert_eq!(ui.get_migration_progress(), 0.0);
+            assert!(!ui.get_migration_status().as_str().contains('%'));
+        });
+    }
+
+    #[test]
     fn operator_inventory_partitions_health_and_preserves_selected_raw_issue_across_locale() {
         crate::locale::with_test_window(|ui| {
             let directory = LocaleTestDirectory::new();
@@ -2350,6 +3093,7 @@ mod tests {
             controller
                 .cache_and_apply_audit_entries(ui, locale_audit_entries())
                 .expect("cache audit entries");
+            controller.select_profile(ui, 0);
             controller
                 .cache_and_apply_migration_terminal(
                     ui,
@@ -2360,7 +3104,6 @@ mod tests {
                     },
                 )
                 .expect("cache migration success");
-            controller.select_profile(ui, 0);
             ui.set_repair_reset_state(true);
             ui.set_migration_include_roaming(true);
             ui.set_migration_progress(0.42);

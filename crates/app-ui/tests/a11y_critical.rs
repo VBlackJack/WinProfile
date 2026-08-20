@@ -123,6 +123,7 @@ fn verify_static_and_runtime_contract(ui: &MainWindow) {
     assert!(ui_source.contains("height: 390px;"));
     assert!(ui_source.contains("startup-quit-focus-pending"));
     assert!(ui_source.contains("interval: 0ms;"));
+    assert!(ui_source.contains("indeterminate: root.migration-running;"));
     assert!(!ui_source.contains("accessible-live:"));
 
     let repair_source = include_str!("../../core-profiles/src/repair.rs");
@@ -322,6 +323,27 @@ fn critical_accessibility_contract_is_present_in_the_runtime_tree() {
     assert_eq!(progress.accessible_value().as_deref(), Some("0.42"));
     assert_eq!(progress.accessible_value_minimum(), Some(0.0));
     assert_eq!(progress.accessible_value_maximum(), Some(1.0));
+    assert!(ElementHandle::find_by_accessible_label(
+        &ui,
+        strings.get_migration_browse_parent().as_str()
+    )
+    .any(|element| element.accessible_role() == Some(AccessibleRole::Button)));
+    assert!(ElementHandle::find_by_accessible_label(
+        &ui,
+        strings.get_migration_validate().as_str()
+    )
+    .any(|element| element.accessible_role() == Some(AccessibleRole::Button)));
+    ui.set_migration_running(true);
+    let indeterminate_progress = labeled_element(
+        &ui,
+        AccessibleRole::ProgressIndicator,
+        strings.get_migration_progress_label().as_str(),
+    );
+    assert_eq!(
+        indeterminate_progress.accessible_value().as_deref(),
+        Some("")
+    );
+    ui.set_migration_running(false);
 
     let raw_audit_details = "RAW-AUDIT-DETAILS-0xC0000022-UNABRIDGED";
     ui.set_audit_entries(ModelRc::from(Rc::new(VecModel::from(vec![

@@ -159,6 +159,9 @@ pub fn apply_app_strings(ui: &MainWindow) {
     strings.set_migration_source(t("migration.source").into());
     strings.set_migration_target(t("migration.target").into());
     strings.set_migration_placeholder(t("migration.target_placeholder").into());
+    strings.set_migration_parent_help(t("migration.parent_help").into());
+    strings.set_migration_browse_parent(t("migration.btn.browse_parent").into());
+    strings.set_migration_validate(t("migration.btn.validate").into());
     strings.set_include_roaming(t("migration.include_roaming").into());
     strings.set_include_docs(t("migration.include_docs").into());
     strings.set_start_migration(t("migration.btn.start").into());

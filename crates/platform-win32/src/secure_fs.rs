@@ -58,6 +58,7 @@ use crate::OwnedHandle;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const DIRECTORY_BUFFER_BYTES: usize = 64 * 1024;
 const ALL_FILE_SHARES: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+const PINNED_DIRECTORY_SHARES: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
 const DIRECTORY_READ_ACCESS: u32 =
     FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const DIRECTORY_WRITE_ACCESS: u32 = DIRECTORY_READ_ACCESS
@@ -187,6 +188,7 @@ impl SecureCreatedEntry {
 #[derive(Debug)]
 pub struct SecureDirectory {
     handle: OwnedHandle,
+    namespace_guards: Vec<OwnedHandle>,
     display_path: PathBuf,
     ancestry: Vec<FileIdentity>,
 }
@@ -259,47 +261,91 @@ impl SecureDirectory {
             name,
             &path,
             DIRECTORY_READ_ACCESS,
-            ALL_FILE_SHARES,
+            PINNED_DIRECTORY_SHARES,
             FILE_OPEN,
             FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         )?;
         reject_reparse_handle(&handle, &path)?;
         let mut ancestry = self.ancestry.clone();
         ancestry.push(file_identity(&handle, &path)?);
+        let namespace_guards = self.clone_namespace_guards(&path)?;
         Ok(Self {
             handle,
+            namespace_guards,
             display_path: path,
             ancestry,
         })
+    }
+
+    /// Inspects one immediate child without following a reparse point.
+    pub fn child_kind(&self, name: &OsStr) -> SecureFsResult<Option<SecureEntryKind>> {
+        let path = child_display_path(&self.display_path, name)?;
+        let (handle, _) = match nt_open_relative(
+            self.handle.as_raw(),
+            name,
+            &path,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            ALL_FILE_SHARES,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+        ) {
+            Ok(opened) => opened,
+            Err(SecureFsError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        reject_reparse_handle(&handle, &path)?;
+        let mut information: FILE_ATTRIBUTE_TAG_INFO = unsafe { zeroed() };
+        let success = unsafe {
+            GetFileInformationByHandleEx(
+                handle.as_raw(),
+                FileAttributeTagInfo,
+                (&mut information as *mut FILE_ATTRIBUTE_TAG_INFO).cast::<c_void>(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            )
+        };
+        if success == 0 {
+            return Err(win32_error("inspect child attributes", &path));
+        }
+        Ok(Some(
+            if information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                SecureEntryKind::Directory
+            } else {
+                SecureEntryKind::File
+            },
+        ))
     }
 
     pub fn open_or_create_directory(
         &self,
         name: &OsStr,
     ) -> SecureFsResult<(Self, Option<SecureCreatedEntry>)> {
-        let path = child_display_path(&self.display_path, name)?;
         match self.open_directory(name) {
             Ok(directory) => return Ok((directory, None)),
             Err(SecureFsError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
 
+        self.create_directory(name)
+            .map(|(directory, created)| (directory, Some(created)))
+    }
+
+    /// Creates one exact child directory with `FILE_CREATE`; an object of any
+    /// kind that wins the name race is returned as `AlreadyExists` and is never opened.
+    pub fn create_directory(&self, name: &OsStr) -> SecureFsResult<(Self, SecureCreatedEntry)> {
+        let path = child_display_path(&self.display_path, name)?;
         let create_result = nt_open_relative(
             self.handle.as_raw(),
             name,
             &path,
             DIRECTORY_WRITE_ACCESS | DELETE,
-            ALL_FILE_SHARES,
+            PINNED_DIRECTORY_SHARES,
             FILE_CREATE,
             FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         );
         let (handle, _) = match create_result {
             Ok(result) => result,
             Err(SecureFsError::AlreadyExists(_)) => {
-                return match self.open_directory(name) {
-                    Ok(_) => Err(SecureFsError::AlreadyExists(path.display().to_string())),
-                    Err(error) => Err(error),
-                };
+                return Err(SecureFsError::AlreadyExists(path.display().to_string()));
             }
             Err(error) => return Err(error),
         };
@@ -308,6 +354,10 @@ impl SecureDirectory {
             .and_then(|()| file_identity(pending.handle(), &path))
         {
             Ok(identity) => identity,
+            Err(error) => return pending.fail(error),
+        };
+        let namespace_guards = match self.clone_namespace_guards(&path) {
+            Ok(namespace_guards) => namespace_guards,
             Err(error) => return pending.fail(error),
         };
         let rollback_handle = match pending.handle().try_clone() {
@@ -331,10 +381,11 @@ impl SecureDirectory {
         Ok((
             Self {
                 handle,
+                namespace_guards,
                 display_path: path,
                 ancestry,
             },
-            Some(created),
+            created,
         ))
     }
 
@@ -463,6 +514,38 @@ impl SecureDirectory {
         self_identity.is_some_and(|identity| other.ancestry.contains(identity))
             || other_identity.is_some_and(|identity| self.ancestry.contains(identity))
     }
+
+    /// Returns whether this directory is the same as, or is below, `ancestor`.
+    ///
+    /// The comparison uses identities captured from opened handles, so DOS aliases
+    /// and SUBST paths cannot change the result.
+    pub fn is_within(&self, ancestor: &Self) -> bool {
+        ancestor
+            .ancestry
+            .last()
+            .is_some_and(|identity| self.ancestry.contains(identity))
+    }
+
+    fn clone_namespace_guards(&self, path: &Path) -> SecureFsResult<Vec<OwnedHandle>> {
+        let mut guards = Vec::with_capacity(self.namespace_guards.len() + 1);
+        for guard in &self.namespace_guards {
+            guards.push(guard.try_clone().map_err(|source| SecureFsError::Io {
+                operation: "duplicate namespace guard",
+                path: path.display().to_string(),
+                source,
+            })?);
+        }
+        guards.push(
+            self.handle
+                .try_clone()
+                .map_err(|source| SecureFsError::Io {
+                    operation: "duplicate parent namespace guard",
+                    path: path.display().to_string(),
+                    source,
+                })?,
+        );
+        Ok(guards)
+    }
 }
 
 fn split_absolute(path: &Path) -> SecureFsResult<(PathBuf, Vec<OsString>)> {
@@ -493,7 +576,7 @@ fn open_volume_or_share_root(path: &Path) -> SecureFsResult<SecureDirectory> {
         CreateFileW(
             wide.as_ptr(),
             DIRECTORY_READ_ACCESS,
-            ALL_FILE_SHARES,
+            PINNED_DIRECTORY_SHARES,
             null(),
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -506,6 +589,7 @@ fn open_volume_or_share_root(path: &Path) -> SecureFsResult<SecureDirectory> {
     let identity = file_identity(&handle, path)?;
     Ok(SecureDirectory {
         handle,
+        namespace_guards: Vec::new(),
         display_path: path.to_path_buf(),
         ancestry: vec![identity],
     })

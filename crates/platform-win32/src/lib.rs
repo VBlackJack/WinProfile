@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+pub mod folder_dialog;
 pub mod handles;
 pub mod locale;
 pub mod registry;
@@ -22,6 +23,10 @@ pub mod secure_fs;
 pub mod security;
 pub mod tokens;
 
+pub use folder_dialog::{
+    folder_dialog_owner, pick_existing_folder, FolderDialogError, FolderDialogOwner,
+    FolderDialogResult,
+};
 pub use handles::{OwnedEnvironmentBlock, OwnedHandle, OwnedScHandle};
 pub use locale::{user_preferred_ui_languages, LocaleError, LocaleResult};
 pub use registry::{

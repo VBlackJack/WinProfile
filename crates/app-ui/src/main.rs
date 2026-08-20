@@ -25,7 +25,7 @@ use app_ui::startup::{self, StartupDecision};
 use app_ui::{AppController, MainWindow};
 use audit_journal::LegacyStorageRecovery;
 use core_profiles::{t, I18nManager};
-use platform_win32::is_process_elevated;
+use platform_win32::{folder_dialog_owner, is_process_elevated, pick_existing_folder};
 use slint::{CloseRequestResponse, ComponentHandle};
 
 fn main() -> anyhow::Result<()> {
@@ -303,6 +303,49 @@ fn bind_controller(main_window: &MainWindow, controller: Arc<AppController>) {
         main_window.on_request_repair(move || {
             if let Some(ui) = weak.upgrade() {
                 controller.request_repair_confirmation(&ui);
+            }
+        });
+    }
+    {
+        let controller = Arc::clone(&controller);
+        let weak = main_window.as_weak();
+        main_window.on_pick_migration_parent(move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let owner = match folder_dialog_owner(&ui.window().window_handle()) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    controller.report_migration_picker_failure(&ui, error.to_string());
+                    return;
+                }
+            };
+            let title = t("migration.picker.title");
+            let accept = t("migration.picker.accept");
+            match pick_existing_folder(owner, title.as_str(), accept.as_str()) {
+                Ok(Some(parent)) => controller.apply_migration_parent(&ui, &parent),
+                Ok(None) => {}
+                Err(error) => {
+                    controller.report_migration_picker_failure(&ui, error.to_string());
+                }
+            }
+        });
+    }
+    {
+        let controller = Arc::clone(&controller);
+        let weak = main_window.as_weak();
+        main_window.on_validate_migration(move || {
+            if let Some(ui) = weak.upgrade() {
+                controller.prevalidate_migration(&ui);
+            }
+        });
+    }
+    {
+        let controller = Arc::clone(&controller);
+        let weak = main_window.as_weak();
+        main_window.on_invalidate_migration_preflight(move || {
+            if let Some(ui) = weak.upgrade() {
+                controller.invalidate_migration_preflight(&ui);
             }
         });
     }

@@ -22,11 +22,11 @@ mod tests {
     use core_profiles::i18n::{t, t_args, I18nManager};
     use core_profiles::models::{ProfileAnomaly, ProfileHealth, UserProfile};
     use core_profiles::{
-        MigrationError, MigrationPlan, ProfileMigrationEngine, ProfileRepairEngine, RepairError,
-        RepairPlan,
+        prevalidate_migration_plan, MigrationError, MigrationPhase, MigrationPlan,
+        MigrationProgress, ProfileMigrationEngine, ProfileRepairEngine, RepairError, RepairPlan,
     };
     use platform_win32::SecureDirectory;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::ffi::OsStr;
     use std::fs::OpenOptions;
     use std::path::{Path, PathBuf};
@@ -318,7 +318,7 @@ mod tests {
             include_personal_folders: true,
         };
         assert!(matches!(
-            migration.execute_migration(&migration_plan, |_, _| {}),
+            migration.execute_migration(&migration_plan, |_| {}),
             Err(MigrationError::Audit(_))
         ));
         assert!(
@@ -373,8 +373,9 @@ mod tests {
             include_personal_folders: true,
         };
 
+        let progress = RefCell::new(Vec::<MigrationProgress>::new());
         let receipt = engine
-            .execute_migration(&plan, |_, _| {})
+            .execute_migration(&plan, |snapshot| progress.borrow_mut().push(snapshot))
             .expect("verified migration");
         assert_eq!(receipt.copied_files, 1);
         assert_eq!(receipt.copied_bytes, 13);
@@ -383,6 +384,180 @@ mod tests {
             std::fs::read(target.join("Documents").join("report.txt")).expect("copied file"),
             b"verified data"
         );
+        let progress = progress.into_inner();
+        assert_eq!(
+            progress.first().map(|snapshot| snapshot.phase),
+            Some(MigrationPhase::Enumerating)
+        );
+        assert!(progress
+            .iter()
+            .any(|snapshot| snapshot.phase == MigrationPhase::Copying));
+        assert_eq!(
+            progress[progress.len() - 2].phase,
+            MigrationPhase::Verifying
+        );
+        assert_eq!(
+            progress.last().map(|snapshot| snapshot.phase),
+            Some(MigrationPhase::Finalizing)
+        );
+        assert!(progress
+            .windows(2)
+            .all(|pair| pair[0].copied_bytes <= pair[1].copied_bytes));
+        assert!(progress.iter().all(|snapshot| {
+            snapshot.completed_files == 0
+                || matches!(
+                    snapshot.phase,
+                    MigrationPhase::Copying
+                        | MigrationPhase::Verifying
+                        | MigrationPhase::Finalizing
+                )
+        }));
+    }
+
+    #[test]
+    fn prevalidated_target_replaced_by_file_is_refused_and_preserved() {
+        let temp = TestDirectory::new();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(source.join("Documents")).expect("source directory");
+        let logger =
+            AuditLogger::new(Some(temp.path().join("audit.jsonl")), 20).expect("audit logger");
+        let engine = ProfileMigrationEngine::new(&logger);
+        let plan = MigrationPlan {
+            source_sid: "S-1-5-21-1001".to_string(),
+            source_path: source.display().to_string(),
+            target_path: target.display().to_string(),
+            include_roaming_appdata: false,
+            include_personal_folders: true,
+        };
+        prevalidate_migration_plan(&plan).expect("target initially absent");
+        std::fs::write(&target, b"race-file-sentinel").expect("race file");
+
+        assert!(matches!(
+            engine.execute_migration(&plan, |_| {}),
+            Err(MigrationError::DestinationExists(_))
+        ));
+        assert_eq!(
+            std::fs::read(&target).expect("preserved race file"),
+            b"race-file-sentinel"
+        );
+    }
+
+    #[test]
+    fn prevalidated_target_replaced_by_directory_is_refused_and_preserved() {
+        let temp = TestDirectory::new();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(source.join("Documents")).expect("source directory");
+        let logger =
+            AuditLogger::new(Some(temp.path().join("audit.jsonl")), 20).expect("audit logger");
+        let engine = ProfileMigrationEngine::new(&logger);
+        let plan = MigrationPlan {
+            source_sid: "S-1-5-21-1001".to_string(),
+            source_path: source.display().to_string(),
+            target_path: target.display().to_string(),
+            include_roaming_appdata: false,
+            include_personal_folders: true,
+        };
+        prevalidate_migration_plan(&plan).expect("target initially absent");
+        std::fs::create_dir(&target).expect("race directory");
+        std::fs::write(target.join("sentinel.txt"), b"keep").expect("race sentinel");
+
+        assert!(matches!(
+            engine.execute_migration(&plan, |_| {}),
+            Err(MigrationError::DestinationExists(_))
+        ));
+        assert_eq!(
+            std::fs::read(target.join("sentinel.txt")).expect("preserved race directory"),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn migration_rejects_invalid_or_reserved_final_windows_names() {
+        let temp = TestDirectory::new();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("Documents")).expect("source directory");
+        for leaf in [
+            "CON",
+            "con.txt",
+            "CONIN$",
+            "conout$.txt",
+            "PRN",
+            "AUX",
+            "NUL",
+            "COM1",
+            "LPT9",
+            "COM¹",
+            "LPT².txt",
+            "COM³",
+            "bad.",
+            "bad ",
+            "bad*name",
+        ] {
+            let plan = MigrationPlan {
+                source_sid: "S-1-5-21-1001".to_string(),
+                source_path: source.display().to_string(),
+                target_path: temp.path().join(leaf).display().to_string(),
+                include_roaming_appdata: false,
+                include_personal_folders: true,
+            };
+            assert!(
+                matches!(
+                    prevalidate_migration_plan(&plan),
+                    Err(MigrationError::InvalidPlan(_))
+                ),
+                "leaf must be refused: {leaf}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_prevalidation_rejects_unsupported_paths_scopes_and_parent_state() {
+        let temp = TestDirectory::new();
+        let source = temp.path().join("source");
+        std::fs::create_dir_all(source.join("Documents")).expect("source directory");
+        let valid_target = temp.path().join("AbsentTarget");
+        let base = MigrationPlan {
+            source_sid: "S-1-5-21-1001".to_string(),
+            source_path: source.display().to_string(),
+            target_path: valid_target.display().to_string(),
+            include_roaming_appdata: false,
+            include_personal_folders: true,
+        };
+
+        for target in [
+            r"relative\target".to_string(),
+            r"\\server\share\target".to_string(),
+            r"\\?\C:\target".to_string(),
+            format!(r"{}\.\target", temp.path().display()),
+            format!(r"{}\missing-parent\target", temp.path().display()),
+        ] {
+            let mut plan = base.clone();
+            plan.target_path = target;
+            assert!(matches!(
+                prevalidate_migration_plan(&plan),
+                Err(MigrationError::InvalidPlan(_))
+            ));
+        }
+
+        let mut empty_scope = base.clone();
+        empty_scope.include_personal_folders = false;
+        assert!(matches!(
+            prevalidate_migration_plan(&empty_scope),
+            Err(MigrationError::InvalidPlan(_))
+        ));
+
+        let parent_file = temp.path().join("parent-file");
+        std::fs::write(&parent_file, b"sentinel").expect("parent file");
+        let mut file_parent = base;
+        file_parent.target_path = parent_file.join("target").display().to_string();
+        assert!(prevalidate_migration_plan(&file_parent).is_err());
+        assert_eq!(
+            std::fs::read(parent_file).expect("preserved parent file"),
+            b"sentinel"
+        );
+        assert!(!valid_target.exists());
     }
 
     #[test]
@@ -406,7 +581,7 @@ mod tests {
         };
 
         assert!(matches!(
-            engine.execute_migration(&plan, |_, _| {}),
+            engine.execute_migration(&plan, |_| {}),
             Err(MigrationError::DestinationExists(_))
         ));
         assert_eq!(
@@ -434,7 +609,7 @@ mod tests {
         };
 
         assert!(matches!(
-            engine.execute_migration_with_cancel(&plan, |_, _| {}, || true),
+            engine.execute_migration_with_cancel(&plan, |_| {}, || true),
             Err(MigrationError::Cancelled)
         ));
         assert!(!target.exists());
@@ -470,7 +645,7 @@ mod tests {
             include_personal_folders: true,
         };
 
-        let result = engine.execute_migration(&plan, |_, _| {});
+        let result = engine.execute_migration(&plan, |_| {});
         std::fs::remove_dir(&junction).expect("remove junction fixture");
         assert!(matches!(result, Err(MigrationError::ReparsePoint(_))));
         assert!(!target.exists());
@@ -499,7 +674,7 @@ mod tests {
             include_personal_folders: true,
         };
 
-        let result = engine.execute_migration(&plan, |_, _| {});
+        let result = engine.execute_migration(&plan, |_| {});
         std::fs::remove_dir(&junction).expect("remove junction fixture");
         assert!(matches!(result, Err(MigrationError::ReparsePoint(_))));
         assert!(
@@ -528,7 +703,7 @@ mod tests {
         };
 
         assert!(matches!(
-            engine.execute_migration(&plan, |_, _| {}),
+            engine.execute_migration(&plan, |_| {}),
             Err(MigrationError::InvalidPlan(_))
         ));
         assert!(
@@ -577,6 +752,26 @@ mod tests {
     }
 
     #[test]
+    fn secure_directory_pins_every_opened_namespace_ancestor_against_rename() {
+        let temp = TestDirectory::new();
+        let ancestor = temp.path().join("namespace-ancestor");
+        let parent = ancestor.join("migration-parent");
+        std::fs::create_dir_all(&parent).expect("nested migration parent");
+        let pinned = SecureDirectory::open_absolute_existing(&parent).expect("pinned parent");
+        let renamed = temp.path().join("renamed-ancestor");
+
+        let rename_error = std::fs::rename(&ancestor, &renamed)
+            .expect_err("a retained ancestor handle must deny concurrent rename");
+        assert_eq!(rename_error.raw_os_error(), Some(32));
+        assert!(ancestor.exists());
+        assert!(!renamed.exists());
+
+        drop(pinned);
+        std::fs::rename(&ancestor, &renamed).expect("rename after namespace guard release");
+        assert!(renamed.join("migration-parent").is_dir());
+    }
+
+    #[test]
     fn test_cancellation_during_large_file_rolls_back_exact_created_handles() {
         let temp = TestDirectory::new();
         let source = temp.path().join("source");
@@ -599,9 +794,10 @@ mod tests {
         };
         let checks = Cell::new(0usize);
 
+        let progress = RefCell::new(Vec::<MigrationProgress>::new());
         let result = engine.execute_migration_with_cancel(
             &plan,
-            |_, _| {},
+            |snapshot| progress.borrow_mut().push(snapshot),
             || {
                 let next = checks.get() + 1;
                 checks.set(next);
@@ -612,6 +808,75 @@ mod tests {
         assert!(matches!(result, Err(MigrationError::Cancelled)));
         assert!(checks.get() >= 5, "cancellation was not polled per chunk");
         assert!(!target.exists(), "cancelled target must be rolled back");
+        let progress = progress.into_inner();
+        let rollback = progress.last().expect("rollback progress");
+        assert_eq!(rollback.phase, MigrationPhase::RollingBack);
+        assert_eq!(rollback.completed_files, 0);
+        assert!(rollback.copied_bytes > 0);
+        assert_eq!(
+            rollback.relative_path.as_deref(),
+            Some("Documents/large.bin")
+        );
+    }
+
+    #[test]
+    fn test_cancellation_during_verification_reports_the_true_phase_before_rollback() {
+        let temp = TestDirectory::new();
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        std::fs::create_dir_all(source.join("Documents")).expect("source directory");
+        std::fs::write(
+            source.join("Documents").join("large.bin"),
+            vec![0x5a; 8 * 1024 * 1024],
+        )
+        .expect("large source file");
+        let logger =
+            AuditLogger::new(Some(temp.path().join("audit.jsonl")), 20).expect("audit logger");
+        let engine = ProfileMigrationEngine::new(&logger);
+        let plan = MigrationPlan {
+            source_sid: "S-1-5-21-1001".to_string(),
+            source_path: source.display().to_string(),
+            target_path: target.display().to_string(),
+            include_roaming_appdata: false,
+            include_personal_folders: true,
+        };
+        let verification_started = Cell::new(false);
+        let progress = RefCell::new(Vec::<MigrationProgress>::new());
+
+        let result = engine.execute_migration_with_cancel(
+            &plan,
+            |snapshot| {
+                if snapshot.phase == MigrationPhase::Verifying {
+                    verification_started.set(true);
+                }
+                progress.borrow_mut().push(snapshot);
+            },
+            || verification_started.get(),
+        );
+
+        assert!(matches!(result, Err(MigrationError::Cancelled)));
+        assert!(!target.exists(), "cancelled target must be rolled back");
+        let progress = progress.into_inner();
+        assert!(progress.windows(2).any(|pair| {
+            pair[0].phase == MigrationPhase::Copying && pair[1].phase == MigrationPhase::Verifying
+        }));
+        let verifying = progress
+            .iter()
+            .find(|snapshot| snapshot.phase == MigrationPhase::Verifying)
+            .expect("verification phase before digest");
+        assert_eq!(verifying.completed_files, 0);
+        assert_eq!(
+            verifying.relative_path.as_deref(),
+            Some("Documents/large.bin")
+        );
+        assert!(verifying.copied_bytes >= 8 * 1024 * 1024);
+        assert_eq!(
+            progress.last().map(|snapshot| snapshot.phase),
+            Some(MigrationPhase::RollingBack)
+        );
+        assert!(!progress
+            .iter()
+            .any(|snapshot| snapshot.phase == MigrationPhase::Finalizing));
     }
 
     #[test]
@@ -631,7 +896,7 @@ mod tests {
         };
 
         assert!(matches!(
-            engine.execute_migration(&plan, |_, _| {}),
+            engine.execute_migration(&plan, |_| {}),
             Err(MigrationError::InvalidPlan(_))
         ));
     }

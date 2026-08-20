@@ -14,17 +14,22 @@
  * limitations under the License.
  */
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf, Prefix};
 
 use audit_journal::{AuditError, AuditLogger, AuditStatus};
 use platform_win32::{
-    SecureCreatedEntry, SecureDirectory, SecureEntryKind, SecureFsError, SecureFsResult,
+    open_key, RegistryError, RegistryRoot, SecureCreatedEntry, SecureDirectory, SecureEntryKind,
+    SecureFsError, SecureFsResult,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows_sys::Win32::System::Registry::KEY_READ;
 
 use crate::constants::*;
 use crate::models::MigrationPlan;
@@ -44,6 +49,8 @@ pub enum MigrationError {
     DestinationExists(String),
     #[error("Migration was cancelled")]
     Cancelled,
+    #[error("Source profile is currently loaded: {0}")]
+    SourceLoaded(String),
     #[error("Migration internal state failure: {0}")]
     InternalState(String),
     #[error("Copied file verification failed: {0}")]
@@ -63,6 +70,33 @@ pub enum MigrationError {
 
 pub type MigrationResult<T> = Result<T, MigrationError>;
 
+/// Migration phases that can be measured without inventing a total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MigrationPhase {
+    Enumerating,
+    Copying,
+    Verifying,
+    Finalizing,
+    RollingBack,
+}
+
+/// Honest progress snapshot. No percentage is exposed because the total work
+/// is unknown until traversal has completed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationProgress {
+    pub phase: MigrationPhase,
+    pub relative_path: Option<String>,
+    pub completed_files: usize,
+    pub copied_bytes: u64,
+}
+
+/// Result of a read-only validation performed before an operation is started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationPreflight {
+    pub source_path: PathBuf,
+    pub target_path: PathBuf,
+}
+
 /// Durable summary of a verified migration operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationReceipt {
@@ -75,6 +109,8 @@ pub struct MigrationReceipt {
 struct CopyTransaction {
     created_entries: Vec<SecureCreatedEntry>,
     manifest: Vec<(String, u64, String)>,
+    observed_copied_bytes: u64,
+    last_relative_path: Option<String>,
 }
 
 impl CopyTransaction {
@@ -110,6 +146,41 @@ impl CopyTransaction {
             manifest_sha256: format!("{:x}", manifest_hasher.finalize()),
         }
     }
+
+    fn completed_files(&self) -> usize {
+        self.manifest.len()
+    }
+
+    fn copied_bytes(&self) -> u64 {
+        self.observed_copied_bytes.max(
+            self.manifest
+                .iter()
+                .fold(0u64, |total, (_, size, _)| total.saturating_add(*size)),
+        )
+    }
+
+    fn observe_copy(&mut self, relative_path: &Path, copied_bytes: u64) {
+        self.observed_copied_bytes = copied_bytes;
+        self.last_relative_path = Some(display_relative_path(relative_path));
+    }
+}
+
+struct ValidatedMigration {
+    source_path: PathBuf,
+    target_path: PathBuf,
+    source_directory: SecureDirectory,
+    target_parent: SecureDirectory,
+    target_leaf: OsString,
+}
+
+/// Performs the complete read-only validation used by the UI before it enables
+/// a privileged migration.
+pub fn prevalidate_migration_plan(plan: &MigrationPlan) -> MigrationResult<MigrationPreflight> {
+    let validated = validate_for_execution(plan)?;
+    Ok(MigrationPreflight {
+        source_path: validated.source_path,
+        target_path: validated.target_path,
+    })
 }
 
 /// Engine responsible for selective, verified profile data migration.
@@ -129,7 +200,7 @@ impl<'a> ProfileMigrationEngine<'a> {
         on_progress: F,
     ) -> MigrationResult<MigrationReceipt>
     where
-        F: FnMut(&str, f32),
+        F: FnMut(MigrationProgress),
     {
         self.execute_migration_with_cancel(plan, on_progress, || false)
     }
@@ -142,11 +213,11 @@ impl<'a> ProfileMigrationEngine<'a> {
         mut is_cancelled: C,
     ) -> MigrationResult<MigrationReceipt>
     where
-        F: FnMut(&str, f32),
+        F: FnMut(MigrationProgress),
         C: FnMut() -> bool,
     {
         let _operation_guard = self.audit_logger.acquire_operation_guard()?;
-        let (source_root, target_root) = validate_plan(plan)?;
+        let validated = validate_for_execution(plan)?;
         self.audit_logger.log(
             "MigrationStarted",
             "WinProfile-Admin",
@@ -154,22 +225,22 @@ impl<'a> ProfileMigrationEngine<'a> {
             AuditStatus::Warning,
             format!(
                 "Verified-copy migration started: {} -> {}",
-                source_root.display(),
-                target_root.display()
+                validated.source_path.display(),
+                validated.target_path.display()
             ),
         )?;
 
         let mut transaction = CopyTransaction::default();
         let operation = (|| {
-            let source_directory = SecureDirectory::open_absolute_existing(&source_root)
-                .map_err(|error| map_source_root_error(error, &source_root))?;
-            let (target_directory, created_target_entries) =
-                SecureDirectory::open_or_create_absolute(&target_root).map_err(map_secure_error)?;
-            transaction.created_entries.extend(created_target_entries);
-            validate_opened_roots(&source_directory, &target_directory)?;
+            let (target_directory, created_target) = validated
+                .target_parent
+                .create_directory(&validated.target_leaf)
+                .map_err(map_secure_error)?;
+            transaction.created_entries.push(created_target);
+            validate_opened_roots(&validated.source_directory, &target_directory)?;
 
             if secure_directory_exists(
-                &source_directory,
+                &validated.source_directory,
                 Path::new(APPDATA_ROAMING_REL_PATH)
                     .join("Microsoft")
                     .join("Protect")
@@ -197,13 +268,18 @@ impl<'a> ProfileMigrationEngine<'a> {
                 ));
             }
 
-            let total_roots = roots.len() as f32;
-            for (index, relative_root) in roots.iter().enumerate() {
+            on_progress(MigrationProgress {
+                phase: MigrationPhase::Enumerating,
+                relative_path: None,
+                completed_files: 0,
+                copied_bytes: 0,
+            });
+            for relative_root in roots {
                 if is_cancelled() {
                     return Err(MigrationError::Cancelled);
                 }
                 let Some(source) = open_relative_directory_if_present(
-                    &source_directory,
+                    &validated.source_directory,
                     Path::new(relative_root),
                 )?
                 else {
@@ -214,12 +290,12 @@ impl<'a> ProfileMigrationEngine<'a> {
                     Path::new(relative_root),
                     &mut transaction,
                 )?;
-                on_progress(relative_root, 0.1 + (index as f32 / total_roots) * 0.8);
                 copy_tree_verified(
                     &source,
                     &destination,
                     Path::new(relative_root),
                     &mut transaction,
+                    &mut on_progress,
                     &mut is_cancelled,
                 )?;
             }
@@ -228,7 +304,15 @@ impl<'a> ProfileMigrationEngine<'a> {
                 return Err(MigrationError::Cancelled);
             }
             let receipt = transaction.receipt();
-            on_progress("complete", 1.0);
+            if is_cancelled() {
+                return Err(MigrationError::Cancelled);
+            }
+            on_progress(MigrationProgress {
+                phase: MigrationPhase::Finalizing,
+                relative_path: None,
+                completed_files: receipt.copied_files,
+                copied_bytes: receipt.copied_bytes,
+            });
             if is_cancelled() {
                 return Err(MigrationError::Cancelled);
             }
@@ -248,6 +332,12 @@ impl<'a> ProfileMigrationEngine<'a> {
         match operation {
             Ok(receipt) => Ok(receipt),
             Err(error) => {
+                on_progress(MigrationProgress {
+                    phase: MigrationPhase::RollingBack,
+                    relative_path: transaction.last_relative_path.clone(),
+                    completed_files: transaction.completed_files(),
+                    copied_bytes: transaction.copied_bytes(),
+                });
                 if let Err(rollback_error) = transaction.rollback() {
                     let mut result = MigrationError::RollbackFailed {
                         operation_error: error.to_string(),
@@ -282,58 +372,229 @@ impl<'a> ProfileMigrationEngine<'a> {
     }
 }
 
-fn validate_plan(plan: &MigrationPlan) -> MigrationResult<(PathBuf, PathBuf)> {
+fn validate_for_execution(plan: &MigrationPlan) -> MigrationResult<ValidatedMigration> {
     if plan.source_sid.trim().is_empty() {
         return Err(MigrationError::InvalidPlan(
             "source SID is empty".to_string(),
         ));
     }
-    let source = Path::new(&plan.source_path);
-    if !source.is_dir() {
-        return Err(MigrationError::SourceNotFound(plan.source_path.clone()));
+    if !plan.include_roaming_appdata && !plan.include_personal_folders {
+        return Err(MigrationError::InvalidPlan(
+            "at least one migration scope must be selected".to_string(),
+        ));
     }
-    let source = absolute_normalized(source)?;
-    let target = absolute_normalized(Path::new(&plan.target_path))?;
+    let source = release_absolute_path(Path::new(&plan.source_path), "source")?;
+    let target = release_absolute_path(Path::new(&plan.target_path), "destination")?;
     if paths_overlap(&source, &target) {
         return Err(MigrationError::InvalidPlan(
             "source and destination directories must not overlap".to_string(),
         ));
     }
-    if target.exists() && !target.is_dir() {
+    ensure_source_offline(&plan.source_sid)?;
+
+    let source_directory = SecureDirectory::open_absolute_existing(&source)
+        .map_err(|error| map_source_root_error(error, &source))?;
+    let target_parent_path = target.parent().ok_or_else(|| {
+        MigrationError::InvalidPlan("destination must have an existing parent".to_string())
+    })?;
+    let target_leaf = target
+        .file_name()
+        .ok_or_else(|| {
+            MigrationError::InvalidPlan("destination must include a final folder name".to_string())
+        })?
+        .to_os_string();
+    validate_windows_component(&target_leaf, "destination folder name")?;
+    let target_parent = SecureDirectory::open_absolute_existing(target_parent_path).map_err(
+        |error| match error {
+            SecureFsError::NotFound(_) => MigrationError::InvalidPlan(format!(
+                "destination parent does not exist: {}",
+                target_parent_path.display()
+            )),
+            other => map_secure_error(other),
+        },
+    )?;
+    if target_parent.is_within(&source_directory) {
         return Err(MigrationError::InvalidPlan(
-            "destination exists but is not a directory".to_string(),
+            "destination parent is inside the source directory".to_string(),
         ));
     }
-    Ok((source, target))
+    match target_parent
+        .child_kind(&target_leaf)
+        .map_err(map_secure_error)?
+    {
+        None => {}
+        Some(_) => {
+            return Err(MigrationError::DestinationExists(
+                target.display().to_string(),
+            ));
+        }
+    }
+
+    Ok(ValidatedMigration {
+        source_path: source,
+        target_path: target,
+        source_directory,
+        target_parent,
+        target_leaf,
+    })
 }
 
-fn absolute_normalized(path: &Path) -> std::io::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
+fn release_absolute_path(path: &Path, label: &str) -> MigrationResult<PathBuf> {
+    if path.as_os_str().is_empty() {
+        return Err(MigrationError::InvalidPlan(format!(
+            "{label} path is empty"
+        )));
+    }
+    validate_raw_release_path(path, label)?;
+    let mut components = path.components();
+    let prefix = match components.next() {
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_)) => prefix,
+        Some(Component::Prefix(_)) => {
+            return Err(MigrationError::InvalidPlan(format!(
+                "{label} path uses an unsupported UNC, device, or verbatim prefix"
+            )));
         }
+        _ => {
+            return Err(MigrationError::InvalidPlan(format!(
+                "{label} path must be an absolute drive path"
+            )));
+        }
+    };
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(MigrationError::InvalidPlan(format!(
+            "{label} path must be rooted"
+        )));
+    }
+    let mut normalized = PathBuf::new();
+    normalized.push(prefix.as_os_str());
+    normalized.push(Path::new(r"\"));
+    for component in components {
+        match component {
+            Component::Normal(name) => {
+                validate_windows_component(name, label)?;
+                normalized.push(name);
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(MigrationError::InvalidPlan(format!(
+                    "{label} path must not contain '.' or '..'"
+                )));
+            }
+            _ => {
+                return Err(MigrationError::InvalidPlan(format!(
+                    "{label} path is not normalized"
+                )));
+            }
+        }
+    }
+    if path != normalized {
+        return Err(MigrationError::InvalidPlan(format!(
+            "{label} path is not normalized"
+        )));
     }
     Ok(normalized)
 }
 
-fn copy_tree_verified<C>(
+fn validate_raw_release_path(path: &Path, label: &str) -> MigrationResult<()> {
+    const BACKSLASH: u16 = b'\\' as u16;
+    const FORWARD_SLASH: u16 = b'/' as u16;
+    const COLON: u16 = b':' as u16;
+    const DOT: u16 = b'.' as u16;
+
+    let encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let drive_is_ascii_letter = encoded
+        .first()
+        .is_some_and(|unit| (*unit as u8).is_ascii_alphabetic() && *unit <= u8::MAX as u16);
+    if encoded.len() < 3
+        || !drive_is_ascii_letter
+        || encoded[1] != COLON
+        || encoded[2] != BACKSLASH
+        || encoded.contains(&FORWARD_SLASH)
+    {
+        return Err(MigrationError::InvalidPlan(format!(
+            "{label} path must be a normalized absolute drive path"
+        )));
+    }
+
+    let remainder = &encoded[3..];
+    if remainder.is_empty() {
+        return Ok(());
+    }
+    for component in remainder.split(|unit| *unit == BACKSLASH) {
+        if component.is_empty() || component == [DOT] || component == [DOT, DOT] {
+            return Err(MigrationError::InvalidPlan(format!(
+                "{label} path must not contain empty, '.' or '..' components"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_windows_component(component: &std::ffi::OsStr, label: &str) -> MigrationResult<()> {
+    let value = component.to_string_lossy();
+    if value.is_empty()
+        || value.ends_with(['.', ' '])
+        || value
+            .chars()
+            .any(|character| character <= '\u{1f}' || r#"<>:"/\|?*"#.contains(character))
+    {
+        return Err(MigrationError::InvalidPlan(format!(
+            "{label} contains an invalid Windows path component: {value}"
+        )));
+    }
+
+    let stem = value.split('.').next().unwrap_or_default();
+    let upper = stem.to_ascii_uppercase();
+    let reserved = matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || upper.strip_prefix("COM").is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    }) || upper.strip_prefix("LPT").is_some_and(|suffix| {
+        matches!(
+            suffix,
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        )
+    });
+    if reserved {
+        return Err(MigrationError::InvalidPlan(format!(
+            "{label} contains a reserved Windows device name: {value}"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_source_offline(source_sid: &str) -> MigrationResult<()> {
+    let canonical_sid = source_sid
+        .strip_suffix(BAK_EXTENSION)
+        .unwrap_or(source_sid)
+        .trim();
+    if canonical_sid.is_empty() || canonical_sid.contains('\\') || canonical_sid.contains('/') {
+        return Err(MigrationError::InvalidPlan(
+            "source SID is invalid".to_string(),
+        ));
+    }
+    match open_key(RegistryRoot::Users, canonical_sid, KEY_READ) {
+        Ok(_) => Err(MigrationError::SourceLoaded(canonical_sid.to_string())),
+        Err(RegistryError::Win32Error(ERROR_FILE_NOT_FOUND)) => Ok(()),
+        Err(error) => Err(MigrationError::Security(format!(
+            "failed to verify whether source profile is loaded: {error}"
+        ))),
+    }
+}
+
+fn copy_tree_verified<F, C>(
     source: &SecureDirectory,
     destination: &SecureDirectory,
     relative_directory: &Path,
     transaction: &mut CopyTransaction,
+    on_progress: &mut F,
     is_cancelled: &mut C,
 ) -> MigrationResult<()>
 where
+    F: FnMut(MigrationProgress),
     C: FnMut() -> bool,
 {
     for entry in source.entries().map_err(map_secure_error)? {
@@ -357,6 +618,7 @@ where
                     &destination_child,
                     &relative_path,
                     transaction,
+                    on_progress,
                     is_cancelled,
                 )?;
             }
@@ -366,6 +628,7 @@ where
                 &entry.name,
                 &relative_path,
                 transaction,
+                on_progress,
                 is_cancelled,
             )?,
         }
@@ -373,15 +636,17 @@ where
     Ok(())
 }
 
-fn copy_file_verified<C>(
+fn copy_file_verified<F, C>(
     source_directory: &SecureDirectory,
     destination_directory: &SecureDirectory,
     name: &std::ffi::OsStr,
     relative_path: &Path,
     transaction: &mut CopyTransaction,
+    on_progress: &mut F,
     is_cancelled: &mut C,
 ) -> MigrationResult<()>
 where
+    F: FnMut(MigrationProgress),
     C: FnMut() -> bool,
 {
     let mut input = source_directory.open_file(name).map_err(map_secure_error)?;
@@ -393,6 +658,7 @@ where
     let mut source_hasher = Sha256::new();
     let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
     let mut copied_bytes = 0u64;
+    let completed_bytes = transaction.copied_bytes();
     loop {
         if is_cancelled() {
             return Err(MigrationError::Cancelled);
@@ -404,6 +670,14 @@ where
         output.write_all(&buffer[..count])?;
         source_hasher.update(&buffer[..count]);
         copied_bytes = copied_bytes.saturating_add(count as u64);
+        let observed_bytes = completed_bytes.saturating_add(copied_bytes);
+        transaction.observe_copy(relative_path, observed_bytes);
+        on_progress(MigrationProgress {
+            phase: MigrationPhase::Copying,
+            relative_path: Some(display_relative_path(relative_path)),
+            completed_files: transaction.completed_files(),
+            copied_bytes: observed_bytes,
+        });
     }
     if is_cancelled() {
         return Err(MigrationError::Cancelled);
@@ -413,6 +687,12 @@ where
 
     let source_sha = format!("{:x}", source_hasher.finalize());
     output.seek(SeekFrom::Start(0))?;
+    on_progress(MigrationProgress {
+        phase: MigrationPhase::Verifying,
+        relative_path: Some(display_relative_path(relative_path)),
+        completed_files: transaction.completed_files(),
+        copied_bytes: transaction.copied_bytes(),
+    });
     let destination_sha = sha256_file(&mut output, is_cancelled)?;
     if source_sha != destination_sha || copied_bytes != output.metadata()?.len() {
         return Err(MigrationError::VerificationFailed(
@@ -424,6 +704,10 @@ where
         .manifest
         .push((relative, copied_bytes, source_sha));
     Ok(())
+}
+
+fn display_relative_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn sha256_file<C>(file: &mut File, is_cancelled: &mut C) -> MigrationResult<String>

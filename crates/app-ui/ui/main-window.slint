@@ -111,6 +111,9 @@ export global AppStrings {
     in-out property <string> migration-source;
     in-out property <string> migration-target;
     in-out property <string> migration-placeholder;
+    in-out property <string> migration-parent-help;
+    in-out property <string> migration-browse-parent;
+    in-out property <string> migration-validate;
     in-out property <string> include-roaming;
     in-out property <string> include-docs;
     in-out property <string> start-migration;
@@ -229,8 +232,13 @@ export component MainWindow inherits Window {
     in-out property <string> migration-target-path;
     in-out property <bool> migration-include-roaming: false;
     in-out property <bool> migration-include-docs: false;
+    in-out property <bool> migration-preflight-valid: false;
     in-out property <float> migration-progress: 0.0;
     in-out property <string> migration-status;
+    in-out property <string> migration-phase;
+    in-out property <string> migration-relative-path;
+    in-out property <int> migration-completed-files: 0;
+    in-out property <string> migration-copied-bytes: "0";
     in-out property <bool> confirmation-visible: false;
     in-out property <int> confirmation-kind: -1;
     in-out property <string> confirmation-title;
@@ -278,6 +286,9 @@ export component MainWindow inherits Window {
     callback request-repair();
     callback start-migration();
     callback cancel-migration();
+    callback pick-migration-parent();
+    callback validate-migration();
+    callback invalidate-migration-preflight();
     callback request-ti-console();
     callback confirm-action(int);
     callback export-audit-json();
@@ -659,6 +670,7 @@ export component MainWindow inherits Window {
                                 }
                             }
                             Text { text: AppStrings.migration-source + " " + root.selected-path; color: DraculaTheme.foreground; font-weight: 600; }
+                            Text { text: AppStrings.migration-parent-help; color: DraculaTheme.text-secondary; wrap: word-wrap; }
                             HorizontalLayout {
                                 spacing: DraculaTheme.spacing-md;
                                 Text { text: AppStrings.migration-target; color: DraculaTheme.text-secondary; vertical-alignment: center; }
@@ -668,10 +680,16 @@ export component MainWindow inherits Window {
                                     accessible-label: AppStrings.migration-target;
                                     enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible;
                                     horizontal-stretch: 1;
+                                    edited => { root.invalidate-migration-preflight(); }
+                                }
+                                Button {
+                                    text: AppStrings.migration-browse-parent;
+                                    enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible;
+                                    clicked => { root.pick-migration-parent(); }
                                 }
                             }
-                            CheckBox { text: AppStrings.include-roaming; checked <=> root.migration-include-roaming; enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible; }
-                            CheckBox { text: AppStrings.include-docs; checked <=> root.migration-include-docs; enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible; }
+                            CheckBox { text: AppStrings.include-roaming; checked <=> root.migration-include-roaming; enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible; toggled => { root.invalidate-migration-preflight(); } }
+                            CheckBox { text: AppStrings.include-docs; checked <=> root.migration-include-docs; enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible; toggled => { root.invalidate-migration-preflight(); } }
                             Text {
                                 text: root.migration-status;
                                 color: DraculaTheme.text-secondary;
@@ -681,6 +699,7 @@ export component MainWindow inherits Window {
                             }
                             ProgressIndicator {
                                 progress: root.migration-progress;
+                                indeterminate: root.migration-running;
                                 height: 14px;
                                 accessible-label: AppStrings.migration-progress-label;
                                 accessible-value-minimum: 0;
@@ -689,9 +708,14 @@ export component MainWindow inherits Window {
                             HorizontalLayout {
                                 spacing: DraculaTheme.spacing-md;
                                 Button {
+                                    text: AppStrings.migration-validate;
+                                    enabled: !root.operation-busy && !root.modal-visible && root.selected-path != "" && !root.selected-loaded && root.migration-target-path != "" && (root.migration-include-roaming || root.migration-include-docs);
+                                    clicked => { root.validate-migration(); }
+                                }
+                                Button {
                                     text: AppStrings.start-migration;
                                     primary: true;
-                                    enabled: root.is-elevated && !root.operation-busy && !root.modal-visible && root.selected-path != "" && !root.selected-loaded && root.migration-target-path != "" && (root.migration-include-roaming || root.migration-include-docs);
+                                    enabled: root.is-elevated && root.migration-preflight-valid && !root.operation-busy && !root.modal-visible && root.selected-path != "" && !root.selected-loaded && root.migration-target-path != "" && (root.migration-include-roaming || root.migration-include-docs);
                                     clicked => { root.start-migration(); }
                                 }
                                 Button {
