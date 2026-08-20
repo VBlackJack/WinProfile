@@ -28,6 +28,19 @@ The Slint interface exposes honest navigation, main-content, list/list-item, pro
 
 ## Build and test
 
+For the common Windows workflows, the repository root provides double-click entry points:
+
+- `Run.bat` validates the official origin before Git network access, builds the debug application, and requests administrator elevation;
+- `Build.bat` builds the application with the pinned Windows GNU toolchain into this repository's `target` directory;
+- `Test.bat` runs the batch-contract harness, formatting, Clippy, and every workspace test with the critical Slint accessibility metadata enabled;
+- `Release.bat check` performs a fail-closed release preflight, while `Release.bat` creates the version tag only after exact-CI, signing-secret, clean-tree, and private release-VM approval gates pass.
+
+The scripts locate `rustup` without embedding a user-specific path, install the pinned toolchain when it is missing, and ignore an inherited `CARGO_TARGET_DIR`. Every entry point accepts `no-pause`; unknown or contradictory arguments fail before building, updating, tagging, or launching.
+
+`Run.bat` accepts `no-fetch`, `no-pull`, `pull`, and `clean`. Its default mode fetches from the single validated official origin and fails closed if the fetch fails. On a clean, non-divergent `main`, it may fast-forward with an explicit `origin main` pull. `no-pull` may still fetch but never modifies the worktree; `no-fetch` performs no Git network operation and implies no pull. A source archive without `.git` builds without Git network access. Rustup or Cargo may still download a missing toolchain or dependency.
+
+The private release checklist and approval marker remain under the ignored `work-private-docs` directory and are never published. The marker is bound to the exact 40-character `HEAD` SHA and release tag; `Release.bat` requires its exact four-line format, then rechecks it together with the clean worktree, `HEAD`, official origin, and `origin/main` immediately before tagging that captured SHA.
+
 The portable `rust-toolchain.toml` pins Rust 1.97.1. Install the exact Windows GNU toolchain used for local development:
 
 ```powershell

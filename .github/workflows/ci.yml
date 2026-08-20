@@ -37,6 +37,9 @@ jobs:
       - name: Install pinned GNU toolchain
         shell: pwsh
         run: rustup toolchain install $env:RUST_GNU_TOOLCHAIN --profile minimal --component clippy,rustfmt
+      - name: Batch entry-point contracts
+        shell: pwsh
+        run: .\scripts\Test-BatchContracts.ps1
       - name: Formatting
         shell: pwsh
         run: cargo "+$env:RUST_GNU_TOOLCHAIN" fmt --all -- --check
@@ -45,6 +48,8 @@ jobs:
         run: cargo "+$env:RUST_GNU_TOOLCHAIN" clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         shell: pwsh
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
         run: cargo "+$env:RUST_GNU_TOOLCHAIN" test --workspace --all-features --locked
       - name: Dependency audit
         shell: pwsh

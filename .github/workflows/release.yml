@@ -40,6 +40,9 @@ jobs:
           if ($version -ne $manifestVersion) { throw "Tag $version does not match Cargo version $manifestVersion" }
           $notes = "docs\release-v$version.md"
           if (-not (Test-Path -LiteralPath $notes -PathType Leaf)) { throw "Missing release notes: $notes" }
+      - name: Batch entry-point contracts
+        shell: pwsh
+        run: .\scripts\Test-BatchContracts.ps1
       - name: Formatting
         shell: pwsh
         run: cargo "+$env:RUST_MSVC_TOOLCHAIN" fmt --all -- --check
@@ -48,6 +51,8 @@ jobs:
         run: cargo "+$env:RUST_MSVC_TOOLCHAIN" clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Tests
         shell: pwsh
+        env:
+          SLINT_EMIT_DEBUG_INFO: "1"
         run: cargo "+$env:RUST_MSVC_TOOLCHAIN" test --workspace --all-features --locked
       - name: Audit dependencies
         shell: pwsh
