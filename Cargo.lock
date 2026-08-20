@@ -245,6 +245,7 @@ dependencies = [
  "core-profiles",
  "embed-manifest",
  "embed-resource",
+ "i-slint-backend-testing",
  "platform-win32",
  "serde",
  "serde_json",

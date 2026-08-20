@@ -458,15 +458,24 @@ impl AppController {
             ui.set_selected_path(profile.profile_path.clone());
             ui.set_selected_username(profile.username.clone());
             ui.set_selected_anomalies(profile.anomalies.clone());
+            ui.set_selected_locking_processes(profile.locking_processes.clone());
+            ui.set_selected_has_locking_processes(profile.has_locking_processes);
+            ui.set_selected_lock_inspection_failure(profile.lock_inspection_failure.clone());
+            ui.set_selected_repair_blocked_by_lock_inspection(
+                profile.repair_blocked_by_lock_inspection,
+            );
             ui.set_selected_loaded(profile.loaded);
             ui.set_repair_fix_bak(profile.suggest_fix_bak);
             ui.set_repair_reset_state(profile.suggest_reset_state);
-            ui.set_repair_unlock_hive(profile.suggest_unlock_hive);
         }
     }
 
     /// Builds a localized, explicit confirmation for the selected repair actions.
     pub fn request_repair_confirmation(&self, ui: &MainWindow) {
+        if ui.get_selected_repair_blocked_by_lock_inspection() {
+            ui.set_status_message(t("repair.locked.status").into());
+            return;
+        }
         if ui.get_selected_sid().is_empty() {
             ui.set_status_message(t("error.profile_not_selected").into());
             return;
@@ -500,6 +509,10 @@ impl AppController {
 
     /// Executes the selected repair plan on a worker thread.
     pub fn execute_repair(self: &Arc<Self>, ui: &MainWindow, dry_run: bool) {
+        if ui.get_selected_repair_blocked_by_lock_inspection() {
+            ui.set_status_message(t("repair.locked.status").into());
+            return;
+        }
         if !require_elevation(ui) || !self.begin_operation(ui, OperationKind::Repair) {
             return;
         }
@@ -509,7 +522,7 @@ impl AppController {
             profile_path: ui.get_selected_path().to_string(),
             fix_bak: ui.get_repair_fix_bak(),
             reset_state: ui.get_repair_reset_state(),
-            unlock_hive: ui.get_repair_unlock_hive(),
+            unlock_hive: false,
             dry_run,
         };
         let is_loaded = ui.get_selected_loaded();
@@ -927,9 +940,6 @@ fn selected_repair_actions(ui: &MainWindow) -> Vec<String> {
     if ui.get_repair_reset_state() {
         actions.push(t("repair.confirm.reset_state"));
     }
-    if ui.get_repair_unlock_hive() {
-        actions.push(t("repair.confirm.unlock_hive"));
-    }
     actions
 }
 
@@ -960,7 +970,7 @@ fn render_report(ui: &MainWindow, report: &DiagnosticReport, reset_selection: bo
         .iter()
         .map(user_profile_to_slint)
         .collect::<Vec<ProfileEntry>>();
-    let selected_anomalies = if reset_selection {
+    let selected_details = if reset_selection {
         None
     } else {
         usize::try_from(ui.get_selected_idx())
@@ -970,7 +980,15 @@ fn render_report(ui: &MainWindow, report: &DiagnosticReport, reset_selection: bo
                 profile.sid.as_str() == ui.get_selected_sid().as_str()
                     && profile.profile_path.as_str() == ui.get_selected_path().as_str()
             })
-            .map(|profile| profile.anomalies.clone())
+            .map(|profile| {
+                (
+                    profile.anomalies.clone(),
+                    profile.locking_processes.clone(),
+                    profile.has_locking_processes,
+                    profile.lock_inspection_failure.clone(),
+                    profile.repair_blocked_by_lock_inspection,
+                )
+            })
     };
     ui.set_profiles(ModelRc::from(Rc::new(VecModel::from(profiles))));
     ui.set_total_profiles_count(report.total_count as i32);
@@ -983,9 +1001,24 @@ fn render_report(ui: &MainWindow, report: &DiagnosticReport, reset_selection: bo
         ui.set_selected_path("".into());
         ui.set_selected_username("".into());
         ui.set_selected_anomalies("".into());
+        ui.set_selected_locking_processes(ModelRc::default());
+        ui.set_selected_has_locking_processes(false);
+        ui.set_selected_lock_inspection_failure("".into());
+        ui.set_selected_repair_blocked_by_lock_inspection(false);
         ui.set_selected_loaded(false);
-    } else if let Some(anomalies) = selected_anomalies {
+    } else if let Some((
+        anomalies,
+        locking_processes,
+        has_locking_processes,
+        lock_inspection_failure,
+        repair_blocked_by_lock_inspection,
+    )) = selected_details
+    {
         ui.set_selected_anomalies(anomalies);
+        ui.set_selected_locking_processes(locking_processes);
+        ui.set_selected_has_locking_processes(has_locking_processes);
+        ui.set_selected_lock_inspection_failure(lock_inspection_failure);
+        ui.set_selected_repair_blocked_by_lock_inspection(repair_blocked_by_lock_inspection);
     }
 }
 
@@ -998,7 +1031,7 @@ fn render_audit_entries(ui: &MainWindow, entries: &[AuditEntry]) {
 }
 
 fn set_error(ui: &MainWindow, error: &str) {
-    ui.set_status_message(format!("{} {error}", t("common.error_prefix")).into());
+    ui.set_status_message(error.into());
 }
 
 #[cfg(test)]
@@ -1168,6 +1201,33 @@ mod tests {
         }
     }
 
+    fn repair_report(anomalies: Vec<ProfileAnomaly>) -> DiagnosticReport {
+        DiagnosticReport {
+            timestamp: Utc::now(),
+            total_count: 1,
+            healthy_count: 0,
+            corrupted_count: 1,
+            temporary_count: 0,
+            profiles: vec![UserProfile {
+                sid: "S-1-5-21-4242.bak".to_string(),
+                canonical_sid: "S-1-5-21-4242".to_string(),
+                username: "LockedUser".to_string(),
+                domain: "TEST".to_string(),
+                profile_path: "C:\\Users\\LockedUser".to_string(),
+                loaded: false,
+                is_bak: true,
+                state_mask: 0,
+                ref_count: 0,
+                guid: None,
+                ntuser_exists: true,
+                usrclass_exists: true,
+                disk_size_bytes: 0,
+                anomalies,
+                health: ProfileHealth::Corrupted,
+            }],
+        }
+    }
+
     fn locale_audit_entries() -> Vec<AuditEntry> {
         vec![AuditEntry {
             timestamp: Utc::now(),
@@ -1198,7 +1258,7 @@ mod tests {
             profile.is_bak,
             profile.suggest_fix_bak,
             profile.suggest_reset_state,
-            profile.suggest_unlock_hive,
+            profile.repair_blocked_by_lock_inspection,
             profile.state_raw,
             profile.anomalies,
             audit.timestamp,
@@ -1256,6 +1316,92 @@ mod tests {
         ] {
             assert_eq!(operation.close_policy(), ClosePolicy::Block);
         }
+    }
+
+    #[test]
+    fn technical_error_status_is_preserved_byte_for_byte() {
+        crate::locale::with_test_window(|ui| {
+            let raw = "RAW-WIN32-ERROR-0xC0000022: chemin C:\\Users\\Test";
+            set_error(ui, raw);
+            assert_eq!(ui.get_status_message().as_str(), raw);
+        });
+    }
+
+    #[test]
+    fn measured_lockers_and_inspection_failures_block_repair_until_rescan_clears_them() {
+        crate::locale::with_test_window(|ui| {
+            let directory = LocaleTestDirectory::new();
+            let controller = Arc::new(locale_test_controller(&directory));
+            ui.set_startup_visible(false);
+            ui.set_is_elevated(true);
+            crate::locale::set_locale_and_app_strings(ui, "en").expect("English locale");
+
+            controller
+                .cache_and_apply_report(
+                    ui,
+                    repair_report(vec![
+                        ProfileAnomaly::BakSuffix,
+                        ProfileAnomaly::LockedNtUserDat(vec![
+                            "Editor.exe (PID: 4242)".to_string(),
+                            "Sync.exe (PID: 4343)".to_string(),
+                        ]),
+                    ]),
+                    true,
+                )
+                .expect("render locked report");
+            controller.select_profile(ui, 0);
+
+            assert!(ui.get_selected_repair_blocked_by_lock_inspection());
+            assert_eq!(ui.get_selected_locking_processes().row_count(), 2);
+            assert_eq!(
+                ui.get_selected_locking_processes()
+                    .row_data(0)
+                    .expect("first blocker")
+                    .as_str(),
+                "Editor.exe (PID: 4242)"
+            );
+            assert!(!ui.get_repair_execution_enabled());
+            controller.request_repair_confirmation(ui);
+            assert!(!ui.get_confirmation_visible());
+            assert!(ui
+                .get_status_message()
+                .as_str()
+                .contains("close the listed"));
+            controller.execute_repair(ui, false);
+            assert_eq!(
+                controller.operation_state.active_operation(),
+                OperationKind::Idle
+            );
+
+            controller
+                .cache_and_apply_report(ui, repair_report(vec![ProfileAnomaly::BakSuffix]), true)
+                .expect("render rescanned unlocked report");
+            controller.select_profile(ui, 0);
+            assert!(!ui.get_selected_repair_blocked_by_lock_inspection());
+            assert!(ui.get_repair_execution_enabled());
+
+            controller
+                .cache_and_apply_report(
+                    ui,
+                    repair_report(vec![
+                        ProfileAnomaly::BakSuffix,
+                        ProfileAnomaly::LockInspectionFailure(
+                            "RAW-RM-INSPECTION-ERROR-5".to_string(),
+                        ),
+                    ]),
+                    true,
+                )
+                .expect("render failed inspection report");
+            controller.select_profile(ui, 0);
+            assert!(ui.get_selected_repair_blocked_by_lock_inspection());
+            assert_eq!(
+                ui.get_selected_lock_inspection_failure().as_str(),
+                "RAW-RM-INSPECTION-ERROR-5"
+            );
+            assert!(!ui.get_repair_execution_enabled());
+            controller.request_repair_confirmation(ui);
+            assert!(!ui.get_confirmation_visible());
+        });
     }
 
     #[test]
@@ -1400,7 +1546,7 @@ mod tests {
                 english_audit.status_type,
                 ui.get_repair_fix_bak(),
                 ui.get_repair_reset_state(),
-                ui.get_repair_unlock_hive(),
+                ui.get_selected_repair_blocked_by_lock_inspection(),
                 ui.get_migration_include_roaming(),
                 ui.get_migration_progress(),
                 ui.get_startup_consent_granted(),
@@ -1443,7 +1589,7 @@ mod tests {
                     french_audit.status_type,
                     ui.get_repair_fix_bak(),
                     ui.get_repair_reset_state(),
-                    ui.get_repair_unlock_hive(),
+                    ui.get_selected_repair_blocked_by_lock_inspection(),
                     ui.get_migration_include_roaming(),
                     ui.get_migration_progress(),
                     ui.get_startup_consent_granted(),

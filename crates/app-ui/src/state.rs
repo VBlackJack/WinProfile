@@ -16,6 +16,8 @@
 
 use audit_journal::{AuditEntry, AuditStatus};
 use core_profiles::models::{ProfileAnomaly, ProfileHealth, UserProfile};
+use slint::{ModelRc, SharedString, VecModel};
+use std::rc::Rc;
 
 // Slint generated types
 use crate::{AuditLogEntry, ProfileEntry};
@@ -24,7 +26,6 @@ use crate::{AuditLogEntry, ProfileEntry};
 struct RepairSuggestions {
     fix_bak: bool,
     reset_state: bool,
-    unlock_hive: bool,
 }
 
 fn repair_suggestions(profile: &UserProfile) -> RepairSuggestions {
@@ -37,11 +38,27 @@ fn repair_suggestions(profile: &UserProfile) -> RepairSuggestions {
             .anomalies
             .iter()
             .any(|anomaly| matches!(anomaly, ProfileAnomaly::DirtyStateMask(_))),
-        unlock_hive: profile
-            .anomalies
-            .iter()
-            .any(|anomaly| matches!(anomaly, ProfileAnomaly::LockedNtUserDat(_))),
     }
+}
+
+fn locking_processes(profile: &UserProfile) -> Vec<SharedString> {
+    profile
+        .anomalies
+        .iter()
+        .filter_map(|anomaly| match anomaly {
+            ProfileAnomaly::LockedNtUserDat(processes) => Some(processes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(|process| process.as_str().into())
+        .collect()
+}
+
+fn lock_inspection_failure(profile: &UserProfile) -> Option<&str> {
+    profile.anomalies.iter().find_map(|anomaly| match anomaly {
+        ProfileAnomaly::LockInspectionFailure(details) => Some(details.as_str()),
+        _ => None,
+    })
 }
 
 pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
@@ -69,6 +86,9 @@ pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
         .collect::<Vec<_>>()
         .join("; ");
     let suggestions = repair_suggestions(profile);
+    let locking_processes = locking_processes(profile);
+    let has_locking_processes = !locking_processes.is_empty();
+    let lock_inspection_failure = lock_inspection_failure(profile).unwrap_or_default();
 
     ProfileEntry {
         sid: profile.sid.clone().into(),
@@ -82,7 +102,11 @@ pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
         is_bak: profile.is_bak,
         suggest_fix_bak: suggestions.fix_bak,
         suggest_reset_state: suggestions.reset_state,
-        suggest_unlock_hive: suggestions.unlock_hive,
+        locking_processes: ModelRc::from(Rc::new(VecModel::from(locking_processes))),
+        has_locking_processes,
+        lock_inspection_failure: lock_inspection_failure.into(),
+        repair_blocked_by_lock_inspection: has_locking_processes
+            || !lock_inspection_failure.is_empty(),
         state_raw: format!("0x{:04X}", profile.state_mask).into(),
         anomalies: anomalies.into(),
     }
@@ -99,7 +123,7 @@ pub fn audit_entry_to_slint(entry: &AuditEntry) -> AuditLogEntry {
     AuditLogEntry {
         timestamp: entry
             .timestamp
-            .format("%Y-%m-%d %H:%M:%S")
+            .format("%Y-%m-%d %H:%M:%SZ")
             .to_string()
             .into(),
         operation: entry.operation.clone().into(),
@@ -113,6 +137,7 @@ pub fn audit_entry_to_slint(entry: &AuditEntry) -> AuditLogEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use slint::Model;
 
     fn profile_with_anomalies(anomalies: Vec<ProfileAnomaly>) -> UserProfile {
         UserProfile {
@@ -147,9 +172,27 @@ mod tests {
             RepairSuggestions {
                 fix_bak: true,
                 reset_state: true,
-                unlock_hive: true,
             }
         );
+        assert_eq!(
+            locking_processes(&profile),
+            vec![SharedString::from("process.exe")]
+        );
+    }
+
+    #[test]
+    fn lock_inspection_failure_is_preserved_raw_and_blocks_repair() {
+        let profile = profile_with_anomalies(vec![ProfileAnomaly::LockInspectionFailure(
+            "raw Restart Manager failure 123".to_string(),
+        )]);
+
+        let entry = user_profile_to_slint(&profile);
+        assert_eq!(
+            entry.lock_inspection_failure.as_str(),
+            "raw Restart Manager failure 123"
+        );
+        assert!(entry.repair_blocked_by_lock_inspection);
+        assert_eq!(entry.locking_processes.row_count(), 0);
     }
 
     #[test]
@@ -166,8 +209,26 @@ mod tests {
             RepairSuggestions {
                 fix_bak: false,
                 reset_state: false,
-                unlock_hive: false,
             }
+        );
+    }
+
+    #[test]
+    fn audit_timestamp_is_explicit_utc() {
+        let entry = AuditEntry {
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-08-20T17:18:19Z")
+                .expect("valid timestamp")
+                .with_timezone(&chrono::Utc),
+            operation: "Test".to_string(),
+            actor: "test".to_string(),
+            target: "profile".to_string(),
+            status: AuditStatus::Success,
+            details: "raw details".to_string(),
+        };
+
+        assert_eq!(
+            audit_entry_to_slint(&entry).timestamp.as_str(),
+            "2026-08-20 17:18:19Z"
         );
     }
 }

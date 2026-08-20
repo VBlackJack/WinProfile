@@ -44,3 +44,6 @@ windows-sys.workspace = true
 slint-build.workspace = true
 embed-manifest.workspace = true
 embed-resource.workspace = true
+
+[dev-dependencies]
+i-slint-backend-testing = "=1.17.1"

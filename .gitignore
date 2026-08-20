@@ -12,3 +12,6 @@ tools/
 local/
 .claude/
 *.log
+
+# Private local docs (work-in-progress, notes, sensitive references)
+/work-private-docs/

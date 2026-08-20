@@ -6,8 +6,9 @@ WinProfile is a Windows-only administrative application for inspecting user prof
 
 - The executable embeds a `requireAdministrator` manifest on GNU and MSVC builds.
 - Repairs are disabled until a profile and at least one action are selected.
-- Repair suggestions are exact: `.bak` repair is suggested only for a `.bak` anomaly, state reset only for a dirty state mask, and hive unlock only for a locked `NTUSER.DAT`.
-- A dry-run performs the same preflight checks without mutating state.
+- Repair suggestions are exact: `.bak` repair is suggested only for a `.bak` anomaly and state reset only for a dirty state mask. There is no automatic process-closing action.
+- Restart Manager is inspection-only. If `NTUSER.DAT` is locked, WinProfile displays every measured application and PID, asks the operator to save work and close those applications manually, and requires a new scan. A lock-inspection failure also blocks repair.
+- A dry-run performs the same fail-closed lock and registry preflight checks without mutating state. The repair engine re-inspects `NTUSER.DAT` independently of the UI scan immediately before snapshot or dry-run success.
 - Registry mutations require durable snapshots and are verified after execution.
 - A failed repair restores the captured registry state and records the outcome.
 - A profile reported as loaded cannot be repaired or used as a migration source; sign the user out and scan again first.
@@ -21,7 +22,9 @@ WinProfile is a Windows-only administrative application for inspecting user prof
 - The former named-pipe broker was removed because it was not installed or operated as a real Windows service.
 - The About dialog includes Slint's official `AboutSlint` attribution widget.
 
-Closing applications through Restart Manager and launching a TrustedInstaller console are destructive expert operations. Both require elevation, explicit confirmation, and an audit event.
+Launching a TrustedInstaller console is a destructive expert operation that requires elevation, explicit confirmation, and an audit event. Restart Manager never shuts down or restarts applications; the operator remains responsible for closing measured blockers manually.
+
+The Slint interface exposes honest navigation, main-content, list/list-item, progress, and live-status accessibility semantics. Full technical status and audit details open in a read-only, selectable text panel; `Escape` closes it and returns focus to a safe control. English and French remain key-parity checked. Automated headless tests cover critical semantics and keyboard paths, but live Narrator, Accessibility Insights, and 150% DPI validation on Windows remain release-VM gates rather than claims made by the source test suite.
 
 ## Build and test
 
@@ -38,6 +41,14 @@ cargo +1.97.1-x86_64-pc-windows-gnu fmt --all -- --check
 cargo +1.97.1-x86_64-pc-windows-gnu clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo +1.97.1-x86_64-pc-windows-gnu test --workspace --all-features --locked
 cargo +1.97.1-x86_64-pc-windows-gnu build --workspace --all-targets --release --locked
+```
+
+The critical Slint tree oracle additionally requires compiler debug metadata at build time:
+
+```powershell
+$env:SLINT_EMIT_DEBUG_INFO = "1"
+cargo +1.97.1-x86_64-pc-windows-gnu test -p app-ui --test a11y_critical --all-features --locked
+Remove-Item Env:SLINT_EMIT_DEBUG_INFO
 ```
 
 Regular CI runs for `main`, pull requests, manual dispatches, and a weekly dependency audit. Every GitHub Action is pinned to a full commit SHA. CI builds and verifies the MSVC executable, PE metadata, elevation manifest, and checksum, but uploads no artifact.

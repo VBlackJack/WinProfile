@@ -26,16 +26,20 @@ The detached name is `WinProfile.Legacy.Untrusted.<random-id>`. Its old permissi
 
 ## Repair transaction
 
-1. Validate the selected SID, live `HKEY_USERS` state, registry key, profile path, and requested actions.
-2. For dry-run, audit the validated plan and stop.
-3. Capture every registry key that may be changed.
-4. Audit transaction start.
-5. Optionally request graceful closure of `NTUSER.DAT` lockers.
-6. Preserve an existing canonical key under a unique timestamped name.
-7. Rename the `.bak` key and apply selected State/RefCount changes.
-8. Re-read the canonical key and verify every postcondition.
-9. Audit success. If this write fails, roll back.
-10. On any execution error, reverse renames and restore all snapshots.
+1. For a non-dry repair, acquire the exclusive operation guard before any preflight or effect.
+2. Reject the historical `unlock_hive` contract. Restart Manager is inspection-only and no product path asks it to stop or restart a process.
+3. Reject an empty registry-action selection, then validate the absolute profile path and inspect `NTUSER.DAT`. Measured application/PID blockers produce `ManualCloseRequired`; any inspection error is fail-closed.
+4. Validate the selected SID, live `HKEY_USERS` state, registry key, profile path, and requested registry actions.
+5. Re-inspect `NTUSER.DAT` immediately before either a dry-run success event or snapshot/mutation. This core check is independent of the possibly stale UI scan.
+6. For dry-run, audit the validated plan and stop without snapshot or mutation.
+7. Capture every registry key that may be changed and audit transaction start.
+8. Preserve an existing canonical key under a unique timestamped name.
+9. Rename the `.bak` key and apply selected State/RefCount changes.
+10. Re-read the canonical key and verify every postcondition.
+11. Audit success. If this write fails, roll back.
+12. On any execution error, reverse renames and restore all snapshots.
+
+The UI preserves the measured blocker strings, including application and PID, without parsing or truncating their accessibility labels. Repair remains disabled until the operator saves work, closes the listed applications manually, and obtains a new scan without a lock or inspection-failure anomaly. There is no process-shutdown confirmation and no claim that application state can be rolled back.
 
 The tool does not invent filesystem ACLs. Account-specific ownership or DACL remediation requires a separately defined policy and is outside this transaction.
 
@@ -58,3 +62,9 @@ Audit file operations share a process-wide lock. Each JSON event is serialized b
 ## Elevation and packaging
 
 The PE manifest requests administrator elevation. Runtime token elevation is checked again before destructive operations. GNU builds embed the manifest through a pure Rust COFF object. The official MSVC release build also compiles `resources/version.rc`. Authenticode signing remains an external publication credential and must be verified before release.
+
+## Accessibility boundary
+
+The Slint tree uses navigation and main landmarks, list/list-item semantics for profile and audit collections, named progress values, and polite/assertive live regions for changing status. Technical strings remain byte-for-byte visible through a read-only selectable details panel rather than being localized or irreversibly elided. Keyboard oracles cover the recovery Quit default, English/French selection with Enter and Space, and Escape dismissal with safe focus restoration. Theme colors used for secondary, accent, error, and maintenance text are runtime contrast-tested against their actual backgrounds; the 12 px body minimum is a product readability rule, not presented as a WCAG font-size threshold.
+
+These automated semantics do not prove the complete Windows accessibility stack. Narrator speech order, Accessibility Insights findings, high-contrast behavior, and layout at 150% DPI still require an elevated Windows release-VM pass.

@@ -26,7 +26,7 @@ use audit_journal::{
 };
 use platform_win32::{
     open_key, open_subkey, query_value_string, query_value_u32, rename_subkey, set_value_u32,
-    subkey_exists, RegistryRoot, RestartManagerError, RestartManagerSession,
+    subkey_exists, LockingProcessInfo, RegistryRoot, RestartManagerSession,
 };
 
 use crate::constants::*;
@@ -34,6 +34,12 @@ use crate::models::RepairPlan;
 
 const AUDIT_ACTOR: &str = "WinProfile-Admin";
 const BACKUP_SUFFIX: &str = "pre-repair";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualCloseBlocker {
+    pub application: String,
+    pub process_id: u32,
+}
 
 #[derive(Error, Debug)]
 pub enum RepairError {
@@ -53,8 +59,14 @@ pub enum RepairError {
     RollbackError(#[from] RollbackError),
     #[error("Audit logging failed: {0}")]
     AuditError(#[from] AuditError),
-    #[error("Restart Manager failed: {0}")]
-    RestartManagerError(#[from] RestartManagerError),
+    #[error("NTUSER.DAT lock inspection failed: {0}")]
+    LockInspectionFailed(String),
+    #[error(
+        "Close the locking applications manually, save their work, and scan again: {blockers:?}"
+    )]
+    ManualCloseRequired { blockers: Vec<ManualCloseBlocker> },
+    #[error("Automatic process shutdown is no longer supported; scan for blockers and close them manually")]
+    AutomaticUnlockUnsupported,
     #[error("Transaction failed at step '{step}': {reason}")]
     TransactionFailed { step: String, reason: String },
 }
@@ -72,10 +84,57 @@ struct RepairSnapshot {
     expected_registry_key_path: String,
 }
 
+trait HiveLockInspector: Send + Sync {
+    fn inspect(&self, ntuser_path: &Path) -> Result<Vec<ManualCloseBlocker>, String>;
+}
+
+struct RestartManagerHiveLockInspector;
+
+impl HiveLockInspector for RestartManagerHiveLockInspector {
+    fn inspect(&self, ntuser_path: &Path) -> Result<Vec<ManualCloseBlocker>, String> {
+        match ntuser_path.try_exists() {
+            Ok(false) => return Ok(Vec::new()),
+            Ok(true) => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to determine whether '{}' exists: {error}",
+                    ntuser_path.display()
+                ))
+            }
+        }
+        let manager = RestartManagerSession::new().map_err(|error| error.to_string())?;
+        manager
+            .register_file(ntuser_path)
+            .map_err(|error| error.to_string())?;
+        manager
+            .get_locking_processes()
+            .map_err(|error| error.to_string())
+            .map(|processes| {
+                processes
+                    .into_iter()
+                    .map(ManualCloseBlocker::from)
+                    .collect()
+            })
+    }
+}
+
+impl From<LockingProcessInfo> for ManualCloseBlocker {
+    fn from(process: LockingProcessInfo) -> Self {
+        Self {
+            application: process.app_name,
+            process_id: process.process_id,
+        }
+    }
+}
+
+static RESTART_MANAGER_LOCK_INSPECTOR: RestartManagerHiveLockInspector =
+    RestartManagerHiveLockInspector;
+
 /// Transactional repair executor for Windows user profiles.
 pub struct ProfileRepairEngine<'a> {
     snapshot_engine: &'a SnapshotEngine,
     audit_logger: &'a AuditLogger,
+    lock_inspector: &'a dyn HiveLockInspector,
 }
 
 impl<'a> ProfileRepairEngine<'a> {
@@ -83,6 +142,20 @@ impl<'a> ProfileRepairEngine<'a> {
         Self {
             snapshot_engine,
             audit_logger,
+            lock_inspector: &RESTART_MANAGER_LOCK_INSPECTOR,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_lock_inspector(
+        snapshot_engine: &'a SnapshotEngine,
+        audit_logger: &'a AuditLogger,
+        lock_inspector: &'a dyn HiveLockInspector,
+    ) -> Self {
+        Self {
+            snapshot_engine,
+            audit_logger,
+            lock_inspector,
         }
     }
 
@@ -93,7 +166,13 @@ impl<'a> ProfileRepairEngine<'a> {
         } else {
             Some(self.audit_logger.acquire_operation_guard()?)
         };
+        if plan.unlock_hive {
+            return Err(RepairError::AutomaticUnlockUnsupported);
+        }
+        self.validate_selected_actions(plan)?;
+        self.validate_lock_contract(plan)?;
         let validation = self.validate_plan(plan, is_loaded)?;
+        self.validate_lock_contract(plan)?;
         if plan.dry_run {
             self.audit_logger.log(
                 "RepairDryRun",
@@ -175,9 +254,7 @@ impl<'a> ProfileRepairEngine<'a> {
     }
 
     fn validate_plan(&self, plan: &RepairPlan, is_loaded: bool) -> RepairResult<String> {
-        if !plan.fix_bak && !plan.reset_state && !plan.unlock_hive {
-            return Err(RepairError::NoActionSelected);
-        }
+        self.validate_selected_actions(plan)?;
         if !is_valid_sid(&plan.canonical_sid) {
             return Err(RepairError::InvalidSid(plan.canonical_sid.clone()));
         }
@@ -230,16 +307,6 @@ impl<'a> ProfileRepairEngine<'a> {
             return Err(RepairError::MissingRegistryKey(canonical_name.clone()));
         }
 
-        if plan.unlock_hive {
-            let profile_path = Path::new(&plan.profile_path);
-            if plan.profile_path.trim().is_empty() || !profile_path.is_dir() {
-                return Err(RepairError::TransactionFailed {
-                    step: "Preflight".to_string(),
-                    reason: "unlock requires an existing profile directory".to_string(),
-                });
-            }
-        }
-
         Ok(format!(
             "Preflight passed: fix_bak={}, reset_state={}, unlock_hive={}, canonical_exists={}",
             plan.fix_bak,
@@ -247,6 +314,32 @@ impl<'a> ProfileRepairEngine<'a> {
             plan.unlock_hive,
             subkey_exists(&parent, canonical_name)?
         ))
+    }
+
+    fn validate_selected_actions(&self, plan: &RepairPlan) -> RepairResult<()> {
+        if !plan.fix_bak && !plan.reset_state {
+            return Err(RepairError::NoActionSelected);
+        }
+        Ok(())
+    }
+
+    fn validate_lock_contract(&self, plan: &RepairPlan) -> RepairResult<()> {
+        let profile_path = Path::new(&plan.profile_path);
+        if plan.profile_path.trim().is_empty() || !profile_path.is_absolute() {
+            return Err(RepairError::TransactionFailed {
+                step: "LockInspection".to_string(),
+                reason: "profile path must be absolute before NTUSER.DAT lock inspection"
+                    .to_string(),
+            });
+        }
+        let blockers = self
+            .lock_inspector
+            .inspect(&profile_path.join(NTUSER_DAT))
+            .map_err(RepairError::LockInspectionFailed)?;
+        if !blockers.is_empty() {
+            return Err(RepairError::ManualCloseRequired { blockers });
+        }
+        Ok(())
     }
 
     fn create_required_snapshots(&self, plan: &RepairPlan) -> RepairResult<Vec<RepairSnapshot>> {
@@ -286,10 +379,6 @@ impl<'a> ProfileRepairEngine<'a> {
         parent: &platform_win32::OwnedHKey,
         mutation: &mut RegistryMutation,
     ) -> RepairResult<()> {
-        if plan.unlock_hive {
-            self.unlock_hive(plan)?;
-        }
-
         let canonical_name = &plan.canonical_sid;
         let bak_name = format!("{canonical_name}{BAK_EXTENSION}");
         if plan.fix_bak {
@@ -319,28 +408,6 @@ impl<'a> ProfileRepairEngine<'a> {
         }
 
         self.verify(plan, parent)
-    }
-
-    fn unlock_hive(&self, plan: &RepairPlan) -> RepairResult<()> {
-        let ntuser_path = Path::new(&plan.profile_path).join(NTUSER_DAT);
-        if !ntuser_path.exists() {
-            return Ok(());
-        }
-        let manager = RestartManagerSession::new()?;
-        manager.register_file(&ntuser_path)?;
-        let processes = manager.get_locking_processes()?;
-        if processes.is_empty() {
-            return Ok(());
-        }
-        manager.shutdown_locking_processes(false)?;
-        let remaining = manager.get_locking_processes()?;
-        if !remaining.is_empty() {
-            return Err(RepairError::TransactionFailed {
-                step: "UnlockHive".to_string(),
-                reason: format!("{} process(es) still hold NTUSER.DAT", remaining.len()),
-            });
-        }
-        Ok(())
     }
 
     fn verify(&self, plan: &RepairPlan, parent: &platform_win32::OwnedHKey) -> RepairResult<()> {
@@ -496,9 +563,87 @@ fn normalize_profile_path(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{attempt_all_then_audit, is_valid_sid, rollback_summary};
-    use audit_journal::AuditStatus;
+    use super::{
+        attempt_all_then_audit, is_valid_sid, rollback_summary, HiveLockInspector,
+        ManualCloseBlocker, ProfileRepairEngine, RepairError,
+    };
+    use crate::models::RepairPlan;
+    use audit_journal::{AuditLogger, AuditStatus, SnapshotEngine};
     use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    struct RepairTestDirectory(PathBuf);
+
+    impl RepairTestDirectory {
+        fn new() -> Self {
+            static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+            let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "winprofile-repair-lock-contract-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create repair test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for RepairTestDirectory {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!(
+                    "failed to remove repair test directory {}: {error}",
+                    self.0.display()
+                );
+            }
+        }
+    }
+
+    struct FakeLockInspector {
+        result: Mutex<Option<Result<Vec<ManualCloseBlocker>, String>>>,
+        calls: AtomicUsize,
+    }
+
+    impl FakeLockInspector {
+        fn new(result: Result<Vec<ManualCloseBlocker>, String>) -> Self {
+            Self {
+                result: Mutex::new(Some(result)),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl HiveLockInspector for FakeLockInspector {
+        fn inspect(&self, _ntuser_path: &Path) -> Result<Vec<ManualCloseBlocker>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.result
+                .lock()
+                .expect("fake lock inspector")
+                .take()
+                .expect("one lock inspection")
+        }
+    }
+
+    fn test_plan(profile_path: &Path, unlock_hive: bool) -> RepairPlan {
+        RepairPlan {
+            sid: "S-1-5-21-1001".to_string(),
+            canonical_sid: "S-1-5-21-1001".to_string(),
+            profile_path: profile_path.display().to_string(),
+            fix_bak: true,
+            reset_state: false,
+            unlock_hive,
+            dry_run: false,
+        }
+    }
+
+    fn test_engines(directory: &RepairTestDirectory) -> (SnapshotEngine, AuditLogger) {
+        let snapshots = SnapshotEngine::new(Some(directory.0.join("Snapshots")))
+            .expect("create snapshot engine");
+        let audit = AuditLogger::new(Some(directory.0.join("audit.jsonl")), 10)
+            .expect("create audit logger");
+        (snapshots, audit)
+    }
 
     #[test]
     fn sid_validation_is_strict() {
@@ -554,5 +699,76 @@ mod tests {
         assert_eq!(status, AuditStatus::Failed);
         assert!(details.contains("restore canonical name: access denied"));
         assert!(details.contains("attempted all 2 snapshot"));
+    }
+
+    #[test]
+    fn measured_lockers_fail_before_snapshot_mutation_or_success_audit() {
+        let directory = RepairTestDirectory::new();
+        let (snapshots, audit) = test_engines(&directory);
+        let inspector = FakeLockInspector::new(Ok(vec![ManualCloseBlocker {
+            application: "Editor.exe".to_string(),
+            process_id: 4242,
+        }]));
+        let engine = ProfileRepairEngine::with_lock_inspector(&snapshots, &audit, &inspector);
+
+        let result = engine.execute_plan(&test_plan(&directory.0, false), false);
+
+        assert!(matches!(
+            result,
+            Err(RepairError::ManualCloseRequired { blockers })
+                if blockers == vec![ManualCloseBlocker {
+                    application: "Editor.exe".to_string(),
+                    process_id: 4242,
+                }]
+        ));
+        assert_eq!(inspector.calls.load(Ordering::SeqCst), 1);
+        assert!(snapshots
+            .list_snapshots()
+            .expect("snapshot inventory")
+            .is_empty());
+        assert!(audit.get_entries().expect("audit entries").is_empty());
+    }
+
+    #[test]
+    fn obsolete_unlock_flag_is_rejected_even_without_lockers_or_effects() {
+        let directory = RepairTestDirectory::new();
+        let (snapshots, audit) = test_engines(&directory);
+        let inspector = FakeLockInspector::new(Ok(Vec::new()));
+        let engine = ProfileRepairEngine::with_lock_inspector(&snapshots, &audit, &inspector);
+
+        let result = engine.execute_plan(&test_plan(&directory.0, true), false);
+
+        assert!(matches!(
+            result,
+            Err(RepairError::AutomaticUnlockUnsupported)
+        ));
+        assert_eq!(inspector.calls.load(Ordering::SeqCst), 0);
+        assert!(snapshots
+            .list_snapshots()
+            .expect("snapshot inventory")
+            .is_empty());
+        assert!(audit.get_entries().expect("audit entries").is_empty());
+    }
+
+    #[test]
+    fn lock_inspection_failure_is_fail_closed_before_any_effect() {
+        let directory = RepairTestDirectory::new();
+        let (snapshots, audit) = test_engines(&directory);
+        let inspector = FakeLockInspector::new(Err("Restart Manager unavailable".to_string()));
+        let engine = ProfileRepairEngine::with_lock_inspector(&snapshots, &audit, &inspector);
+
+        let result = engine.execute_plan(&test_plan(&directory.0, false), false);
+
+        assert!(matches!(
+            result,
+            Err(RepairError::LockInspectionFailed(details))
+                if details == "Restart Manager unavailable"
+        ));
+        assert_eq!(inspector.calls.load(Ordering::SeqCst), 1);
+        assert!(snapshots
+            .list_snapshots()
+            .expect("snapshot inventory")
+            .is_empty());
+        assert!(audit.get_entries().expect("audit entries").is_empty());
     }
 }

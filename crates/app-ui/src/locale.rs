@@ -141,7 +141,9 @@ pub fn apply_app_strings(ui: &MainWindow) {
     strings.set_repair_pipeline(t("repair.pipeline").into());
     strings.set_fix_bak(t("repair.action.fix_bak").into());
     strings.set_reset_state(t("repair.action.reset_state").into());
-    strings.set_unlock_hive(t("repair.action.unlock_hive").into());
+    strings.set_lock_title(t("repair.locked.title").into());
+    strings.set_lock_instruction(t("repair.locked.instruction").into());
+    strings.set_lock_status(t("repair.locked.status").into());
     strings.set_dry_run(t("repair.btn.dry_run").into());
     strings.set_execute_repair(t("repair.btn.execute").into());
     strings.set_migration_title(t("migration.title").into());
@@ -164,6 +166,16 @@ pub fn apply_app_strings(ui: &MainWindow) {
     strings.set_audit_target(t("audit.column.target").into());
     strings.set_audit_result(t("audit.column.result").into());
     strings.set_audit_details(t("audit.column.details").into());
+    strings.set_view_details(t("common.view_details").into());
+    strings.set_details_copy_hint(t("details.copy_hint").into());
+    strings.set_status_details_title(t("details.status_title").into());
+    strings.set_navigation_label(t("accessibility.navigation").into());
+    strings.set_main_content_label(t("accessibility.main_content").into());
+    strings.set_profiles_list_label(t("accessibility.profiles_list").into());
+    strings.set_audit_list_label(t("accessibility.audit_list").into());
+    strings.set_blockers_list_label(t("accessibility.blockers_list").into());
+    strings.set_migration_progress_label(t("accessibility.migration_progress").into());
+    strings.set_status_region_label(t("accessibility.status_region").into());
     strings.set_about(t("about.title").into());
     strings.set_close(t("common.close").into());
     strings.set_confirm(t("common.confirm").into());
@@ -371,6 +383,131 @@ mod tests {
                 text: Key::Return.into(),
             });
             assert_eq!(quit_calls.get(), 1);
+            ui.hide().expect("hide testing window");
+        });
+    }
+
+    #[test]
+    fn recovery_language_selector_accepts_enter_and_space_without_business_state_changes() {
+        with_test_window(|ui| {
+            set_locale_and_app_strings(ui, FRENCH_LOCALE).expect("apply French strings");
+            StartupPresentation::FreshRecovery {
+                reason: "keyboard language fixture".to_string(),
+            }
+            .apply(ui);
+            ui.set_startup_visible(true);
+            ui.set_startup_busy(false);
+            ui.set_selected_sid("S-1-5-21-4242".into());
+            ui.set_selected_path("C:\\Users\\Fixture".into());
+            ui.set_total_profiles_count(7);
+            ui.set_migration_progress(0.37);
+            ui.set_startup_consent_granted(true);
+            let business_state = (
+                ui.get_selected_sid(),
+                ui.get_selected_path(),
+                ui.get_total_profiles_count(),
+                ui.get_migration_progress(),
+                ui.get_startup_consent_granted(),
+            );
+            let locale_calls = Rc::new(Cell::new(0));
+            {
+                let weak = ui.as_weak();
+                let locale_calls = Rc::clone(&locale_calls);
+                ui.on_change_locale(move |locale| {
+                    locale_calls.set(locale_calls.get() + 1);
+                    let ui = weak.upgrade().expect("live UI");
+                    set_locale_and_app_strings(&ui, locale.as_str()).expect("keyboard locale");
+                });
+            }
+
+            ui.show().expect("show testing window");
+            ui.window()
+                .dispatch_event(WindowEvent::WindowActiveChanged(true));
+            slint::platform::update_timers_and_animations();
+            assert!(ui.get_startup_quit_focused());
+
+            for _ in 0..12 {
+                if ui.get_startup_language_english_focused() {
+                    break;
+                }
+                ui.window().dispatch_event(WindowEvent::KeyPressed {
+                    text: Key::Tab.into(),
+                });
+                ui.window().dispatch_event(WindowEvent::KeyReleased {
+                    text: Key::Tab.into(),
+                });
+            }
+            assert!(ui.get_startup_language_english_focused());
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Return.into(),
+            });
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Return.into(),
+            });
+            assert_eq!(ui.get_current_locale().as_str(), ENGLISH_LOCALE);
+
+            for _ in 0..12 {
+                if ui.get_startup_language_french_focused() {
+                    break;
+                }
+                ui.window().dispatch_event(WindowEvent::KeyPressed {
+                    text: Key::Tab.into(),
+                });
+                ui.window().dispatch_event(WindowEvent::KeyReleased {
+                    text: Key::Tab.into(),
+                });
+            }
+            assert!(ui.get_startup_language_french_focused());
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Space.into(),
+            });
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Space.into(),
+            });
+            assert_eq!(ui.get_current_locale().as_str(), FRENCH_LOCALE);
+            assert_eq!(locale_calls.get(), 2);
+            assert_eq!(
+                business_state,
+                (
+                    ui.get_selected_sid(),
+                    ui.get_selected_path(),
+                    ui.get_total_profiles_count(),
+                    ui.get_migration_progress(),
+                    ui.get_startup_consent_granted(),
+                )
+            );
+            ui.hide().expect("hide testing window");
+        });
+    }
+
+    #[test]
+    fn escape_closes_full_read_only_details_and_returns_safe_focus() {
+        with_test_window(|ui| {
+            set_locale_and_app_strings(ui, ENGLISH_LOCALE).expect("apply English strings");
+            ui.set_startup_visible(false);
+            ui.set_status_message("RAW-LONG-STATUS-DETAIL-0xC0000022".into());
+            ui.show().expect("show testing window");
+            ui.window()
+                .dispatch_event(WindowEvent::WindowActiveChanged(true));
+            ui.invoke_show_details(
+                "Status details".into(),
+                "RAW-LONG-STATUS-DETAIL-0xC0000022".into(),
+            );
+            slint::platform::update_timers_and_animations();
+            assert!(ui.get_details_visible());
+            assert_eq!(
+                ui.get_details_content().as_str(),
+                "RAW-LONG-STATUS-DETAIL-0xC0000022"
+            );
+
+            ui.window().dispatch_event(WindowEvent::KeyPressed {
+                text: Key::Escape.into(),
+            });
+            ui.window().dispatch_event(WindowEvent::KeyReleased {
+                text: Key::Escape.into(),
+            });
+            assert!(!ui.get_details_visible());
+            assert!(ui.get_status_details_focused());
             ui.hide().expect("hide testing window");
         });
     }

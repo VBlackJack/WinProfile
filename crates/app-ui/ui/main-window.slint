@@ -15,7 +15,7 @@
  */
 
 import { DraculaTheme } from "theme.slint";
-import { AboutSlint, Button, CheckBox, LineEdit, ListView, ProgressIndicator } from "std-widgets.slint";
+import { AboutSlint, Button, CheckBox, LineEdit, ListView, ProgressIndicator, ScrollView, TextEdit } from "std-widgets.slint";
 
 export struct ProfileEntry {
     sid: string,
@@ -29,7 +29,10 @@ export struct ProfileEntry {
     is_bak: bool,
     suggest_fix_bak: bool,
     suggest_reset_state: bool,
-    suggest_unlock_hive: bool,
+    locking_processes: [string],
+    has_locking_processes: bool,
+    lock_inspection_failure: string,
+    repair_blocked_by_lock_inspection: bool,
     state_raw: string,
     anomalies: string,
 }
@@ -83,7 +86,9 @@ export global AppStrings {
     in-out property <string> repair-pipeline;
     in-out property <string> fix-bak;
     in-out property <string> reset-state;
-    in-out property <string> unlock-hive;
+    in-out property <string> lock-title;
+    in-out property <string> lock-instruction;
+    in-out property <string> lock-status;
     in-out property <string> dry-run;
     in-out property <string> execute-repair;
     in-out property <string> migration-title;
@@ -106,6 +111,16 @@ export global AppStrings {
     in-out property <string> audit-target;
     in-out property <string> audit-result;
     in-out property <string> audit-details;
+    in-out property <string> view-details;
+    in-out property <string> details-copy-hint;
+    in-out property <string> status-details-title;
+    in-out property <string> navigation-label;
+    in-out property <string> main-content-label;
+    in-out property <string> profiles-list-label;
+    in-out property <string> audit-list-label;
+    in-out property <string> blockers-list-label;
+    in-out property <string> migration-progress-label;
+    in-out property <string> status-region-label;
     in-out property <string> about;
     in-out property <string> close;
     in-out property <string> confirm;
@@ -116,19 +131,27 @@ component LanguageSelector inherits HorizontalLayout {
     in property <string> current-locale;
     in property <bool> selector-enabled: true;
     callback selected(string);
+    callback focus-changed(bool, bool);
+    out property <bool> english-focused: english-button.has-focus;
+    out property <bool> french-focused: french-button.has-focus;
     spacing: 4px;
+    accessible-role: radio-group;
 
-    Button {
+    english-button := Button {
         text: AppStrings.language-english;
         checked: root.current-locale == "en";
         enabled: root.selector-enabled;
+        accessible-role: radio-button;
         clicked => { root.selected("en"); }
+        changed has-focus => { root.focus-changed(root.english-focused, root.french-focused); }
     }
-    Button {
+    french-button := Button {
         text: AppStrings.language-french;
         checked: root.current-locale == "fr";
         enabled: root.selector-enabled;
+        accessible-role: radio-button;
         clicked => { root.selected("fr"); }
+        changed has-focus => { root.focus-changed(root.english-focused, root.french-focused); }
     }
 }
 
@@ -151,10 +174,10 @@ component StatCard inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: AppStrings.window-title;
-    min-width: 1040px;
-    min-height: 720px;
-    preferred-width: 1180px;
-    preferred-height: 780px;
+    min-width: 900px;
+    min-height: 480px;
+    preferred-width: 1040px;
+    preferred-height: 680px;
     background: DraculaTheme.background;
     default-font-family: DraculaTheme.font-family;
 
@@ -175,10 +198,13 @@ export component MainWindow inherits Window {
     in-out property <string> selected-path;
     in-out property <string> selected-username;
     in-out property <string> selected-anomalies;
+    in-out property <[string]> selected-locking-processes: [];
+    in-out property <bool> selected-has-locking-processes: false;
+    in-out property <string> selected-lock-inspection-failure;
+    in-out property <bool> selected-repair-blocked-by-lock-inspection: false;
     in-out property <bool> selected-loaded: false;
     in-out property <bool> repair-fix-bak: false;
     in-out property <bool> repair-reset-state: false;
-    in-out property <bool> repair-unlock-hive: false;
     in-out property <string> migration-target-path;
     in-out property <bool> migration-include-roaming: false;
     in-out property <bool> migration-include-docs: false;
@@ -189,6 +215,9 @@ export component MainWindow inherits Window {
     in-out property <string> confirmation-title;
     in-out property <string> confirmation-message;
     in-out property <bool> about-visible: false;
+    in-out property <bool> details-visible: false;
+    in-out property <string> details-title;
+    in-out property <string> details-content;
     in-out property <bool> startup-visible: true;
     in-out property <bool> startup-busy: true;
     in-out property <string> startup-title;
@@ -199,10 +228,26 @@ export component MainWindow inherits Window {
     in-out property <string> startup-consent-text;
     in-out property <bool> startup-consent-required: false;
     in-out property <bool> startup-consent-granted: false;
-    property <bool> modal-visible: root.startup-visible || root.confirmation-visible || root.about-visible;
+    property <bool> modal-visible: root.startup-visible || root.confirmation-visible || root.about-visible || root.details-visible;
     out property <bool> language-switch-enabled: root.startup-visible || (!root.operation-busy && !root.modal-visible);
+    out property <bool> repair-execution-enabled: root.is-elevated && !root.operation-busy && !root.modal-visible && root.selected-sid != "" && !root.selected-loaded && !root.selected-repair-blocked-by-lock-inspection && (root.repair-fix-bak || root.repair-reset-state);
     property <bool> startup-quit-has-focus: false;
     out property <bool> startup-quit-focused: root.startup-visible && root.startup-quit-has-focus;
+    property <bool> startup-language-english-has-focus: false;
+    property <bool> startup-language-french-has-focus: false;
+    out property <bool> startup-language-english-focused: root.startup-language-english-has-focus;
+    out property <bool> startup-language-french-focused: root.startup-language-french-has-focus;
+    property <bool> details-text-has-focus: false;
+    out property <bool> details-text-focused: root.details-visible && root.details-text-has-focus;
+    property <bool> status-details-has-focus: false;
+    out property <bool> status-details-focused: !root.details-visible && root.status-details-has-focus;
+    out property <color> a11y-text-secondary: DraculaTheme.text-secondary;
+    out property <color> a11y-purple: DraculaTheme.purple;
+    out property <color> a11y-pink: DraculaTheme.pink;
+    out property <color> a11y-red: DraculaTheme.red;
+    out property <color> a11y-background: DraculaTheme.background;
+    out property <color> a11y-current-line: DraculaTheme.current-line;
+    out property <color> a11y-card-bg: DraculaTheme.card-bg;
 
     callback scan-profiles();
     callback select-profile(int);
@@ -217,6 +262,18 @@ export component MainWindow inherits Window {
     callback startup-proceed();
     callback startup-quit();
     callback change-locale(string);
+    callback show-details(string, string);
+    callback close-details();
+
+    show-details(title, content) => {
+        root.details-title = title;
+        root.details-content = content;
+        root.details-visible = true;
+    }
+    close-details() => {
+        root.details-visible = false;
+        status-details-button.focus();
+    }
 
     Rectangle {
         background: DraculaTheme.background;
@@ -234,7 +291,7 @@ export component MainWindow inherits Window {
                     VerticalLayout {
                         alignment: center;
                         Text { text: AppStrings.app-title; color: DraculaTheme.purple; font-size: 19px; font-weight: 800; }
-                        Text { text: AppStrings.app-subtitle; color: DraculaTheme.text-secondary; font-size: 11px; }
+                        Text { text: AppStrings.app-subtitle; color: DraculaTheme.text-secondary; font-size: 12px; }
                     }
                     HorizontalLayout {
                         alignment: end;
@@ -261,7 +318,7 @@ export component MainWindow inherits Window {
                                 Text {
                                     text: root.is-elevated ? AppStrings.elevated : AppStrings.unelevated;
                                     color: root.is-elevated ? DraculaTheme.green : DraculaTheme.red;
-                                    font-size: 11px;
+                                    font-size: 12px;
                                     font-weight: 700;
                                     vertical-alignment: center;
                                 }
@@ -280,6 +337,8 @@ export component MainWindow inherits Window {
             Rectangle {
                 height: 48px;
                 background: #21222c;
+                accessible-role: navigation;
+                accessible-label: AppStrings.navigation-label;
                 HorizontalLayout {
                     padding-left: DraculaTheme.spacing-lg;
                     padding-right: DraculaTheme.spacing-lg;
@@ -293,8 +352,16 @@ export component MainWindow inherits Window {
                 }
             }
 
-            Rectangle {
-                background: DraculaTheme.background;
+            ScrollView {
+                horizontal-stretch: 1;
+                vertical-stretch: 1;
+
+                Rectangle {
+                    min-width: 880px;
+                    min-height: 520px;
+                    background: DraculaTheme.background;
+                    accessible-role: main;
+                    accessible-label: AppStrings.main-content-label;
 
                 if root.active-tab == 0: VerticalLayout {
                     padding: DraculaTheme.spacing-lg;
@@ -337,17 +404,20 @@ export component MainWindow inherits Window {
                                 vertical-alignment: center;
                             }
                             ListView {
+                                accessible-label: AppStrings.profiles-list-label;
                                 for profile[idx] in root.profiles: Rectangle {
                                     height: 44px;
                                     background: root.selected-idx == idx ? DraculaTheme.selection : transparent;
                                     border-radius: 4px;
+                                    accessible-role: list-item;
+                                    accessible-label: profile.username + ", " + profile.sid + ", " + profile.profile_path + ", " + profile.status_text + ", " + (profile.loaded ? AppStrings.yes : AppStrings.no);
                                     HorizontalLayout {
                                         padding-left: 10px;
                                         padding-right: 10px;
                                         spacing: 8px;
                                         Text { text: profile.username; color: DraculaTheme.foreground; font-weight: 600; width: 150px; vertical-alignment: center; overflow: elide; }
-                                        Text { text: profile.sid; color: DraculaTheme.text-secondary; font-size: 11px; width: 220px; vertical-alignment: center; overflow: elide; }
-                                        Text { text: profile.profile_path; color: DraculaTheme.cyan; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                        Text { text: profile.sid; color: DraculaTheme.text-secondary; font-size: 12px; width: 220px; vertical-alignment: center; overflow: elide; }
+                                        Text { text: profile.profile_path; color: DraculaTheme.cyan; font-size: 12px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
                                         Text { text: profile.status_text; color: profile.health_type == 0 ? DraculaTheme.green : (profile.health_type == 1 ? DraculaTheme.orange : DraculaTheme.red); font-weight: 600; width: 190px; vertical-alignment: center; overflow: elide; }
                                         Text { text: profile.loaded ? AppStrings.yes : AppStrings.no; color: profile.loaded ? DraculaTheme.yellow : DraculaTheme.text-secondary; width: 58px; vertical-alignment: center; }
                                         Button { text: AppStrings.select; width: 90px; enabled: !root.operation-busy && !root.modal-visible; clicked => { root.select-profile(idx); } }
@@ -377,8 +447,8 @@ export component MainWindow inherits Window {
                                     padding: 10px;
                                     spacing: 4px;
                                     Text { text: AppStrings.target-account + " " + (root.selected-username != "" ? root.selected-username : AppStrings.none-selected); color: DraculaTheme.foreground; font-weight: 700; }
-                                    Text { text: AppStrings.target-sid + " " + root.selected-sid; color: DraculaTheme.text-secondary; font-size: 11px; }
-                                    Text { text: AppStrings.profile-path + " " + root.selected-path; color: DraculaTheme.cyan; font-size: 11px; }
+                                    Text { text: AppStrings.target-sid + " " + root.selected-sid; color: DraculaTheme.text-secondary; font-size: 12px; }
+                                    Text { text: AppStrings.profile-path + " " + root.selected-path; color: DraculaTheme.cyan; font-size: 12px; wrap: word-wrap; }
                                     if root.selected-anomalies != "": Text { text: AppStrings.anomalies + " " + root.selected-anomalies; color: DraculaTheme.orange; font-weight: 600; }
                                     if root.selected-loaded: Text { text: AppStrings.loaded-warning; color: DraculaTheme.red; font-weight: 700; }
                                 }
@@ -386,18 +456,63 @@ export component MainWindow inherits Window {
                             Text { text: AppStrings.repair-pipeline; color: DraculaTheme.text-secondary; font-size: 12px; wrap: word-wrap; }
                             CheckBox { text: AppStrings.fix-bak; checked <=> root.repair-fix-bak; enabled: !root.operation-busy && !root.modal-visible; }
                             CheckBox { text: AppStrings.reset-state; checked <=> root.repair-reset-state; enabled: !root.operation-busy && !root.modal-visible; }
-                            CheckBox { text: AppStrings.unlock-hive; checked <=> root.repair-unlock-hive; enabled: !root.operation-busy && !root.modal-visible; }
+                            if root.selected-repair-blocked-by-lock-inspection: Rectangle {
+                                background: #512c35;
+                                border-radius: DraculaTheme.border-radius;
+                                border-width: 2px;
+                                border-color: DraculaTheme.red;
+                                accessible-role: groupbox;
+                                accessible-label: AppStrings.lock-title;
+                                VerticalLayout {
+                                    padding: DraculaTheme.spacing-md;
+                                    spacing: DraculaTheme.spacing-sm;
+                                    Text { text: AppStrings.lock-title; color: DraculaTheme.red; font-size: 16px; font-weight: 700; }
+                                    Text { text: AppStrings.lock-instruction; color: DraculaTheme.foreground; wrap: word-wrap; }
+                                    if root.selected-locking-processes.length > 0: Rectangle {
+                                        accessible-role: list;
+                                        accessible-label: AppStrings.blockers-list-label;
+                                        VerticalLayout {
+                                            spacing: 4px;
+                                            for process in root.selected-locking-processes: Rectangle {
+                                                min-height: 28px;
+                                                accessible-role: list-item;
+                                                accessible-label: process;
+                                                Text { text: process; color: DraculaTheme.foreground; wrap: word-wrap; }
+                                            }
+                                        }
+                                    }
+                                    if root.selected-lock-inspection-failure != "": Text {
+                                        text: root.selected-lock-inspection-failure;
+                                        color: DraculaTheme.red;
+                                        wrap: word-wrap;
+                                        accessible-live-region: assertive;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: DraculaTheme.spacing-sm;
+                                        Button {
+                                            text: AppStrings.scan;
+                                            primary: true;
+                                            enabled: !root.operation-busy && !root.modal-visible;
+                                            clicked => { root.scan-profiles(); }
+                                        }
+                                        if root.selected-lock-inspection-failure != "": Button {
+                                            text: AppStrings.view-details;
+                                            clicked => { root.show-details(AppStrings.lock-title, root.selected-lock-inspection-failure); }
+                                        }
+                                    }
+                                }
+                            }
                             HorizontalLayout {
                                 spacing: DraculaTheme.spacing-md;
                                 Button {
                                     text: AppStrings.dry-run;
-                                    enabled: root.is-elevated && !root.operation-busy && !root.modal-visible && root.selected-sid != "" && !root.selected-loaded && (root.repair-fix-bak || root.repair-reset-state || root.repair-unlock-hive);
+                                    enabled: root.repair-execution-enabled;
                                     clicked => { root.execute-dry-run(); }
                                 }
                                 Button {
                                     text: AppStrings.execute-repair;
                                     primary: true;
-                                    enabled: root.is-elevated && !root.operation-busy && !root.modal-visible && root.selected-sid != "" && !root.selected-loaded && (root.repair-fix-bak || root.repair-reset-state || root.repair-unlock-hive);
+                                    enabled: root.repair-execution-enabled;
                                     clicked => { root.request-repair(); }
                                 }
                             }
@@ -439,8 +554,20 @@ export component MainWindow inherits Window {
                             }
                             CheckBox { text: AppStrings.include-roaming; checked <=> root.migration-include-roaming; enabled: !root.operation-busy && !root.modal-visible; }
                             CheckBox { text: AppStrings.include-docs; checked <=> root.migration-include-docs; enabled: !root.operation-busy && !root.modal-visible; }
-                            Text { text: root.migration-status; color: DraculaTheme.text-secondary; font-weight: 600; }
-                            ProgressIndicator { progress: root.migration-progress; height: 14px; }
+                            Text {
+                                text: root.migration-status;
+                                color: DraculaTheme.text-secondary;
+                                font-weight: 600;
+                                wrap: word-wrap;
+                                accessible-live-region: polite;
+                            }
+                            ProgressIndicator {
+                                progress: root.migration-progress;
+                                height: 14px;
+                                accessible-label: AppStrings.migration-progress-label;
+                                accessible-value-minimum: 0;
+                                accessible-value-maximum: 1;
+                            }
                             HorizontalLayout {
                                 spacing: DraculaTheme.spacing-md;
                                 Button {
@@ -517,36 +644,101 @@ export component MainWindow inherits Window {
                                 }
                             }
                             ListView {
+                                accessible-label: AppStrings.audit-list-label;
                                 for entry in root.audit-entries: Rectangle {
-                                    height: 38px;
+                                    min-height: 44px;
                                     background: DraculaTheme.current-line;
                                     border-radius: 4px;
+                                    accessible-role: list-item;
+                                    accessible-label: entry.timestamp + ", " + entry.operation + ", " + entry.target + ", " + entry.status + ", " + entry.details;
                                     HorizontalLayout {
                                         padding-left: 10px;
                                         padding-right: 10px;
                                         spacing: 8px;
-                                        Text { text: entry.timestamp; color: DraculaTheme.text-secondary; font-size: 11px; width: 150px; vertical-alignment: center; }
+                                        Text { text: entry.timestamp; color: DraculaTheme.text-secondary; font-size: 12px; width: 165px; vertical-alignment: center; }
                                         Text { text: entry.operation; color: DraculaTheme.purple; font-weight: 600; width: 150px; vertical-alignment: center; overflow: elide; }
-                                        Text { text: entry.target; color: DraculaTheme.cyan; font-size: 11px; width: 180px; vertical-alignment: center; overflow: elide; }
+                                        Text { text: entry.target; color: DraculaTheme.cyan; font-size: 12px; width: 180px; vertical-alignment: center; overflow: elide; }
                                         Text { text: entry.status; color: entry.status_type == 0 ? DraculaTheme.green : (entry.status_type == 1 ? DraculaTheme.orange : DraculaTheme.red); font-weight: 700; width: 100px; vertical-alignment: center; }
-                                        Text { text: entry.details; color: DraculaTheme.foreground; font-size: 11px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                        Text { text: entry.details; color: DraculaTheme.foreground; font-size: 12px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                        Button {
+                                            text: AppStrings.view-details;
+                                            clicked => { root.show-details(entry.operation, entry.target + "\n\n" + entry.details); }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
+                }
             }
 
             Rectangle {
-                height: 32px;
+                min-height: 44px;
                 background: DraculaTheme.current-line;
+                accessible-role: content-info;
+                accessible-live-region: polite;
+                accessible-label: AppStrings.status-region-label + ": " + root.status-message;
                 HorizontalLayout {
                     padding-left: DraculaTheme.spacing-lg;
                     padding-right: DraculaTheme.spacing-lg;
                     alignment: space-between;
-                    Text { text: root.status-message; color: DraculaTheme.foreground; font-size: 11px; vertical-alignment: center; overflow: elide; }
-                    Text { text: AppStrings.app-version + " | " + AppStrings.app-license; color: DraculaTheme.text-secondary; font-size: 11px; vertical-alignment: center; }
+                    Text { text: root.status-message; color: DraculaTheme.foreground; font-size: 12px; vertical-alignment: center; wrap: word-wrap; horizontal-stretch: 1; }
+                    status-details-button := Button {
+                        text: AppStrings.view-details;
+                        enabled: root.status-message != "" && !root.modal-visible;
+                        changed has-focus => { root.status-details-has-focus = self.has-focus; }
+                        clicked => { root.show-details(AppStrings.status-details-title, root.status-message); }
+                    }
+                    Text { text: AppStrings.app-version + " | " + AppStrings.app-license; color: DraculaTheme.text-secondary; font-size: 12px; vertical-alignment: center; }
+                }
+            }
+        }
+
+        if root.details-visible: Rectangle {
+            background: #aa000000;
+            FocusScope {
+                forward-focus: details-text;
+                init => { self.focus(); }
+                key-pressed(event) => {
+                    if event.text == Key.Escape {
+                        root.close-details();
+                        return accept;
+                    }
+                    return reject;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: parent.width * 0.82;
+                        height: parent.height * 0.78;
+                        background: DraculaTheme.card-bg;
+                        border-radius: DraculaTheme.border-radius;
+                        border-width: 2px;
+                        border-color: DraculaTheme.purple;
+                        accessible-role: groupbox;
+                        accessible-label: root.details-title;
+                        VerticalLayout {
+                            padding: DraculaTheme.spacing-lg;
+                            spacing: DraculaTheme.spacing-md;
+                            Text { text: root.details-title; color: DraculaTheme.purple; font-size: 18px; font-weight: 700; wrap: word-wrap; }
+                            Text { text: AppStrings.details-copy-hint; color: DraculaTheme.text-secondary; font-size: 12px; wrap: word-wrap; }
+                            details-text := TextEdit {
+                                text: root.details-content;
+                                read-only: true;
+                                wrap: word-wrap;
+                                accessible-label: root.details-title;
+                                accessible-description: AppStrings.details-copy-hint;
+                                changed has-focus => { root.details-text-has-focus = self.has-focus; }
+                                horizontal-stretch: 1;
+                                vertical-stretch: 1;
+                            }
+                            HorizontalLayout {
+                                alignment: end;
+                                Button { text: AppStrings.close; primary: true; clicked => { root.close-details(); } }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -680,7 +872,7 @@ export component MainWindow inherits Window {
                                     height: parent.height - 2 * DraculaTheme.spacing-md;
                                     text: root.startup-details;
                                     color: DraculaTheme.text-secondary;
-                                    font-size: 11px;
+                                    font-size: 12px;
                                     wrap: word-wrap;
                                 }
                             }
@@ -691,10 +883,14 @@ export component MainWindow inherits Window {
                             }
                             HorizontalLayout {
                                 alignment: end;
-                                LanguageSelector {
+                                startup-language := LanguageSelector {
                                     current-locale: root.current-locale;
                                     selector-enabled: true;
                                     selected(locale) => { root.change-locale(locale); }
+                                    focus-changed(english, french) => {
+                                        root.startup-language-english-has-focus = english;
+                                        root.startup-language-french-has-focus = french;
+                                    }
                                 }
                             }
                             HorizontalLayout {
