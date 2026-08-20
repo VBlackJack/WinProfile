@@ -17,6 +17,12 @@
 import { DraculaTheme } from "theme.slint";
 import { AboutSlint, Button, CheckBox, LineEdit, ListView, ProgressIndicator, ScrollView, TextEdit } from "std-widgets.slint";
 
+export struct ProfileIssueEntry {
+    code: string,
+    summary: string,
+    technical_details: string,
+}
+
 export struct ProfileEntry {
     sid: string,
     canonical_sid: string,
@@ -35,6 +41,7 @@ export struct ProfileEntry {
     repair_blocked_by_lock_inspection: bool,
     state_raw: string,
     anomalies: string,
+    issues: [ProfileIssueEntry],
 }
 
 export struct AuditLogEntry {
@@ -64,6 +71,7 @@ export global AppStrings {
     in-out property <string> scan;
     in-out property <string> total;
     in-out property <string> healthy;
+    in-out property <string> warning;
     in-out property <string> corrupted;
     in-out property <string> temporary;
     in-out property <string> column-account;
@@ -76,6 +84,13 @@ export global AppStrings {
     in-out property <string> yes;
     in-out property <string> no;
     in-out property <string> no-profiles;
+    in-out property <string> selected-details-title;
+    in-out property <string> issue-code;
+    in-out property <string> technical-details;
+    in-out property <string> examine-repair;
+    in-out property <string> prepare-migration;
+    in-out property <string> choose-profile;
+    in-out property <string> choose-profile-instruction;
     in-out property <string> repair-title;
     in-out property <string> target-account;
     in-out property <string> target-sid;
@@ -117,6 +132,8 @@ export global AppStrings {
     in-out property <string> navigation-label;
     in-out property <string> main-content-label;
     in-out property <string> profiles-list-label;
+    in-out property <string> profile-details-label;
+    in-out property <string> profile-issues-list-label;
     in-out property <string> audit-list-label;
     in-out property <string> blockers-list-label;
     in-out property <string> migration-progress-label;
@@ -191,13 +208,17 @@ export component MainWindow inherits Window {
     in-out property <[AuditLogEntry]> audit-entries: [];
     in-out property <int> total-profiles-count: 0;
     in-out property <int> healthy-count: 0;
+    in-out property <int> warning-count: 0;
     in-out property <int> corrupted-count: 0;
     in-out property <int> temp-count: 0;
     in-out property <int> selected-idx: -1;
     in-out property <string> selected-sid;
     in-out property <string> selected-path;
     in-out property <string> selected-username;
+    in-out property <string> selected-account;
+    in-out property <int> selected-health-type: -1;
     in-out property <string> selected-anomalies;
+    in-out property <[ProfileIssueEntry]> selected-issues: [];
     in-out property <[string]> selected-locking-processes: [];
     in-out property <bool> selected-has-locking-processes: false;
     in-out property <string> selected-lock-inspection-failure;
@@ -218,6 +239,7 @@ export component MainWindow inherits Window {
     in-out property <bool> details-visible: false;
     in-out property <string> details-title;
     in-out property <string> details-content;
+    in-out property <string> status-details-content;
     in-out property <bool> startup-visible: true;
     in-out property <bool> startup-busy: true;
     in-out property <string> startup-title;
@@ -232,6 +254,7 @@ export component MainWindow inherits Window {
     out property <bool> language-switch-enabled: root.startup-visible || (!root.operation-busy && !root.modal-visible);
     out property <bool> repair-execution-enabled: root.is-elevated && !root.operation-busy && !root.modal-visible && root.selected-sid != "" && !root.selected-loaded && !root.selected-repair-blocked-by-lock-inspection && (root.repair-fix-bak || root.repair-reset-state);
     property <bool> startup-quit-has-focus: false;
+    property <bool> startup-quit-focus-pending: false;
     out property <bool> startup-quit-focused: root.startup-visible && root.startup-quit-has-focus;
     property <bool> startup-language-english-has-focus: false;
     property <bool> startup-language-french-has-focus: false;
@@ -371,8 +394,9 @@ export component MainWindow inherits Window {
                         height: 82px;
                         StatCard { card-title: AppStrings.total; value: root.total-profiles-count; accent-color: DraculaTheme.cyan; }
                         StatCard { card-title: AppStrings.healthy; value: root.healthy-count; accent-color: DraculaTheme.green; }
-                        StatCard { card-title: AppStrings.corrupted; value: root.corrupted-count; accent-color: DraculaTheme.orange; }
-                        StatCard { card-title: AppStrings.temporary; value: root.temp-count; accent-color: DraculaTheme.red; }
+                        StatCard { card-title: AppStrings.warning; value: root.warning-count; accent-color: DraculaTheme.orange; }
+                        StatCard { card-title: AppStrings.corrupted; value: root.corrupted-count; accent-color: DraculaTheme.red; }
+                        StatCard { card-title: AppStrings.temporary; value: root.temp-count; accent-color: DraculaTheme.purple; }
                     }
                     Rectangle {
                         background: DraculaTheme.card-bg;
@@ -426,6 +450,76 @@ export component MainWindow inherits Window {
                             }
                         }
                     }
+
+                    if root.selected-idx >= 0: Rectangle {
+                    background: DraculaTheme.card-bg;
+                    border-radius: DraculaTheme.border-radius;
+                    border-width: 1px;
+                    border-color: root.selected-health-type == 1 ? DraculaTheme.orange : (root.selected-health-type == 2 ? DraculaTheme.red : DraculaTheme.card-border);
+                    accessible-role: groupbox;
+                    accessible-label: AppStrings.profile-details-label;
+                    VerticalLayout {
+                        padding: DraculaTheme.spacing-md;
+                        spacing: 4px;
+                        Text { text: AppStrings.selected-details-title; color: DraculaTheme.purple; font-size: 17px; font-weight: 700; }
+                        Text { text: AppStrings.target-account + " " + root.selected-account; color: DraculaTheme.foreground; font-weight: 700; wrap: word-wrap; }
+                        Text { text: AppStrings.target-sid + " " + root.selected-sid; color: DraculaTheme.text-secondary; font-size: 12px; wrap: word-wrap; }
+                        Text { text: AppStrings.profile-path + " " + root.selected-path; color: DraculaTheme.cyan; font-size: 12px; wrap: word-wrap; }
+                        Text { text: AppStrings.column-loaded + ": " + (root.selected-loaded ? AppStrings.yes : AppStrings.no); color: DraculaTheme.text-secondary; wrap: word-wrap; }
+                        if root.selected-health-type == 1: Rectangle {
+                            min-height: 52px;
+                            background: #4a3d2a;
+                            border-radius: 6px;
+                            border-width: 2px;
+                            border-color: DraculaTheme.orange;
+                            accessible-role: groupbox;
+                            accessible-label: AppStrings.warning + ": " + root.selected-anomalies;
+                            Text { x: 10px; y: 8px; width: parent.width - 20px; height: parent.height - 16px; text: root.selected-anomalies; color: DraculaTheme.orange; wrap: word-wrap; }
+                        }
+                        if root.selected-issues.length > 0: Rectangle {
+                            accessible-role: list;
+                            accessible-label: AppStrings.profile-issues-list-label;
+                            VerticalLayout {
+                                spacing: DraculaTheme.spacing-sm;
+                                for issue in root.selected-issues: Rectangle {
+                                    min-height: issue.technical_details == "" ? 44px : 112px;
+                                    background: DraculaTheme.current-line;
+                                    border-radius: 4px;
+                                    accessible-role: list-item;
+                                    accessible-label: issue.code + ", " + issue.summary + (issue.technical_details == "" ? "" : ", " + issue.technical_details);
+                                    VerticalLayout {
+                                        padding: 8px;
+                                        spacing: 4px;
+                                        Text { text: AppStrings.issue-code + " " + issue.code; color: DraculaTheme.text-secondary; font-size: 12px; font-weight: 700; }
+                                        Text { text: issue.summary; color: DraculaTheme.orange; font-weight: 700; wrap: word-wrap; }
+                                        if issue.technical_details != "": TextEdit {
+                                            text: issue.technical_details;
+                                            read-only: true;
+                                            height: 54px;
+                                            wrap: word-wrap;
+                                            accessible-label: AppStrings.technical-details + " " + issue.code;
+                                            accessible-description: AppStrings.details-copy-hint;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: DraculaTheme.spacing-md;
+                            Button {
+                                text: AppStrings.examine-repair;
+                                primary: true;
+                                enabled: !root.operation-busy && !root.modal-visible;
+                                clicked => { root.active-tab = 1; }
+                            }
+                            Button {
+                                text: AppStrings.prepare-migration;
+                                enabled: !root.operation-busy && !root.modal-visible;
+                                clicked => { root.active-tab = 2; }
+                            }
+                        }
+                    }
+                }
                 }
 
                 if root.active-tab == 1: VerticalLayout {
@@ -440,6 +534,18 @@ export component MainWindow inherits Window {
                             padding: DraculaTheme.spacing-lg;
                             spacing: DraculaTheme.spacing-md;
                             Text { text: AppStrings.repair-title; color: DraculaTheme.purple; font-size: 17px; font-weight: 700; }
+                            if root.selected-idx < 0: Rectangle {
+                                background: DraculaTheme.current-line;
+                                border-radius: 6px;
+                                accessible-role: groupbox;
+                                accessible-label: AppStrings.choose-profile-instruction;
+                                HorizontalLayout {
+                                    padding: DraculaTheme.spacing-md;
+                                    spacing: DraculaTheme.spacing-md;
+                                    Text { text: AppStrings.choose-profile-instruction; color: DraculaTheme.foreground; wrap: word-wrap; horizontal-stretch: 1; }
+                                    Button { text: AppStrings.choose-profile; primary: true; clicked => { root.active-tab = 0; } }
+                                }
+                            }
                             Rectangle {
                                 background: DraculaTheme.current-line;
                                 border-radius: 6px;
@@ -454,8 +560,8 @@ export component MainWindow inherits Window {
                                 }
                             }
                             Text { text: AppStrings.repair-pipeline; color: DraculaTheme.text-secondary; font-size: 12px; wrap: word-wrap; }
-                            CheckBox { text: AppStrings.fix-bak; checked <=> root.repair-fix-bak; enabled: !root.operation-busy && !root.modal-visible; }
-                            CheckBox { text: AppStrings.reset-state; checked <=> root.repair-reset-state; enabled: !root.operation-busy && !root.modal-visible; }
+                            CheckBox { text: AppStrings.fix-bak; checked <=> root.repair-fix-bak; enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible; }
+                            CheckBox { text: AppStrings.reset-state; checked <=> root.repair-reset-state; enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible; }
                             if root.selected-repair-blocked-by-lock-inspection: Rectangle {
                                 background: #512c35;
                                 border-radius: DraculaTheme.border-radius;
@@ -532,6 +638,18 @@ export component MainWindow inherits Window {
                             padding: DraculaTheme.spacing-lg;
                             spacing: DraculaTheme.spacing-md;
                             Text { text: AppStrings.migration-title; color: DraculaTheme.cyan; font-size: 17px; font-weight: 700; }
+                            if root.selected-idx < 0: Rectangle {
+                                background: DraculaTheme.current-line;
+                                border-radius: 6px;
+                                accessible-role: groupbox;
+                                accessible-label: AppStrings.choose-profile-instruction;
+                                HorizontalLayout {
+                                    padding: DraculaTheme.spacing-md;
+                                    spacing: DraculaTheme.spacing-md;
+                                    Text { text: AppStrings.choose-profile-instruction; color: DraculaTheme.foreground; wrap: word-wrap; horizontal-stretch: 1; }
+                                    Button { text: AppStrings.choose-profile; primary: true; clicked => { root.active-tab = 0; } }
+                                }
+                            }
                             Rectangle {
                                 background: #4a3d2a;
                                 border-radius: 6px;
@@ -548,12 +666,12 @@ export component MainWindow inherits Window {
                                     text <=> root.migration-target-path;
                                     placeholder-text: AppStrings.migration-placeholder;
                                     accessible-label: AppStrings.migration-target;
-                                    enabled: !root.operation-busy && !root.modal-visible;
+                                    enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible;
                                     horizontal-stretch: 1;
                                 }
                             }
-                            CheckBox { text: AppStrings.include-roaming; checked <=> root.migration-include-roaming; enabled: !root.operation-busy && !root.modal-visible; }
-                            CheckBox { text: AppStrings.include-docs; checked <=> root.migration-include-docs; enabled: !root.operation-busy && !root.modal-visible; }
+                            CheckBox { text: AppStrings.include-roaming; checked <=> root.migration-include-roaming; enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible; }
+                            CheckBox { text: AppStrings.include-docs; checked <=> root.migration-include-docs; enabled: root.selected-idx >= 0 && !root.operation-busy && !root.modal-visible; }
                             Text {
                                 text: root.migration-status;
                                 color: DraculaTheme.text-secondary;
@@ -688,7 +806,7 @@ export component MainWindow inherits Window {
                         text: AppStrings.view-details;
                         enabled: root.status-message != "" && !root.modal-visible;
                         changed has-focus => { root.status-details-has-focus = self.has-focus; }
-                        clicked => { root.show-details(AppStrings.status-details-title, root.status-message); }
+                        clicked => { root.show-details(AppStrings.status-details-title, root.status-details-content != "" ? root.status-details-content : root.status-message); }
                     }
                     Text { text: AppStrings.app-version + " | " + AppStrings.app-license; color: DraculaTheme.text-secondary; font-size: 12px; vertical-alignment: center; }
                 }
@@ -844,78 +962,89 @@ export component MainWindow inherits Window {
                     }
                     return reject;
                 }
-                VerticalLayout {
-                    alignment: center;
-                    Rectangle {
-                        width: 680px;
-                        height: 390px;
-                        background: DraculaTheme.card-bg;
-                        border-radius: DraculaTheme.border-radius;
-                        border-width: 2px;
-                        border-color: root.startup-busy ? DraculaTheme.purple : DraculaTheme.orange;
-                        accessible-role: groupbox;
-                        accessible-label: root.startup-title;
-                        VerticalLayout {
-                            padding: DraculaTheme.spacing-lg;
-                            spacing: DraculaTheme.spacing-md;
-                            Text { text: AppStrings.app-title; color: DraculaTheme.purple; font-size: 22px; font-weight: 800; }
-                            Text { text: root.startup-title; color: DraculaTheme.orange; font-size: 19px; font-weight: 700; }
-                            Text { text: root.startup-message; color: DraculaTheme.foreground; wrap: word-wrap; vertical-stretch: 1; }
-                            Rectangle {
-                                background: DraculaTheme.current-line;
-                                border-radius: DraculaTheme.border-radius;
-                                min-height: 92px;
-                                Text {
-                                    x: DraculaTheme.spacing-md;
-                                    y: DraculaTheme.spacing-md;
-                                    width: parent.width - 2 * DraculaTheme.spacing-md;
-                                    height: parent.height - 2 * DraculaTheme.spacing-md;
-                                    text: root.startup-details;
-                                    color: DraculaTheme.text-secondary;
-                                    font-size: 12px;
-                                    wrap: word-wrap;
-                                }
+                Rectangle {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 680px;
+                    height: 390px;
+                    background: DraculaTheme.card-bg;
+                    border-radius: DraculaTheme.border-radius;
+                    border-width: 2px;
+                    border-color: root.startup-busy ? DraculaTheme.purple : DraculaTheme.orange;
+                    accessible-role: groupbox;
+                    accessible-label: root.startup-title;
+                    VerticalLayout {
+                        padding: DraculaTheme.spacing-lg;
+                        spacing: DraculaTheme.spacing-md;
+                        Text { text: AppStrings.app-title; color: DraculaTheme.purple; font-size: 22px; font-weight: 800; }
+                        Text { text: root.startup-title; color: DraculaTheme.orange; font-size: 19px; font-weight: 700; }
+                        Text { text: root.startup-message; color: DraculaTheme.foreground; wrap: word-wrap; vertical-stretch: 1; }
+                        Rectangle {
+                            background: DraculaTheme.current-line;
+                            border-radius: DraculaTheme.border-radius;
+                            min-height: 92px;
+                            Text {
+                                x: DraculaTheme.spacing-md;
+                                y: DraculaTheme.spacing-md;
+                                width: parent.width - 2 * DraculaTheme.spacing-md;
+                                height: parent.height - 2 * DraculaTheme.spacing-md;
+                                text: root.startup-details;
+                                color: DraculaTheme.text-secondary;
+                                font-size: 12px;
+                                wrap: word-wrap;
                             }
-                            if root.startup-consent-required: CheckBox {
-                                text: root.startup-consent-text;
-                                checked <=> root.startup-consent-granted;
-                                enabled: !root.startup-busy;
-                            }
-                            HorizontalLayout {
-                                alignment: end;
-                                startup-language := LanguageSelector {
-                                    current-locale: root.current-locale;
-                                    selector-enabled: true;
-                                    selected(locale) => { root.change-locale(locale); }
-                                    focus-changed(english, french) => {
-                                        root.startup-language-english-has-focus = english;
-                                        root.startup-language-french-has-focus = french;
-                                    }
-                                }
-                            }
-                            HorizontalLayout {
-                                alignment: end;
-                                spacing: DraculaTheme.spacing-md;
-                                startup-quit-button := Button {
-                                    text: root.startup-quit-text;
-                                    enabled: !root.startup-busy;
-                                    primary: true;
-                                    changed enabled => { if self.enabled { self.focus(); } }
-                                    changed has-focus => { root.startup-quit-has-focus = self.has-focus; }
-                                    clicked => { root.startup-quit(); }
-                                }
-                                Button {
-                                    text: AppStrings.about;
-                                    enabled: !root.startup-busy;
-                                    clicked => { root.about-visible = true; }
-                                }
-                                Button {
-                                    text: root.startup-action-text;
-                                    enabled: !root.startup-busy && (!root.startup-consent-required || root.startup-consent-granted);
-                                    clicked => { root.startup-proceed(); }
+                        }
+                        if root.startup-consent-required: CheckBox {
+                            text: root.startup-consent-text;
+                            checked <=> root.startup-consent-granted;
+                            enabled: !root.startup-busy;
+                        }
+                        HorizontalLayout {
+                            alignment: end;
+                            startup-language := LanguageSelector {
+                                current-locale: root.current-locale;
+                                selector-enabled: true;
+                                selected(locale) => { root.change-locale(locale); }
+                                focus-changed(english, french) => {
+                                    root.startup-language-english-has-focus = english;
+                                    root.startup-language-french-has-focus = french;
                                 }
                             }
                         }
+                        HorizontalLayout {
+                            alignment: end;
+                            spacing: DraculaTheme.spacing-md;
+                            startup-quit-button := Button {
+                                text: root.startup-quit-text;
+                                enabled: !root.startup-busy;
+                                primary: true;
+                                changed enabled => {
+                                    if self.enabled {
+                                        root.startup-quit-focus-pending = true;
+                                    }
+                                }
+                                changed has-focus => { root.startup-quit-has-focus = self.has-focus; }
+                                clicked => { root.startup-quit(); }
+                            }
+                            Button {
+                                text: AppStrings.about;
+                                enabled: !root.startup-busy;
+                                clicked => { root.about-visible = true; }
+                            }
+                            Button {
+                                text: root.startup-action-text;
+                                enabled: !root.startup-busy && (!root.startup-consent-required || root.startup-consent-granted);
+                                clicked => { root.startup-proceed(); }
+                            }
+                        }
+                    }
+                }
+                Timer {
+                    interval: 0ms;
+                    running: root.startup-quit-focus-pending;
+                    triggered => {
+                        root.startup-quit-focus-pending = false;
+                        startup-quit-button.focus();
                     }
                 }
             }

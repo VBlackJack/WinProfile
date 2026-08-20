@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use app_ui::{AppStrings, AuditLogEntry, MainWindow, ProfileEntry};
+use app_ui::{AppStrings, AuditLogEntry, MainWindow, ProfileEntry, ProfileIssueEntry};
 use i_slint_backend_testing::{AccessibleLiveness, AccessibleRole, ElementHandle, ElementQuery};
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use std::collections::BTreeSet;
@@ -118,6 +118,11 @@ fn verify_static_and_runtime_contract(ui: &MainWindow) {
     assert!(ui_source.contains("min-height: 480px;"));
     assert!(ui_source.contains("preferred-width: 1040px;"));
     assert!(ui_source.contains("preferred-height: 680px;"));
+    assert!(ui_source.contains("x: (parent.width - self.width) / 2;"));
+    assert!(ui_source.contains("width: 680px;"));
+    assert!(ui_source.contains("height: 390px;"));
+    assert!(ui_source.contains("startup-quit-focus-pending"));
+    assert!(ui_source.contains("interval: 0ms;"));
     assert!(!ui_source.contains("accessible-live:"));
 
     let repair_source = include_str!("../../core-profiles/src/repair.rs");
@@ -171,6 +176,12 @@ fn critical_accessibility_contract_is_present_in_the_runtime_tree() {
 
     let profile_accessible_label =
         "LockedUser, S-1-5-21-4242.bak, C:\\Users\\LockedUser, NTUSER.DAT locked, No";
+    let raw_issue_details = "RAW-RM-CAUSE-0xC0000022\nEditor.exe (PID: 4242)";
+    let issues = ModelRc::from(Rc::new(VecModel::from(vec![ProfileIssueEntry {
+        code: "LOCK_INSPECTION_FAILURE".into(),
+        summary: "Lock inspection failed".into(),
+        technical_details: raw_issue_details.into(),
+    }])));
     ui.set_profiles(ModelRc::from(Rc::new(VecModel::from(vec![ProfileEntry {
         sid: "S-1-5-21-4242.bak".into(),
         canonical_sid: "S-1-5-21-4242".into(),
@@ -192,16 +203,87 @@ fn critical_accessibility_contract_is_present_in_the_runtime_tree() {
         repair_blocked_by_lock_inspection: true,
         state_raw: "0x0000".into(),
         anomalies: "NTUSER.DAT locked".into(),
+        issues: issues.clone(),
     }]))));
     assert!(
         ElementHandle::find_by_accessible_label(&ui, profile_accessible_label)
             .any(|element| element.accessible_role() == Some(AccessibleRole::ListItem))
     );
 
-    ui.set_active_tab(1);
+    ui.set_selected_idx(0);
     ui.set_selected_sid("S-1-5-21-4242.bak".into());
     ui.set_selected_path("C:\\Users\\LockedUser".into());
     ui.set_selected_username("LockedUser".into());
+    ui.set_selected_account("TEST\\LockedUser".into());
+    ui.set_selected_health_type(1);
+    ui.set_selected_anomalies("NTUSER.DAT locked".into());
+    ui.set_selected_issues(issues);
+    let profile_details = labeled_element(
+        &ui,
+        AccessibleRole::Groupbox,
+        strings.get_profile_details_label().as_str(),
+    );
+    assert!(profile_details.size().height > 0.0);
+    let warning_card = labeled_element(
+        &ui,
+        AccessibleRole::Groupbox,
+        &format!("{}: NTUSER.DAT locked", strings.get_warning()),
+    );
+    assert!(warning_card.size().height > 0.0);
+    let issue_list = labeled_element(
+        &ui,
+        AccessibleRole::List,
+        strings.get_profile_issues_list_label().as_str(),
+    );
+    assert_eq!(
+        issue_list
+            .query_descendants()
+            .match_accessible_role(AccessibleRole::ListItem)
+            .find_all()
+            .len(),
+        1
+    );
+    let technical_details = labeled_element(
+        &ui,
+        AccessibleRole::TextInput,
+        &format!(
+            "{} LOCK_INSPECTION_FAILURE",
+            strings.get_technical_details()
+        ),
+    );
+    assert_eq!(
+        technical_details.accessible_value().as_deref(),
+        Some(raw_issue_details)
+    );
+    assert_eq!(technical_details.accessible_read_only(), Some(true));
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, strings.get_examine_repair().as_str())
+            .any(|element| element.accessible_role() == Some(AccessibleRole::Button))
+    );
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, strings.get_prepare_migration().as_str())
+            .any(|element| element.accessible_role() == Some(AccessibleRole::Button))
+    );
+
+    ui.set_selected_idx(-1);
+    ui.set_active_tab(1);
+    assert!(ElementHandle::find_by_accessible_label(
+        &ui,
+        strings.get_choose_profile_instruction().as_str()
+    )
+    .any(|element| element.accessible_role() == Some(AccessibleRole::Groupbox)));
+    assert!(
+        ElementHandle::find_by_accessible_label(&ui, strings.get_choose_profile().as_str())
+            .any(|element| element.accessible_role() == Some(AccessibleRole::Button))
+    );
+    ui.set_active_tab(2);
+    assert!(ElementHandle::find_by_accessible_label(
+        &ui,
+        strings.get_choose_profile_instruction().as_str()
+    )
+    .any(|element| element.accessible_role() == Some(AccessibleRole::Groupbox)));
+    ui.set_selected_idx(0);
+    ui.set_active_tab(1);
     ui.set_selected_locking_processes(ModelRc::from(Rc::new(VecModel::from(vec![
         SharedString::from("Editor.exe (PID: 4242)"),
         SharedString::from("Sync.exe (PID: 4343)"),

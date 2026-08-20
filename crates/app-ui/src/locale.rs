@@ -119,6 +119,7 @@ pub fn apply_app_strings(ui: &MainWindow) {
     strings.set_scan(t("dashboard.scan_btn").into());
     strings.set_total(t("dashboard.total_profiles").into());
     strings.set_healthy(t("dashboard.healthy_profiles").into());
+    strings.set_warning(t("dashboard.warning_profiles").into());
     strings.set_corrupted(t("dashboard.corrupted_profiles").into());
     strings.set_temporary(t("dashboard.temporary_profiles").into());
     strings.set_column_account(t("dashboard.column.username").into());
@@ -131,6 +132,13 @@ pub fn apply_app_strings(ui: &MainWindow) {
     strings.set_yes(t("common.yes").into());
     strings.set_no(t("common.no").into());
     strings.set_no_profiles(t("dashboard.no_profiles").into());
+    strings.set_selected_details_title(t("dashboard.selected_details").into());
+    strings.set_issue_code(t("dashboard.issue_code").into());
+    strings.set_technical_details(t("dashboard.technical_details").into());
+    strings.set_examine_repair(t("dashboard.action.examine_repair").into());
+    strings.set_prepare_migration(t("dashboard.action.prepare_migration").into());
+    strings.set_choose_profile(t("dashboard.action.choose_profile").into());
+    strings.set_choose_profile_instruction(t("dashboard.choose_profile_instruction").into());
     strings.set_repair_title(t("repair.title").into());
     strings.set_target_account(t("repair.target_account").into());
     strings.set_target_sid(t("repair.target_sid").into());
@@ -172,6 +180,8 @@ pub fn apply_app_strings(ui: &MainWindow) {
     strings.set_navigation_label(t("accessibility.navigation").into());
     strings.set_main_content_label(t("accessibility.main_content").into());
     strings.set_profiles_list_label(t("accessibility.profiles_list").into());
+    strings.set_profile_details_label(t("accessibility.profile_details").into());
+    strings.set_profile_issues_list_label(t("accessibility.profile_issues_list").into());
     strings.set_audit_list_label(t("accessibility.audit_list").into());
     strings.set_blockers_list_label(t("accessibility.blockers_list").into());
     strings.set_migration_progress_label(t("accessibility.migration_progress").into());

@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use audit_journal::{AuditEntry, AuditLogger, AuditStatus, SnapshotEngine};
+use chrono::{DateTime, Utc};
 use core_profiles::{
     t, t_args, DiagnosticReport, MigrationError, MigrationPlan, ProfileMigrationEngine,
     ProfileRepairEngine, ProfileScanner, RepairPlan,
@@ -77,6 +78,210 @@ enum MigrationTerminalPresentation {
     Error {
         details: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorStatusOperation {
+    Application,
+    Scan,
+    Repair,
+    Migration,
+    TrustedInstaller,
+    Export,
+    Audit,
+}
+
+impl OperatorStatusOperation {
+    fn localization_key(self) -> &'static str {
+        match self {
+            Self::Application => "status.operation.application",
+            Self::Scan => "status.operation.scan",
+            Self::Repair => "status.operation.repair",
+            Self::Migration => "status.operation.migration",
+            Self::TrustedInstaller => "status.operation.trusted_installer",
+            Self::Export => "status.operation.export",
+            Self::Audit => "status.operation.audit",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorStatusOutcome {
+    Ready,
+    Running,
+    Success,
+    Warning,
+    Failed,
+    Cancelled,
+}
+
+impl OperatorStatusOutcome {
+    fn localization_key(self) -> &'static str {
+        match self {
+            Self::Ready => "status.outcome.ready",
+            Self::Running => "status.outcome.running",
+            Self::Success => "status.outcome.success",
+            Self::Warning => "status.outcome.warning",
+            Self::Failed => "status.outcome.failed",
+            Self::Cancelled => "status.outcome.cancelled",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OperatorStatusPayload {
+    Localized {
+        key: &'static str,
+        arguments: Vec<(String, String)>,
+    },
+    ScanSummary {
+        total: usize,
+        warnings: usize,
+        corrupted: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OperatorStatus {
+    operation: OperatorStatusOperation,
+    outcome: OperatorStatusOutcome,
+    target: String,
+    timestamp: DateTime<Utc>,
+    payload: OperatorStatusPayload,
+    raw_details: Option<String>,
+    recovery_hint_key: Option<&'static str>,
+}
+
+impl OperatorStatus {
+    fn localized(
+        operation: OperatorStatusOperation,
+        outcome: OperatorStatusOutcome,
+        target: impl Into<String>,
+        key: &'static str,
+        arguments: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            operation,
+            outcome,
+            target: target.into(),
+            timestamp: Utc::now(),
+            payload: OperatorStatusPayload::Localized { key, arguments },
+            raw_details: None,
+            recovery_hint_key: None,
+        }
+    }
+
+    fn failure(
+        operation: OperatorStatusOperation,
+        target: impl Into<String>,
+        raw_details: impl Into<String>,
+        recovery_hint_key: Option<&'static str>,
+    ) -> Self {
+        Self {
+            operation,
+            outcome: OperatorStatusOutcome::Failed,
+            target: target.into(),
+            timestamp: Utc::now(),
+            payload: OperatorStatusPayload::Localized {
+                key: "status.operator.failed",
+                arguments: Vec::new(),
+            },
+            raw_details: Some(raw_details.into()),
+            recovery_hint_key,
+        }
+    }
+
+    fn scan_completed(report: &DiagnosticReport) -> Self {
+        let has_issues = report.warning_count > 0 || report.corrupted_count > 0;
+        Self {
+            operation: OperatorStatusOperation::Scan,
+            outcome: if has_issues {
+                OperatorStatusOutcome::Warning
+            } else {
+                OperatorStatusOutcome::Success
+            },
+            target: "System".to_string(),
+            timestamp: report.timestamp,
+            payload: OperatorStatusPayload::ScanSummary {
+                total: report.total_count,
+                warnings: report.warning_count,
+                corrupted: report.corrupted_count,
+            },
+            raw_details: None,
+            recovery_hint_key: if has_issues {
+                Some("status.recovery.review_issues")
+            } else {
+                None
+            },
+        }
+    }
+
+    fn render_summary(&self) -> String {
+        match &self.payload {
+            OperatorStatusPayload::Localized { key, arguments } => {
+                let arguments = arguments
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect::<Vec<_>>();
+                t_args(key, &arguments)
+            }
+            OperatorStatusPayload::ScanSummary {
+                total,
+                warnings,
+                corrupted,
+            } => {
+                let total = total.to_string();
+                let warnings = warnings.to_string();
+                let corrupted = corrupted.to_string();
+                let key = if self.outcome == OperatorStatusOutcome::Warning {
+                    "status.scan.warning"
+                } else {
+                    "status.scan.success"
+                };
+                t_args(
+                    key,
+                    &[
+                        ("total", total.as_str()),
+                        ("warnings", warnings.as_str()),
+                        ("corrupted", corrupted.as_str()),
+                    ],
+                )
+            }
+        }
+    }
+
+    fn render_details(&self) -> String {
+        let mut lines = vec![
+            format!(
+                "{}: {}",
+                t("status.details.operation"),
+                t(self.operation.localization_key())
+            ),
+            format!(
+                "{}: {}",
+                t("status.details.outcome"),
+                t(self.outcome.localization_key())
+            ),
+            format!("{}: {}", t("status.details.target"), self.target),
+            format!(
+                "{}: {}",
+                t("status.details.timestamp"),
+                self.timestamp.format("%Y-%m-%d %H:%M:%SZ")
+            ),
+            format!("{}: {}", t("status.details.summary"), self.render_summary()),
+        ];
+        if let Some(raw_details) = self.raw_details.as_ref() {
+            lines.push(format!(
+                "{}:\n{}",
+                t("status.details.technical"),
+                raw_details
+            ));
+        }
+        if let Some(key) = self.recovery_hint_key {
+            lines.push(format!("{}: {}", t("status.details.recovery"), t(key)));
+        }
+        lines.join("\n")
+    }
 }
 
 impl MigrationTerminalPresentation {
@@ -280,6 +485,17 @@ impl OperationKind {
             Self::Idle => ClosePolicy::Allow,
         }
     }
+
+    fn status_operation(self) -> OperatorStatusOperation {
+        match self {
+            Self::Scan => OperatorStatusOperation::Scan,
+            Self::Repair => OperatorStatusOperation::Repair,
+            Self::Migration => OperatorStatusOperation::Migration,
+            Self::TrustedInstaller => OperatorStatusOperation::TrustedInstaller,
+            Self::Export => OperatorStatusOperation::Export,
+            Self::Idle | Self::Unknown => OperatorStatusOperation::Application,
+        }
+    }
 }
 
 struct OperationState {
@@ -343,6 +559,7 @@ pub struct AppController {
     last_report: Mutex<Option<DiagnosticReport>>,
     last_audit_entries: Mutex<Option<Vec<AuditEntry>>>,
     last_migration_terminal: Mutex<Option<MigrationTerminalPresentation>>,
+    last_operator_status: Mutex<OperatorStatus>,
     #[cfg(test)]
     scanner_calls: AtomicUsize,
     #[cfg(test)]
@@ -359,6 +576,13 @@ impl AppController {
             last_report: Mutex::new(None),
             last_audit_entries: Mutex::new(None),
             last_migration_terminal: Mutex::new(None),
+            last_operator_status: Mutex::new(OperatorStatus::localized(
+                OperatorStatusOperation::Application,
+                OperatorStatusOutcome::Ready,
+                "WinProfile",
+                "status.ready",
+                Vec::new(),
+            )),
             #[cfg(test)]
             scanner_calls: AtomicUsize::new(0),
             #[cfg(test)]
@@ -389,6 +613,11 @@ impl AppController {
             .lock()
             .map_err(|_| "migration status cache is unavailable".to_string())?
             .clone();
+        let operator_status = self
+            .last_operator_status
+            .lock()
+            .map_err(|_| "operator status cache is unavailable".to_string())?
+            .clone();
 
         crate::locale::set_locale_and_app_strings(ui, locale).map_err(|error| error.to_string())?;
         if let Some(report) = report.as_ref() {
@@ -400,7 +629,7 @@ impl AppController {
         if let Some(presentation) = migration_terminal.as_ref() {
             ui.set_migration_status(presentation.render().into());
         }
-        ui.set_status_message(t("status.ready").into());
+        apply_operator_status(ui, &operator_status);
         Ok(true)
     }
 
@@ -409,7 +638,16 @@ impl AppController {
         if !self.begin_operation(ui, OperationKind::Scan) {
             return;
         }
-        ui.set_status_message(t("status.scanning").into());
+        self.publish_operator_status(
+            ui,
+            OperatorStatus::localized(
+                OperatorStatusOperation::Scan,
+                OperatorStatusOutcome::Running,
+                "System",
+                "status.scanning",
+                Vec::new(),
+            ),
+        );
         let controller = Arc::clone(self);
         let weak = ui.as_weak();
         std::thread::spawn(move || {
@@ -418,10 +656,14 @@ impl AppController {
                     "ProfileScan",
                     "WinProfile-Admin",
                     "System",
-                    AuditStatus::Success,
+                    scan_audit_status(&report),
                     format!(
-                        "Discovered {} profiles ({} healthy, {} corrupted)",
-                        report.total_count, report.healthy_count, report.corrupted_count
+                        "Discovered {} profiles ({} healthy, {} warnings, {} corrupted, {} temporary transversal)",
+                        report.total_count,
+                        report.healthy_count,
+                        report.warning_count,
+                        report.corrupted_count,
+                        report.temporary_count
                     ),
                 ) {
                     Ok(()) => Ok(report),
@@ -454,17 +696,7 @@ impl AppController {
     pub fn select_profile(&self, ui: &MainWindow, index: usize) {
         if let Some(profile) = ui.get_profiles().row_data(index) {
             ui.set_selected_idx(index as i32);
-            ui.set_selected_sid(profile.sid.clone());
-            ui.set_selected_path(profile.profile_path.clone());
-            ui.set_selected_username(profile.username.clone());
-            ui.set_selected_anomalies(profile.anomalies.clone());
-            ui.set_selected_locking_processes(profile.locking_processes.clone());
-            ui.set_selected_has_locking_processes(profile.has_locking_processes);
-            ui.set_selected_lock_inspection_failure(profile.lock_inspection_failure.clone());
-            ui.set_selected_repair_blocked_by_lock_inspection(
-                profile.repair_blocked_by_lock_inspection,
-            );
-            ui.set_selected_loaded(profile.loaded);
+            apply_selected_profile(ui, &profile);
             ui.set_repair_fix_bak(profile.suggest_fix_bak);
             ui.set_repair_reset_state(profile.suggest_reset_state);
         }
@@ -473,16 +705,34 @@ impl AppController {
     /// Builds a localized, explicit confirmation for the selected repair actions.
     pub fn request_repair_confirmation(&self, ui: &MainWindow) {
         if ui.get_selected_repair_blocked_by_lock_inspection() {
-            ui.set_status_message(t("repair.locked.status").into());
+            self.publish_localized_status(
+                ui,
+                OperatorStatusOperation::Repair,
+                OperatorStatusOutcome::Warning,
+                ui.get_selected_sid().to_string(),
+                "repair.locked.status",
+            );
             return;
         }
         if ui.get_selected_sid().is_empty() {
-            ui.set_status_message(t("error.profile_not_selected").into());
+            self.publish_localized_status(
+                ui,
+                OperatorStatusOperation::Repair,
+                OperatorStatusOutcome::Warning,
+                "Inventory",
+                "error.profile_not_selected",
+            );
             return;
         }
         let actions = selected_repair_actions(ui);
         if actions.is_empty() {
-            ui.set_status_message(t("error.no_repair_action").into());
+            self.publish_localized_status(
+                ui,
+                OperatorStatusOperation::Repair,
+                OperatorStatusOutcome::Warning,
+                ui.get_selected_sid().to_string(),
+                "error.no_repair_action",
+            );
             return;
         }
         let actions_text = actions.join(", ");
@@ -510,10 +760,18 @@ impl AppController {
     /// Executes the selected repair plan on a worker thread.
     pub fn execute_repair(self: &Arc<Self>, ui: &MainWindow, dry_run: bool) {
         if ui.get_selected_repair_blocked_by_lock_inspection() {
-            ui.set_status_message(t("repair.locked.status").into());
+            self.publish_localized_status(
+                ui,
+                OperatorStatusOperation::Repair,
+                OperatorStatusOutcome::Warning,
+                ui.get_selected_sid().to_string(),
+                "repair.locked.status",
+            );
             return;
         }
-        if !require_elevation(ui) || !self.begin_operation(ui, OperationKind::Repair) {
+        if !self.require_elevation(ui, OperatorStatusOperation::Repair)
+            || !self.begin_operation(ui, OperationKind::Repair)
+        {
             return;
         }
         let plan = RepairPlan {
@@ -526,7 +784,17 @@ impl AppController {
             dry_run,
         };
         let is_loaded = ui.get_selected_loaded();
-        ui.set_status_message(t("status.repairing").into());
+        let status_target = plan.sid.clone();
+        self.publish_operator_status(
+            ui,
+            OperatorStatus::localized(
+                OperatorStatusOperation::Repair,
+                OperatorStatusOutcome::Running,
+                status_target.clone(),
+                "status.repairing",
+                Vec::new(),
+            ),
+        );
         let controller = Arc::clone(self);
         let weak = ui.as_weak();
         std::thread::spawn(move || {
@@ -553,23 +821,55 @@ impl AppController {
                     Ok(()) => match report {
                         Some(Ok(report)) => {
                             match controller.cache_and_apply_report(&ui, report, true) {
-                                Ok(()) => ui.set_status_message(t("repair.success.message").into()),
-                                Err(error) => set_error(&ui, &error),
+                                Ok(()) => controller.publish_operator_status(
+                                    &ui,
+                                    OperatorStatus::localized(
+                                        OperatorStatusOperation::Repair,
+                                        OperatorStatusOutcome::Success,
+                                        status_target.clone(),
+                                        "repair.success.message",
+                                        Vec::new(),
+                                    ),
+                                ),
+                                Err(error) => controller.publish_failure(
+                                    &ui,
+                                    OperatorStatusOperation::Repair,
+                                    status_target.clone(),
+                                    error,
+                                    Some("status.recovery.retry"),
+                                ),
                             }
                         }
                         Some(Err(error)) => {
-                            let success = t("repair.success.message");
-                            ui.set_status_message(
-                                t_args(
-                                    "status.refresh_failed",
-                                    &[("success", success.as_str()), ("error", error.as_str())],
-                                )
-                                .into(),
+                            let mut status = OperatorStatus::localized(
+                                OperatorStatusOperation::Repair,
+                                OperatorStatusOutcome::Warning,
+                                status_target.clone(),
+                                "status.repair_refresh_warning",
+                                Vec::new(),
                             );
+                            status.raw_details = Some(error);
+                            status.recovery_hint_key = Some("status.recovery.retry");
+                            controller.publish_operator_status(&ui, status);
                         }
-                        None => ui.set_status_message(t("status.completed").into()),
+                        None => controller.publish_operator_status(
+                            &ui,
+                            OperatorStatus::localized(
+                                OperatorStatusOperation::Repair,
+                                OperatorStatusOutcome::Success,
+                                status_target.clone(),
+                                "status.completed",
+                                Vec::new(),
+                            ),
+                        ),
                     },
-                    Err(error) => set_error(&ui, &error),
+                    Err(error) => controller.publish_failure(
+                        &ui,
+                        OperatorStatusOperation::Repair,
+                        status_target,
+                        error,
+                        Some("status.recovery.retry"),
+                    ),
                 }
                 controller.apply_audit_result(&ui, audit_entries);
             }) {
@@ -581,10 +881,18 @@ impl AppController {
     /// Starts a verified, cancellable migration on a worker thread.
     pub fn start_migration(self: &Arc<Self>, ui: &MainWindow) {
         if let Err(message_key) = validate_migration_source(ui.get_selected_loaded()) {
-            ui.set_status_message(t(message_key).into());
+            self.publish_localized_status(
+                ui,
+                OperatorStatusOperation::Migration,
+                OperatorStatusOutcome::Warning,
+                ui.get_selected_path().to_string(),
+                message_key,
+            );
             return;
         }
-        if !require_elevation(ui) || !self.begin_operation(ui, OperationKind::Migration) {
+        if !self.require_elevation(ui, OperatorStatusOperation::Migration)
+            || !self.begin_operation(ui, OperationKind::Migration)
+        {
             return;
         }
         let plan = MigrationPlan {
@@ -600,7 +908,13 @@ impl AppController {
         {
             self.finish_operation();
             ui.set_operation_busy(false);
-            ui.set_status_message(t("error.migration_scope").into());
+            self.publish_localized_status(
+                ui,
+                OperatorStatusOperation::Migration,
+                OperatorStatusOutcome::Warning,
+                plan.source_path,
+                "error.migration_scope",
+            );
             return;
         }
 
@@ -615,13 +929,29 @@ impl AppController {
             Err(_) => {
                 self.finish_operation();
                 ui.set_operation_busy(false);
-                set_error(ui, "migration cancellation state is unavailable");
+                self.publish_failure(
+                    ui,
+                    OperatorStatusOperation::Migration,
+                    plan.source_path,
+                    "migration cancellation state is unavailable",
+                    Some("status.recovery.retry"),
+                );
                 return;
             }
         }
+        let status_target = plan.source_path.clone();
         ui.set_migration_running(true);
         ui.set_migration_progress(0.0);
-        ui.set_status_message(t("status.migrating").into());
+        self.publish_operator_status(
+            ui,
+            OperatorStatus::localized(
+                OperatorStatusOperation::Migration,
+                OperatorStatusOutcome::Running,
+                status_target.clone(),
+                "status.migrating",
+                Vec::new(),
+            ),
+        );
 
         let controller = Arc::clone(self);
         let weak = ui.as_weak();
@@ -661,19 +991,38 @@ impl AppController {
                 ui.set_migration_running(false);
                 match result {
                     Ok(receipt) => {
+                        let files = receipt.copied_files;
+                        let bytes = receipt.copied_bytes;
+                        let manifest_hash =
+                            receipt.manifest_sha256.chars().take(16).collect::<String>();
                         let presentation = MigrationTerminalPresentation::Success {
-                            files: receipt.copied_files,
-                            bytes: receipt.copied_bytes,
-                            manifest_hash: receipt
-                                .manifest_sha256
-                                .chars()
-                                .take(16)
-                                .collect::<String>(),
+                            files,
+                            bytes,
+                            manifest_hash: manifest_hash.clone(),
                         };
                         ui.set_migration_progress(1.0);
                         match controller.cache_and_apply_migration_terminal(&ui, presentation) {
-                            Ok(message) => ui.set_status_message(message.into()),
-                            Err(error) => set_error(&ui, &error),
+                            Ok(_) => controller.publish_operator_status(
+                                &ui,
+                                OperatorStatus::localized(
+                                    OperatorStatusOperation::Migration,
+                                    OperatorStatusOutcome::Success,
+                                    status_target.clone(),
+                                    "migration.success",
+                                    vec![
+                                        ("files".to_string(), files.to_string()),
+                                        ("bytes".to_string(), bytes.to_string()),
+                                        ("hash".to_string(), manifest_hash),
+                                    ],
+                                ),
+                            ),
+                            Err(error) => controller.publish_failure(
+                                &ui,
+                                OperatorStatusOperation::Migration,
+                                status_target.clone(),
+                                error,
+                                Some("status.recovery.retry"),
+                            ),
                         }
                     }
                     Err(MigrationError::Cancelled) => {
@@ -681,8 +1030,23 @@ impl AppController {
                             &ui,
                             MigrationTerminalPresentation::Cancelled,
                         ) {
-                            Ok(message) => ui.set_status_message(message.into()),
-                            Err(error) => set_error(&ui, &error),
+                            Ok(_) => controller.publish_operator_status(
+                                &ui,
+                                OperatorStatus::localized(
+                                    OperatorStatusOperation::Migration,
+                                    OperatorStatusOutcome::Cancelled,
+                                    status_target.clone(),
+                                    "status.cancelled",
+                                    Vec::new(),
+                                ),
+                            ),
+                            Err(error) => controller.publish_failure(
+                                &ui,
+                                OperatorStatusOperation::Migration,
+                                status_target.clone(),
+                                error,
+                                Some("status.recovery.retry"),
+                            ),
                         }
                     }
                     Err(error) => {
@@ -693,9 +1057,21 @@ impl AppController {
                                 details: details.clone(),
                             },
                         ) {
-                            set_error(&ui, &cache_error);
+                            controller.publish_failure(
+                                &ui,
+                                OperatorStatusOperation::Migration,
+                                status_target.clone(),
+                                cache_error,
+                                Some("status.recovery.retry"),
+                            );
                         } else {
-                            set_error(&ui, &details);
+                            controller.publish_failure(
+                                &ui,
+                                OperatorStatusOperation::Migration,
+                                status_target.clone(),
+                                details,
+                                Some("status.recovery.retry"),
+                            );
                         }
                     }
                 }
@@ -717,10 +1093,22 @@ impl AppController {
             Ok(slot) => {
                 if let Some(cancellation) = slot.as_ref() {
                     cancellation.store(true, Ordering::Release);
-                    ui.set_status_message(t("status.cancelling").into());
+                    self.publish_localized_status(
+                        ui,
+                        OperatorStatusOperation::Migration,
+                        OperatorStatusOutcome::Running,
+                        ui.get_selected_path().to_string(),
+                        "status.cancelling",
+                    );
                 }
             }
-            Err(_) => set_error(ui, "migration cancellation state is unavailable"),
+            Err(_) => self.publish_failure(
+                ui,
+                OperatorStatusOperation::Migration,
+                ui.get_selected_path().to_string(),
+                "migration cancellation state is unavailable",
+                Some("status.recovery.retry"),
+            ),
         }
     }
 
@@ -730,7 +1118,13 @@ impl AppController {
         match operation.close_policy() {
             ClosePolicy::Allow => CloseRequestResponse::HideWindow,
             ClosePolicy::Block => {
-                ui.set_status_message(t("status.close_blocked_repair").into());
+                self.publish_localized_status(
+                    ui,
+                    operation.status_operation(),
+                    OperatorStatusOutcome::Warning,
+                    "WinProfile",
+                    "status.close_blocked_repair",
+                );
                 CloseRequestResponse::KeepWindowShown
             }
             ClosePolicy::CancelMigration => {
@@ -740,9 +1134,21 @@ impl AppController {
                         if let Some(cancellation) = slot.as_ref() {
                             cancellation.store(true, Ordering::Release);
                         }
-                        ui.set_status_message(t("status.cancelling").into());
+                        self.publish_localized_status(
+                            ui,
+                            OperatorStatusOperation::Migration,
+                            OperatorStatusOutcome::Running,
+                            ui.get_selected_path().to_string(),
+                            "status.cancelling",
+                        );
                     }
-                    Err(_) => set_error(ui, "migration cancellation state is unavailable"),
+                    Err(_) => self.publish_failure(
+                        ui,
+                        OperatorStatusOperation::Migration,
+                        ui.get_selected_path().to_string(),
+                        "migration cancellation state is unavailable",
+                        Some("status.recovery.retry"),
+                    ),
                 }
                 CloseRequestResponse::KeepWindowShown
             }
@@ -751,10 +1157,21 @@ impl AppController {
 
     /// Launches an audited TrustedInstaller console on a worker thread.
     pub fn launch_ti_console(self: &Arc<Self>, ui: &MainWindow) {
-        if !require_elevation(ui) || !self.begin_operation(ui, OperationKind::TrustedInstaller) {
+        if !self.require_elevation(ui, OperatorStatusOperation::TrustedInstaller)
+            || !self.begin_operation(ui, OperationKind::TrustedInstaller)
+        {
             return;
         }
-        ui.set_status_message(t("status.launching_ti").into());
+        self.publish_operator_status(
+            ui,
+            OperatorStatus::localized(
+                OperatorStatusOperation::TrustedInstaller,
+                OperatorStatusOutcome::Running,
+                TI_AUDIT_TARGET,
+                "status.launching_ti",
+                Vec::new(),
+            ),
+        );
         let controller = Arc::clone(self);
         let weak = ui.as_weak();
         std::thread::spawn(move || {
@@ -778,11 +1195,24 @@ impl AppController {
                 match audited_result {
                     Ok(pid) => {
                         let pid_text = pid.to_string();
-                        ui.set_status_message(
-                            t_args("status.ti_success", &[("pid", pid_text.as_str())]).into(),
+                        controller.publish_operator_status(
+                            &ui,
+                            OperatorStatus::localized(
+                                OperatorStatusOperation::TrustedInstaller,
+                                OperatorStatusOutcome::Success,
+                                TI_AUDIT_TARGET,
+                                "status.ti_success",
+                                vec![("pid".to_string(), pid_text)],
+                            ),
                         );
                     }
-                    Err(error) => set_error(&ui, &error),
+                    Err(error) => controller.publish_failure(
+                        &ui,
+                        OperatorStatusOperation::TrustedInstaller,
+                        TI_AUDIT_TARGET,
+                        error,
+                        Some("status.recovery.retry"),
+                    ),
                 }
                 controller.apply_audit_result(&ui, audit_entries);
             }) {
@@ -796,6 +1226,16 @@ impl AppController {
         if !self.begin_operation(ui, OperationKind::Export) {
             return;
         }
+        self.publish_operator_status(
+            ui,
+            OperatorStatus::localized(
+                OperatorStatusOperation::Export,
+                OperatorStatusOutcome::Running,
+                "Exports",
+                "status.exporting",
+                Vec::new(),
+            ),
+        );
         let controller = Arc::clone(self);
         let weak = ui.as_weak();
         std::thread::spawn(move || {
@@ -806,11 +1246,24 @@ impl AppController {
                 match result {
                     Ok(path) => {
                         let path_text = path.display().to_string();
-                        ui.set_status_message(
-                            t_args("status.export_success", &[("path", path_text.as_str())]).into(),
+                        controller.publish_operator_status(
+                            &ui,
+                            OperatorStatus::localized(
+                                OperatorStatusOperation::Export,
+                                OperatorStatusOutcome::Success,
+                                path_text.clone(),
+                                "status.export_success",
+                                vec![("path".to_string(), path_text)],
+                            ),
                         );
                     }
-                    Err(error) => set_error(&ui, &error.to_string()),
+                    Err(error) => controller.publish_failure(
+                        &ui,
+                        OperatorStatusOperation::Export,
+                        "Exports",
+                        error.to_string(),
+                        Some("status.recovery.retry"),
+                    ),
                 }
             }) {
                 eprintln!("failed to queue audit export result: {error}");
@@ -822,10 +1275,31 @@ impl AppController {
     pub fn clear_audit_logs(&self, ui: &MainWindow) {
         match self.audit_logger.clear_memory() {
             Ok(()) => match self.cache_and_apply_audit_entries(ui, Vec::new()) {
-                Ok(()) => ui.set_status_message(t("status.audit_cleared").into()),
-                Err(error) => set_error(ui, &error),
+                Ok(()) => self.publish_operator_status(
+                    ui,
+                    OperatorStatus::localized(
+                        OperatorStatusOperation::Audit,
+                        OperatorStatusOutcome::Success,
+                        "Display",
+                        "status.audit_cleared",
+                        Vec::new(),
+                    ),
+                ),
+                Err(error) => self.publish_failure(
+                    ui,
+                    OperatorStatusOperation::Audit,
+                    "Display",
+                    error,
+                    Some("status.recovery.retry"),
+                ),
             },
-            Err(error) => set_error(ui, &error.to_string()),
+            Err(error) => self.publish_failure(
+                ui,
+                OperatorStatusOperation::Audit,
+                "Display",
+                error.to_string(),
+                Some("status.recovery.retry"),
+            ),
         }
     }
 
@@ -836,11 +1310,49 @@ impl AppController {
 
     fn begin_operation(&self, ui: &MainWindow, operation: OperationKind) -> bool {
         if !self.operation_state.try_begin(operation) {
-            ui.set_status_message(t("error.operation_busy").into());
+            self.publish_operator_status(
+                ui,
+                OperatorStatus::localized(
+                    operation.status_operation(),
+                    OperatorStatusOutcome::Warning,
+                    "System",
+                    "error.operation_busy",
+                    Vec::new(),
+                ),
+            );
             return false;
         }
         ui.set_operation_busy(true);
         true
+    }
+
+    fn require_elevation(&self, ui: &MainWindow, operation: OperatorStatusOperation) -> bool {
+        match is_process_elevated() {
+            Ok(true) => true,
+            Ok(false) => {
+                self.publish_operator_status(
+                    ui,
+                    OperatorStatus::localized(
+                        operation,
+                        OperatorStatusOutcome::Warning,
+                        "System",
+                        "error.elevation_required",
+                        Vec::new(),
+                    ),
+                );
+                false
+            }
+            Err(error) => {
+                self.publish_failure(
+                    ui,
+                    operation,
+                    "System",
+                    error.to_string(),
+                    Some("status.recovery.retry"),
+                );
+                false
+            }
+        }
     }
 
     fn finish_operation(&self) -> bool {
@@ -866,10 +1378,25 @@ impl AppController {
         reset_selection: bool,
     ) -> Result<(), String> {
         let rendered_report = report.clone();
-        *self
+        let mut report_cache = self
             .last_report
             .lock()
-            .map_err(|_| "profile report cache is unavailable".to_string())? = Some(report);
+            .map_err(|_| "profile report cache is unavailable".to_string())?;
+        let mut migration_terminal_cache = if reset_selection {
+            Some(
+                self.last_migration_terminal
+                    .lock()
+                    .map_err(|_| "migration status cache is unavailable".to_string())?,
+            )
+        } else {
+            None
+        };
+        *report_cache = Some(report);
+        if let Some(cache) = migration_terminal_cache.as_mut() {
+            **cache = None;
+        }
+        drop(migration_terminal_cache);
+        drop(report_cache);
         render_report(ui, &rendered_report, reset_selection);
         Ok(())
     }
@@ -902,6 +1429,55 @@ impl AppController {
         Ok(message)
     }
 
+    fn cache_and_apply_operator_status(
+        &self,
+        ui: &MainWindow,
+        status: OperatorStatus,
+    ) -> Result<(), String> {
+        let rendered = status.clone();
+        *self
+            .last_operator_status
+            .lock()
+            .map_err(|_| "operator status cache is unavailable".to_string())? = status;
+        apply_operator_status(ui, &rendered);
+        Ok(())
+    }
+
+    fn publish_operator_status(&self, ui: &MainWindow, status: OperatorStatus) {
+        if let Err(error) = self.cache_and_apply_operator_status(ui, status) {
+            ui.set_status_message(error.clone().into());
+            ui.set_status_details_content(error.into());
+        }
+    }
+
+    fn publish_localized_status(
+        &self,
+        ui: &MainWindow,
+        operation: OperatorStatusOperation,
+        outcome: OperatorStatusOutcome,
+        target: impl Into<String>,
+        key: &'static str,
+    ) {
+        self.publish_operator_status(
+            ui,
+            OperatorStatus::localized(operation, outcome, target, key, Vec::new()),
+        );
+    }
+
+    fn publish_failure(
+        &self,
+        ui: &MainWindow,
+        operation: OperatorStatusOperation,
+        target: impl Into<String>,
+        raw_details: impl Into<String>,
+        recovery_hint_key: Option<&'static str>,
+    ) {
+        self.publish_operator_status(
+            ui,
+            OperatorStatus::failure(operation, target, raw_details, recovery_hint_key),
+        );
+    }
+
     fn apply_audit_result(
         &self,
         ui: &MainWindow,
@@ -910,26 +1486,29 @@ impl AppController {
         match result {
             Ok(entries) => {
                 if let Err(error) = self.cache_and_apply_audit_entries(ui, entries) {
-                    set_error(ui, &error);
+                    self.publish_failure(
+                        ui,
+                        OperatorStatusOperation::Audit,
+                        "Display",
+                        error,
+                        Some("status.recovery.retry"),
+                    );
                 }
             }
-            Err(error) => set_error(ui, &error.to_string()),
+            Err(error) => self.publish_failure(
+                ui,
+                OperatorStatusOperation::Audit,
+                "Display",
+                error.to_string(),
+                Some("status.recovery.retry"),
+            ),
         }
     }
 }
 
-fn require_elevation(ui: &MainWindow) -> bool {
-    match is_process_elevated() {
-        Ok(true) => true,
-        Ok(false) => {
-            ui.set_status_message(t("error.elevation_required").into());
-            false
-        }
-        Err(error) => {
-            set_error(ui, &error.to_string());
-            false
-        }
-    }
+fn apply_operator_status(ui: &MainWindow, status: &OperatorStatus) {
+    ui.set_status_message(status.render_summary().into());
+    ui.set_status_details_content(status.render_details().into());
 }
 
 fn selected_repair_actions(ui: &MainWindow) -> Vec<String> {
@@ -943,6 +1522,14 @@ fn selected_repair_actions(ui: &MainWindow) -> Vec<String> {
     actions
 }
 
+fn scan_audit_status(report: &DiagnosticReport) -> AuditStatus {
+    if report.warning_count > 0 || report.corrupted_count > 0 {
+        AuditStatus::Warning
+    } else {
+        AuditStatus::Success
+    }
+}
+
 fn queue_scan_result(
     controller: Arc<AppController>,
     weak: Weak<MainWindow>,
@@ -952,11 +1539,26 @@ fn queue_scan_result(
     if let Err(error) = weak.upgrade_in_event_loop(move |ui| {
         ui.set_operation_busy(false);
         match result {
-            Ok(report) => match controller.cache_and_apply_report(&ui, report, true) {
-                Ok(()) => ui.set_status_message(t("status.completed").into()),
-                Err(error) => set_error(&ui, &error),
-            },
-            Err(error) => set_error(&ui, &error),
+            Ok(report) => {
+                let status = OperatorStatus::scan_completed(&report);
+                match controller.cache_and_apply_report(&ui, report, true) {
+                    Ok(()) => controller.publish_operator_status(&ui, status),
+                    Err(error) => controller.publish_failure(
+                        &ui,
+                        OperatorStatusOperation::Scan,
+                        "System",
+                        error,
+                        Some("status.recovery.retry"),
+                    ),
+                }
+            }
+            Err(error) => controller.publish_failure(
+                &ui,
+                OperatorStatusOperation::Scan,
+                "System",
+                error,
+                Some("status.recovery.retry"),
+            ),
         }
         controller.apply_audit_result(&ui, audit_entries);
     }) {
@@ -970,7 +1572,7 @@ fn render_report(ui: &MainWindow, report: &DiagnosticReport, reset_selection: bo
         .iter()
         .map(user_profile_to_slint)
         .collect::<Vec<ProfileEntry>>();
-    let selected_details = if reset_selection {
+    let selected_profile = if reset_selection {
         None
     } else {
         usize::try_from(ui.get_selected_idx())
@@ -980,19 +1582,12 @@ fn render_report(ui: &MainWindow, report: &DiagnosticReport, reset_selection: bo
                 profile.sid.as_str() == ui.get_selected_sid().as_str()
                     && profile.profile_path.as_str() == ui.get_selected_path().as_str()
             })
-            .map(|profile| {
-                (
-                    profile.anomalies.clone(),
-                    profile.locking_processes.clone(),
-                    profile.has_locking_processes,
-                    profile.lock_inspection_failure.clone(),
-                    profile.repair_blocked_by_lock_inspection,
-                )
-            })
+            .cloned()
     };
     ui.set_profiles(ModelRc::from(Rc::new(VecModel::from(profiles))));
     ui.set_total_profiles_count(report.total_count as i32);
     ui.set_healthy_count(report.healthy_count as i32);
+    ui.set_warning_count(report.warning_count as i32);
     ui.set_corrupted_count(report.corrupted_count as i32);
     ui.set_temp_count(report.temporary_count as i32);
     if reset_selection {
@@ -1000,26 +1595,45 @@ fn render_report(ui: &MainWindow, report: &DiagnosticReport, reset_selection: bo
         ui.set_selected_sid("".into());
         ui.set_selected_path("".into());
         ui.set_selected_username("".into());
+        ui.set_selected_account("".into());
+        ui.set_selected_health_type(-1);
         ui.set_selected_anomalies("".into());
+        ui.set_selected_issues(ModelRc::default());
         ui.set_selected_locking_processes(ModelRc::default());
         ui.set_selected_has_locking_processes(false);
         ui.set_selected_lock_inspection_failure("".into());
         ui.set_selected_repair_blocked_by_lock_inspection(false);
         ui.set_selected_loaded(false);
-    } else if let Some((
-        anomalies,
-        locking_processes,
-        has_locking_processes,
-        lock_inspection_failure,
-        repair_blocked_by_lock_inspection,
-    )) = selected_details
-    {
-        ui.set_selected_anomalies(anomalies);
-        ui.set_selected_locking_processes(locking_processes);
-        ui.set_selected_has_locking_processes(has_locking_processes);
-        ui.set_selected_lock_inspection_failure(lock_inspection_failure);
-        ui.set_selected_repair_blocked_by_lock_inspection(repair_blocked_by_lock_inspection);
+        ui.set_repair_fix_bak(false);
+        ui.set_repair_reset_state(false);
+        ui.set_migration_target_path("".into());
+        ui.set_migration_include_roaming(false);
+        ui.set_migration_include_docs(false);
+        ui.set_migration_progress(0.0);
+        ui.set_migration_status("".into());
+    } else if let Some(profile) = selected_profile.as_ref() {
+        apply_selected_profile(ui, profile);
     }
+}
+
+fn apply_selected_profile(ui: &MainWindow, profile: &ProfileEntry) {
+    let account = if profile.domain.is_empty() {
+        profile.username.to_string()
+    } else {
+        format!(r"{}\{}", profile.domain, profile.username)
+    };
+    ui.set_selected_sid(profile.sid.clone());
+    ui.set_selected_path(profile.profile_path.clone());
+    ui.set_selected_username(profile.username.clone());
+    ui.set_selected_account(account.into());
+    ui.set_selected_health_type(profile.health_type);
+    ui.set_selected_anomalies(profile.anomalies.clone());
+    ui.set_selected_issues(profile.issues.clone());
+    ui.set_selected_locking_processes(profile.locking_processes.clone());
+    ui.set_selected_has_locking_processes(profile.has_locking_processes);
+    ui.set_selected_lock_inspection_failure(profile.lock_inspection_failure.clone());
+    ui.set_selected_repair_blocked_by_lock_inspection(profile.repair_blocked_by_lock_inspection);
+    ui.set_selected_loaded(profile.loaded);
 }
 
 fn render_audit_entries(ui: &MainWindow, entries: &[AuditEntry]) {
@@ -1028,10 +1642,6 @@ fn render_audit_entries(ui: &MainWindow, entries: &[AuditEntry]) {
         .map(audit_entry_to_slint)
         .collect::<Vec<AuditLogEntry>>();
     ui.set_audit_entries(ModelRc::from(Rc::new(VecModel::from(model))));
-}
-
-fn set_error(ui: &MainWindow, error: &str) {
-    ui.set_status_message(error.into());
 }
 
 #[cfg(test)]
@@ -1179,6 +1789,7 @@ mod tests {
             timestamp: Utc::now(),
             total_count: 1,
             healthy_count: 0,
+            warning_count: 0,
             corrupted_count: 1,
             temporary_count: 0,
             profiles: vec![UserProfile {
@@ -1206,6 +1817,7 @@ mod tests {
             timestamp: Utc::now(),
             total_count: 1,
             healthy_count: 0,
+            warning_count: 0,
             corrupted_count: 1,
             temporary_count: 0,
             profiles: vec![UserProfile {
@@ -1225,6 +1837,63 @@ mod tests {
                 anomalies,
                 health: ProfileHealth::Corrupted,
             }],
+        }
+    }
+
+    fn operator_flow_report() -> DiagnosticReport {
+        let profile = |sid: &str,
+                       username: &str,
+                       path: &str,
+                       anomalies: Vec<ProfileAnomaly>,
+                       health: ProfileHealth| UserProfile {
+            sid: sid.to_string(),
+            canonical_sid: sid.trim_end_matches(".bak").to_string(),
+            username: username.to_string(),
+            domain: "TEST".to_string(),
+            profile_path: path.to_string(),
+            loaded: false,
+            is_bak: sid.ends_with(".bak"),
+            state_mask: 0,
+            ref_count: 0,
+            guid: None,
+            ntuser_exists: true,
+            usrclass_exists: true,
+            disk_size_bytes: 0,
+            anomalies,
+            health,
+        };
+        DiagnosticReport {
+            timestamp: Utc::now(),
+            total_count: 3,
+            healthy_count: 1,
+            warning_count: 1,
+            corrupted_count: 1,
+            temporary_count: 1,
+            profiles: vec![
+                profile(
+                    "S-1-5-21-1001",
+                    "HealthyUser",
+                    r"C:\Users\HealthyUser",
+                    Vec::new(),
+                    ProfileHealth::Healthy,
+                ),
+                profile(
+                    "S-1-5-21-1002",
+                    "WarningUser",
+                    r"C:\Users\WarningUser",
+                    vec![ProfileAnomaly::FilesystemScanFailure(
+                        "RAW-WARNING-ACCESS-DENIED-0x5".to_string(),
+                    )],
+                    ProfileHealth::Warning,
+                ),
+                profile(
+                    "S-1-5-21-1003.bak",
+                    "CorruptedUser",
+                    r"C:\Users\CorruptedUser",
+                    vec![ProfileAnomaly::BakSuffix, ProfileAnomaly::TempSession],
+                    ProfileHealth::Corrupted,
+                ),
+            ],
         }
     }
 
@@ -1321,9 +1990,38 @@ mod tests {
     #[test]
     fn technical_error_status_is_preserved_byte_for_byte() {
         crate::locale::with_test_window(|ui| {
+            let directory = LocaleTestDirectory::new();
+            let controller = locale_test_controller(&directory);
+            crate::locale::set_locale_and_app_strings(ui, "en").expect("English locale");
             let raw = "RAW-WIN32-ERROR-0xC0000022: chemin C:\\Users\\Test";
-            set_error(ui, raw);
-            assert_eq!(ui.get_status_message().as_str(), raw);
+            controller.publish_failure(
+                ui,
+                OperatorStatusOperation::TrustedInstaller,
+                TI_AUDIT_TARGET,
+                raw,
+                Some("status.recovery.retry"),
+            );
+            let cached = controller
+                .last_operator_status
+                .lock()
+                .expect("status cache")
+                .clone();
+            assert_eq!(cached.raw_details.as_deref(), Some(raw));
+            assert!(ui.get_status_details_content().as_str().contains(raw));
+            assert!(controller.change_locale(ui, "fr").expect("French rerender"));
+            assert_eq!(
+                controller
+                    .last_operator_status
+                    .lock()
+                    .expect("status cache")
+                    .raw_details
+                    .as_deref(),
+                Some(raw)
+            );
+            assert!(ui.get_status_details_content().as_str().contains(raw));
+            assert!(ui.get_status_message().as_str().contains("échoué"));
+            assert_eq!(controller.scanner_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controller.journal_read_calls.load(Ordering::SeqCst), 0);
         });
     }
 
@@ -1489,6 +2187,154 @@ mod tests {
             validate_migration_source(true),
             Err(MIGRATION_SOURCE_LOADED_ERROR)
         );
+    }
+
+    #[test]
+    fn operator_inventory_partitions_health_and_preserves_selected_raw_issue_across_locale() {
+        crate::locale::with_test_window(|ui| {
+            let directory = LocaleTestDirectory::new();
+            let controller = locale_test_controller(&directory);
+            ui.set_startup_visible(false);
+            crate::locale::set_locale_and_app_strings(ui, "en").expect("English locale");
+            let report = operator_flow_report();
+            assert!(report.has_consistent_health_counts());
+            assert_eq!(scan_audit_status(&report), AuditStatus::Warning);
+            let clean_status_report = DiagnosticReport {
+                timestamp: report.timestamp,
+                total_count: 1,
+                healthy_count: 1,
+                warning_count: 0,
+                corrupted_count: 0,
+                temporary_count: 0,
+                profiles: vec![report.profiles[0].clone()],
+            };
+            assert_eq!(
+                scan_audit_status(&clean_status_report),
+                AuditStatus::Success
+            );
+            assert_eq!(
+                OperatorStatus::scan_completed(&clean_status_report).outcome,
+                OperatorStatusOutcome::Success
+            );
+            let corrupted_only_report = DiagnosticReport {
+                total_count: 1,
+                healthy_count: 0,
+                corrupted_count: 1,
+                profiles: vec![report.profiles[2].clone()],
+                ..clean_status_report.clone()
+            };
+            assert_eq!(
+                scan_audit_status(&corrupted_only_report),
+                AuditStatus::Warning
+            );
+            let corrupted_only_status = OperatorStatus::scan_completed(&corrupted_only_report);
+            assert_eq!(
+                corrupted_only_status.outcome,
+                OperatorStatusOutcome::Warning
+            );
+            assert!(corrupted_only_status
+                .render_summary()
+                .contains("review required"));
+            assert!(corrupted_only_status
+                .render_details()
+                .contains("warning or corrupted profile"));
+            crate::locale::set_locale_and_app_strings(ui, "fr").expect("French locale");
+            assert!(corrupted_only_status
+                .render_summary()
+                .contains("vérification requise"));
+            crate::locale::set_locale_and_app_strings(ui, "en").expect("restore English locale");
+            controller
+                .cache_and_apply_report(ui, report.clone(), true)
+                .expect("render operator inventory");
+
+            assert_eq!(ui.get_total_profiles_count(), 3);
+            assert_eq!(ui.get_healthy_count(), 1);
+            assert_eq!(ui.get_warning_count(), 1);
+            assert_eq!(ui.get_corrupted_count(), 1);
+            assert_eq!(ui.get_temp_count(), 1);
+            assert_eq!(
+                (0..3)
+                    .map(|index| ui
+                        .get_profiles()
+                        .row_data(index)
+                        .expect("profile")
+                        .health_type)
+                    .collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert_eq!(ui.get_selected_idx(), -1);
+
+            controller.select_profile(ui, 1);
+            assert_eq!(ui.get_active_tab(), 0, "selection must not navigate");
+            assert_eq!(ui.get_selected_idx(), 1);
+            assert_eq!(ui.get_selected_account().as_str(), r"TEST\WarningUser");
+            assert_eq!(ui.get_selected_sid().as_str(), "S-1-5-21-1002");
+            assert_eq!(ui.get_selected_path().as_str(), r"C:\Users\WarningUser");
+            assert!(!ui.get_selected_loaded());
+            let issue = ui
+                .get_selected_issues()
+                .row_data(0)
+                .expect("selected warning issue");
+            assert_eq!(issue.code.as_str(), "FILESYSTEM_SCAN_FAILURE");
+            assert_eq!(
+                issue.technical_details.as_str(),
+                "RAW-WARNING-ACCESS-DENIED-0x5"
+            );
+
+            controller.publish_operator_status(ui, OperatorStatus::scan_completed(&report));
+            assert!(ui.get_status_message().as_str().contains("review required"));
+            let selected_before = (
+                ui.get_selected_idx(),
+                ui.get_selected_sid(),
+                ui.get_selected_path(),
+                issue.technical_details,
+            );
+            assert!(controller.change_locale(ui, "fr").expect("French rerender"));
+            let french_issue = ui
+                .get_selected_issues()
+                .row_data(0)
+                .expect("French selected warning issue");
+            assert_eq!(
+                selected_before,
+                (
+                    ui.get_selected_idx(),
+                    ui.get_selected_sid(),
+                    ui.get_selected_path(),
+                    french_issue.technical_details,
+                )
+            );
+            assert!(ui.get_status_message().as_str().contains("avertissements"));
+            assert_eq!(controller.scanner_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(controller.journal_read_calls.load(Ordering::SeqCst), 0);
+
+            ui.set_repair_fix_bak(true);
+            ui.set_repair_reset_state(true);
+            ui.set_migration_target_path(r"D:\Migrated\WarningUser".into());
+            ui.set_migration_include_roaming(true);
+            ui.set_migration_include_docs(true);
+            ui.set_migration_progress(0.61);
+            controller
+                .cache_and_apply_migration_terminal(ui, MigrationTerminalPresentation::Cancelled)
+                .expect("cache stale migration terminal");
+            controller
+                .cache_and_apply_report(ui, report, true)
+                .expect("rescan resets selection");
+            assert_eq!(ui.get_selected_idx(), -1);
+            assert!(ui.get_selected_sid().is_empty());
+            assert_eq!(ui.get_selected_issues().row_count(), 0);
+            assert!(!ui.get_repair_fix_bak());
+            assert!(!ui.get_repair_reset_state());
+            assert!(ui.get_migration_target_path().is_empty());
+            assert!(!ui.get_migration_include_roaming());
+            assert!(!ui.get_migration_include_docs());
+            assert_eq!(ui.get_migration_progress(), 0.0);
+            assert!(ui.get_migration_status().is_empty());
+            assert!(controller
+                .last_migration_terminal
+                .lock()
+                .expect("migration terminal cache")
+                .is_none());
+        });
     }
 
     #[test]

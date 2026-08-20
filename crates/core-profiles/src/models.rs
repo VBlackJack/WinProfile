@@ -109,9 +109,18 @@ pub struct DiagnosticReport {
     pub timestamp: DateTime<Utc>,
     pub total_count: usize,
     pub healthy_count: usize,
+    pub warning_count: usize,
     pub corrupted_count: usize,
     pub temporary_count: usize,
     pub profiles: Vec<UserProfile>,
+}
+
+impl DiagnosticReport {
+    /// Returns whether every profile belongs to exactly one health category.
+    /// Temporary sessions remain a transversal counter and are not part of this sum.
+    pub fn has_consistent_health_counts(&self) -> bool {
+        self.total_count == self.healthy_count + self.warning_count + self.corrupted_count
+    }
 }
 
 /// Execution plan for repairing a profile.

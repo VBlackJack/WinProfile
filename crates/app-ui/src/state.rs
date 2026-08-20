@@ -20,7 +20,7 @@ use slint::{ModelRc, SharedString, VecModel};
 use std::rc::Rc;
 
 // Slint generated types
-use crate::{AuditLogEntry, ProfileEntry};
+use crate::{AuditLogEntry, ProfileEntry, ProfileIssueEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RepairSuggestions {
@@ -61,6 +61,33 @@ fn lock_inspection_failure(profile: &UserProfile) -> Option<&str> {
     })
 }
 
+fn anomaly_to_issue(anomaly: &ProfileAnomaly) -> ProfileIssueEntry {
+    let (code, technical_details) = match anomaly {
+        ProfileAnomaly::BakSuffix => ("BAK_SUFFIX", String::new()),
+        ProfileAnomaly::TempSession => ("TEMP_SESSION", String::new()),
+        ProfileAnomaly::OrphanSid => ("ORPHAN_SID", String::new()),
+        ProfileAnomaly::PathCollision(details) => ("PATH_COLLISION", details.clone()),
+        ProfileAnomaly::DirtyStateMask(mask) => ("DIRTY_STATE_MASK", format!("0x{mask:08X}")),
+        ProfileAnomaly::LockedNtUserDat(processes) => ("LOCKED_NTUSER_DAT", processes.join("\n")),
+        ProfileAnomaly::MissingDirectory(details) => ("MISSING_DIRECTORY", details.clone()),
+        ProfileAnomaly::RegistryReadFailure(details) => ("REGISTRY_READ_FAILURE", details.clone()),
+        ProfileAnomaly::SidResolutionFailure(details) => {
+            ("SID_RESOLUTION_FAILURE", details.clone())
+        }
+        ProfileAnomaly::FilesystemScanFailure(details) => {
+            ("FILESYSTEM_SCAN_FAILURE", details.clone())
+        }
+        ProfileAnomaly::LockInspectionFailure(details) => {
+            ("LOCK_INSPECTION_FAILURE", details.clone())
+        }
+    };
+    ProfileIssueEntry {
+        code: code.into(),
+        summary: anomaly.localized_description().into(),
+        technical_details: technical_details.into(),
+    }
+}
+
 pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
     let health_type = match profile.health {
         ProfileHealth::Healthy => 0,
@@ -85,6 +112,11 @@ pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
         .map(|a| a.localized_description())
         .collect::<Vec<_>>()
         .join("; ");
+    let issues = profile
+        .anomalies
+        .iter()
+        .map(anomaly_to_issue)
+        .collect::<Vec<_>>();
     let suggestions = repair_suggestions(profile);
     let locking_processes = locking_processes(profile);
     let has_locking_processes = !locking_processes.is_empty();
@@ -109,6 +141,7 @@ pub fn user_profile_to_slint(profile: &UserProfile) -> ProfileEntry {
             || !lock_inspection_failure.is_empty(),
         state_raw: format!("0x{:04X}", profile.state_mask).into(),
         anomalies: anomalies.into(),
+        issues: ModelRc::from(Rc::new(VecModel::from(issues))),
     }
 }
 
@@ -210,6 +243,61 @@ mod tests {
                 fix_bak: false,
                 reset_state: false,
             }
+        );
+    }
+
+    #[test]
+    fn issue_entries_keep_stable_codes_and_exact_technical_payloads() {
+        let profile = profile_with_anomalies(vec![
+            ProfileAnomaly::PathCollision(r"C:\Users\Exact".to_string()),
+            ProfileAnomaly::DirtyStateMask(0x1234),
+            ProfileAnomaly::LockedNtUserDat(vec![
+                "Editor.exe (PID: 42)".to_string(),
+                "Sync.exe (PID: 43)".to_string(),
+            ]),
+            ProfileAnomaly::MissingDirectory(r"C:\Missing\Exact".to_string()),
+            ProfileAnomaly::RegistryReadFailure("RAW-REG-0x00000005".to_string()),
+            ProfileAnomaly::SidResolutionFailure("RAW-SID-1332".to_string()),
+            ProfileAnomaly::FilesystemScanFailure("RAW-FS-ACCESS-DENIED".to_string()),
+            ProfileAnomaly::LockInspectionFailure("RAW-RM-ERROR-5".to_string()),
+        ]);
+
+        let entry = user_profile_to_slint(&profile);
+        let issues = (0..entry.issues.row_count())
+            .map(|index| entry.issues.row_data(index).expect("issue row"))
+            .map(|issue| (issue.code.to_string(), issue.technical_details.to_string()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            issues,
+            vec![
+                ("PATH_COLLISION".to_string(), r"C:\Users\Exact".to_string()),
+                ("DIRTY_STATE_MASK".to_string(), "0x00001234".to_string()),
+                (
+                    "LOCKED_NTUSER_DAT".to_string(),
+                    "Editor.exe (PID: 42)\nSync.exe (PID: 43)".to_string(),
+                ),
+                (
+                    "MISSING_DIRECTORY".to_string(),
+                    r"C:\Missing\Exact".to_string(),
+                ),
+                (
+                    "REGISTRY_READ_FAILURE".to_string(),
+                    "RAW-REG-0x00000005".to_string(),
+                ),
+                (
+                    "SID_RESOLUTION_FAILURE".to_string(),
+                    "RAW-SID-1332".to_string(),
+                ),
+                (
+                    "FILESYSTEM_SCAN_FAILURE".to_string(),
+                    "RAW-FS-ACCESS-DENIED".to_string(),
+                ),
+                (
+                    "LOCK_INSPECTION_FAILURE".to_string(),
+                    "RAW-RM-ERROR-5".to_string(),
+                ),
+            ]
         );
     }
 

@@ -48,28 +48,7 @@ impl ProfileScanner {
     /// Performs a full scan and returns a complete diagnostic summary report.
     pub fn scan_all() -> ScannerResult<crate::models::DiagnosticReport> {
         let profiles = Self::scan_all_profiles()?;
-        let total_count = profiles.len();
-        let healthy_count = profiles
-            .iter()
-            .filter(|profile| profile.health == ProfileHealth::Healthy)
-            .count();
-        let corrupted_count = profiles
-            .iter()
-            .filter(|profile| profile.health == ProfileHealth::Corrupted)
-            .count();
-        let temporary_count = profiles
-            .iter()
-            .filter(|profile| profile.anomalies.contains(&ProfileAnomaly::TempSession))
-            .count();
-
-        Ok(crate::models::DiagnosticReport {
-            timestamp: chrono::Utc::now(),
-            total_count,
-            healthy_count,
-            corrupted_count,
-            temporary_count,
-            profiles,
-        })
+        Ok(build_diagnostic_report(profiles))
     }
 
     /// Discovers and evaluates all user profiles listed in HKLM ProfileList.
@@ -178,6 +157,36 @@ impl ProfileScanner {
 
         mark_path_collisions(&mut profiles);
         Ok(profiles)
+    }
+}
+
+fn build_diagnostic_report(profiles: Vec<UserProfile>) -> crate::models::DiagnosticReport {
+    let total_count = profiles.len();
+    let healthy_count = profiles
+        .iter()
+        .filter(|profile| profile.health == ProfileHealth::Healthy)
+        .count();
+    let warning_count = profiles
+        .iter()
+        .filter(|profile| profile.health == ProfileHealth::Warning)
+        .count();
+    let corrupted_count = profiles
+        .iter()
+        .filter(|profile| profile.health == ProfileHealth::Corrupted)
+        .count();
+    let temporary_count = profiles
+        .iter()
+        .filter(|profile| profile.anomalies.contains(&ProfileAnomaly::TempSession))
+        .count();
+
+    crate::models::DiagnosticReport {
+        timestamp: chrono::Utc::now(),
+        total_count,
+        healthy_count,
+        warning_count,
+        corrupted_count,
+        temporary_count,
+        profiles,
     }
 }
 
@@ -315,7 +324,7 @@ fn mark_path_collisions(profiles: &mut [UserProfile]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{directory_size, mark_path_collisions};
+    use super::{build_diagnostic_report, directory_size, mark_path_collisions};
     use crate::models::{ProfileAnomaly, ProfileHealth, UserProfile};
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -414,6 +423,30 @@ mod tests {
             .anomalies
             .iter()
             .any(|anomaly| matches!(anomaly, ProfileAnomaly::PathCollision(_))));
+    }
+
+    #[test]
+    fn diagnostic_counts_partition_health_and_keep_temporary_transversal() {
+        let healthy = profile("S-1-5-21-1", r"C:\Users\Healthy");
+        let mut warning = profile("S-1-5-21-2", r"C:\Users\Warning");
+        warning.health = ProfileHealth::Warning;
+        warning.anomalies.push(ProfileAnomaly::MissingDirectory(
+            warning.profile_path.clone(),
+        ));
+        let mut corrupted_temporary = profile("S-1-5-21-3", r"C:\Users\Temporary");
+        corrupted_temporary.health = ProfileHealth::Corrupted;
+        corrupted_temporary
+            .anomalies
+            .push(ProfileAnomaly::TempSession);
+
+        let report = build_diagnostic_report(vec![healthy, warning, corrupted_temporary]);
+
+        assert_eq!(report.total_count, 3);
+        assert_eq!(report.healthy_count, 1);
+        assert_eq!(report.warning_count, 1);
+        assert_eq!(report.corrupted_count, 1);
+        assert_eq!(report.temporary_count, 1);
+        assert!(report.has_consistent_health_counts());
     }
 
     #[test]
