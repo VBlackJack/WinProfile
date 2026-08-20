@@ -37,20 +37,22 @@ use windows_sys::Win32::System::RemoteDesktop::{
 };
 use windows_sys::Win32::System::Services::{
     OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, StartServiceW, SC_MANAGER_CONNECT,
-    SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
-    SERVICE_STATUS_PROCESS,
+    SC_STATUS_PROCESS_INFO, SERVICE_CONTINUE_PENDING, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
+    SERVICE_START, SERVICE_START_PENDING, SERVICE_STATUS_PROCESS,
 };
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CreateProcessWithTokenW, GetCurrentProcessId, OpenProcess, OpenProcessToken, TerminateProcess,
     WaitForSingleObject, CREATE_PROCESS_LOGON_FLAGS, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_QUERY_INFORMATION, STARTUPINFOW,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
 
 use crate::handles::{OwnedEnvironmentBlock, OwnedHandle, OwnedScHandle};
 use crate::registry::to_wide_null;
 use crate::security::{PrivilegeGuard, SecurityError, SE_DEBUG_NAME, SE_IMPERSONATE_NAME};
 
+/// Generic Windows access-mask value retained for API compatibility. TrustedInstaller
+/// token capture deliberately uses the exact masks below instead.
 pub const MAXIMUM_ALLOWED: u32 = 0x02000000;
 const TRUSTED_INSTALLER_SERVICE: &str = "TrustedInstaller";
 const SERVICE_START_POLL_ATTEMPTS: usize = 20;
@@ -60,15 +62,28 @@ const TRUSTED_INSTALLER_CONSOLE_TITLE: &str = "TrustedInstaller Elevated Console
 const INITIAL_SYSTEM_DIRECTORY_CAPACITY: usize = 260;
 const PROCESS_COMPENSATION_EXIT_CODE: u32 = 1;
 const PROCESS_COMPENSATION_TIMEOUT: Duration = Duration::from_secs(5);
+const TRUSTED_INSTALLER_PROCESS_ACCESS: u32 = PROCESS_QUERY_LIMITED_INFORMATION;
+const TRUSTED_INSTALLER_SOURCE_TOKEN_ACCESS: u32 = TOKEN_DUPLICATE;
+const TRUSTED_INSTALLER_LAUNCH_TOKEN_ACCESS: u32 =
+    TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY;
 
 #[derive(Error, Debug)]
 pub enum TokenError {
     #[error("Token operation failed with Win32 error code: {0}")]
     Win32Error(u32),
+    #[error("{operation} failed with Win32 error code: {code}")]
+    Win32Operation { operation: &'static str, code: u32 },
     #[error("Process '{0}' not found")]
     ProcessNotFound(String),
-    #[error("Service '{0}' failed to start")]
-    ServiceStartFailed(String),
+    #[error(
+        "TrustedInstaller did not reach RUNNING (state {state}, Win32 exit {win32_exit_code}, service exit {service_exit_code}, PID {process_id})"
+    )]
+    TrustedInstallerServiceState {
+        state: u32,
+        win32_exit_code: u32,
+        service_exit_code: u32,
+        process_id: u32,
+    },
     #[error("Requesting process session {0} is not interactive")]
     NonInteractiveRequestSession(u32),
     #[error("Requesting process session {session_id} is not active or connected (state {state})")]
@@ -335,60 +350,137 @@ pub fn find_process_id_by_name(image_name: &str) -> TokenResult<u32> {
 
 /// Starts the TrustedInstaller service via SCM and waits until it is in the RUNNING state.
 pub fn ensure_trustedinstaller_service_running() -> TokenResult<u32> {
-    let scm_handle =
-        unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
-    if scm_handle.is_null() {
-        return Err(TokenError::Win32Error(unsafe { GetLastError() }));
+    ensure_trustedinstaller_service_running_with_api(&WindowsTrustedInstallerServiceApi)
+}
+
+trait TrustedInstallerServiceApi {
+    type Handle;
+
+    fn open_manager(&self, desired_access: u32) -> Result<Self::Handle, u32>;
+    fn open_service(
+        &self,
+        manager: &Self::Handle,
+        service_name: &[u16],
+        desired_access: u32,
+    ) -> Result<Self::Handle, u32>;
+    fn start_service(&self, service: &Self::Handle) -> Result<(), u32>;
+    fn query_status(&self, service: &Self::Handle) -> Result<SERVICE_STATUS_PROCESS, u32>;
+    fn wait(&self, interval: Duration);
+}
+
+struct WindowsTrustedInstallerServiceApi;
+
+impl TrustedInstallerServiceApi for WindowsTrustedInstallerServiceApi {
+    type Handle = OwnedScHandle;
+
+    fn open_manager(&self, desired_access: u32) -> Result<Self::Handle, u32> {
+        let handle = unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), desired_access) };
+        OwnedScHandle::from_raw(handle).ok_or_else(|| unsafe { GetLastError() })
     }
-    let owned_scm = OwnedScHandle::from_raw(scm_handle)
-        .ok_or_else(|| TokenError::Win32Error(unsafe { GetLastError() }))?;
 
-    let wide_service_name = to_wide_null(TRUSTED_INSTALLER_SERVICE);
-    let service_handle = unsafe {
-        OpenServiceW(
-            owned_scm.as_raw(),
-            wide_service_name.as_ptr(),
-            SERVICE_START | SERVICE_QUERY_STATUS,
-        )
-    };
-    if service_handle.is_null() {
-        return Err(TokenError::Win32Error(unsafe { GetLastError() }));
-    }
-    let owned_service = OwnedScHandle::from_raw(service_handle)
-        .ok_or_else(|| TokenError::Win32Error(unsafe { GetLastError() }))?;
-
-    // Try to start service
-    let start_res = unsafe { StartServiceW(owned_service.as_raw(), 0, std::ptr::null()) };
-    let start_err = unsafe { GetLastError() };
-    if start_res == 0 && start_err != ERROR_SERVICE_ALREADY_RUNNING {
-        return Err(TokenError::Win32Error(start_err));
+    fn open_service(
+        &self,
+        manager: &Self::Handle,
+        service_name: &[u16],
+        desired_access: u32,
+    ) -> Result<Self::Handle, u32> {
+        let handle =
+            unsafe { OpenServiceW(manager.as_raw(), service_name.as_ptr(), desired_access) };
+        OwnedScHandle::from_raw(handle).ok_or_else(|| unsafe { GetLastError() })
     }
 
-    // Wait until RUNNING
-    let mut status: SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
-    let mut bytes_needed = 0;
+    fn start_service(&self, service: &Self::Handle) -> Result<(), u32> {
+        let result = unsafe { StartServiceW(service.as_raw(), 0, std::ptr::null()) };
+        if result == 0 {
+            Err(unsafe { GetLastError() })
+        } else {
+            Ok(())
+        }
+    }
 
-    for _ in 0..SERVICE_START_POLL_ATTEMPTS {
-        let query_res = unsafe {
+    fn query_status(&self, service: &Self::Handle) -> Result<SERVICE_STATUS_PROCESS, u32> {
+        let mut status: SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
+        let mut bytes_needed = 0;
+        let result = unsafe {
             QueryServiceStatusEx(
-                owned_service.as_raw(),
+                service.as_raw(),
                 SC_STATUS_PROCESS_INFO,
-                &mut status as *mut SERVICE_STATUS_PROCESS as *mut u8,
+                (&raw mut status).cast::<u8>(),
                 std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32,
                 &mut bytes_needed,
             )
         };
-
-        if query_res != 0 && status.dwCurrentState == SERVICE_RUNNING {
-            return Ok(status.dwProcessId);
+        if result == 0 {
+            Err(unsafe { GetLastError() })
+        } else {
+            Ok(status)
         }
-
-        std::thread::sleep(SERVICE_START_POLL_INTERVAL);
     }
 
-    Err(TokenError::ServiceStartFailed(
-        TRUSTED_INSTALLER_SERVICE.to_string(),
-    ))
+    fn wait(&self, interval: Duration) {
+        std::thread::sleep(interval);
+    }
+}
+
+fn ensure_trustedinstaller_service_running_with_api<A: TrustedInstallerServiceApi>(
+    api: &A,
+) -> TokenResult<u32> {
+    let manager =
+        api.open_manager(SC_MANAGER_CONNECT)
+            .map_err(|code| TokenError::Win32Operation {
+                operation: "OpenSCManagerW for TrustedInstaller",
+                code,
+            })?;
+    let service_name = to_wide_null(TRUSTED_INSTALLER_SERVICE);
+    let service = api
+        .open_service(
+            &manager,
+            &service_name,
+            SERVICE_START | SERVICE_QUERY_STATUS,
+        )
+        .map_err(|code| TokenError::Win32Operation {
+            operation: "OpenServiceW for TrustedInstaller",
+            code,
+        })?;
+    if let Err(code) = api.start_service(&service) {
+        if code != ERROR_SERVICE_ALREADY_RUNNING {
+            return Err(TokenError::Win32Operation {
+                operation: "StartServiceW for TrustedInstaller",
+                code,
+            });
+        }
+    }
+
+    for attempt in 0..SERVICE_START_POLL_ATTEMPTS {
+        let status = api
+            .query_status(&service)
+            .map_err(|code| TokenError::Win32Operation {
+                operation: "QueryServiceStatusEx for TrustedInstaller",
+                code,
+            })?;
+        if status.dwCurrentState == SERVICE_RUNNING && status.dwProcessId != 0 {
+            return Ok(status.dwProcessId);
+        }
+        let transitional = matches!(
+            status.dwCurrentState,
+            SERVICE_START_PENDING | SERVICE_CONTINUE_PENDING
+        );
+        if !transitional || attempt + 1 == SERVICE_START_POLL_ATTEMPTS {
+            return Err(service_state_error(status));
+        }
+        api.wait(SERVICE_START_POLL_INTERVAL);
+    }
+
+    unreachable!("the bounded service poll loop always returns")
+}
+
+fn service_state_error(status: SERVICE_STATUS_PROCESS) -> TokenError {
+    TokenError::TrustedInstallerServiceState {
+        state: status.dwCurrentState,
+        win32_exit_code: status.dwWin32ExitCode,
+        service_exit_code: status.dwServiceSpecificExitCode,
+        process_id: status.dwProcessId,
+    }
 }
 
 /// Captures and duplicates the TrustedInstaller primary token. SeDebugPrivilege
@@ -408,44 +500,94 @@ pub fn duplicate_trustedinstaller_token() -> TokenResult<TrustedInstallerLaunchT
 }
 
 fn capture_trustedinstaller_token(pid: u32) -> TokenResult<OwnedHandle> {
-    let process_handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid) };
-    if process_handle.is_null() {
-        return Err(TokenError::Win32Error(unsafe { GetLastError() }));
-    }
-    let owned_process = OwnedHandle::from_raw(process_handle)
-        .ok_or_else(|| TokenError::Win32Error(unsafe { GetLastError() }))?;
+    capture_trustedinstaller_token_with_api(pid, &WindowsTrustedInstallerCaptureApi)
+}
 
-    let mut token_handle: HANDLE = std::ptr::null_mut();
-    let tok_res = unsafe {
-        OpenProcessToken(
-            owned_process.as_raw(),
-            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
-            &mut token_handle,
-        )
-    };
-    if tok_res == 0 {
-        return Err(TokenError::Win32Error(unsafe { GetLastError() }));
-    }
-    let owned_token = OwnedHandle::from_raw(token_handle)
-        .ok_or_else(|| TokenError::Win32Error(unsafe { GetLastError() }))?;
+trait TrustedInstallerCaptureApi {
+    type Handle;
 
-    let mut dup_token: HANDLE = std::ptr::null_mut();
-    let dup_res = unsafe {
-        DuplicateTokenEx(
-            owned_token.as_raw(),
-            MAXIMUM_ALLOWED,
-            std::ptr::null(),
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut dup_token,
-        )
-    };
-    if dup_res == 0 {
-        return Err(TokenError::Win32Error(unsafe { GetLastError() }));
+    fn open_process(&self, pid: u32, desired_access: u32) -> Result<Self::Handle, u32>;
+    fn open_process_token(
+        &self,
+        process: &Self::Handle,
+        desired_access: u32,
+    ) -> Result<Self::Handle, u32>;
+    fn duplicate_primary_token(
+        &self,
+        source_token: &Self::Handle,
+        desired_access: u32,
+    ) -> Result<Self::Handle, u32>;
+}
+
+struct WindowsTrustedInstallerCaptureApi;
+
+impl TrustedInstallerCaptureApi for WindowsTrustedInstallerCaptureApi {
+    type Handle = OwnedHandle;
+
+    fn open_process(&self, pid: u32, desired_access: u32) -> Result<Self::Handle, u32> {
+        let handle = unsafe { OpenProcess(desired_access, 0, pid) };
+        OwnedHandle::from_raw(handle).ok_or_else(|| unsafe { GetLastError() })
     }
-    let owned_dup = OwnedHandle::from_raw(dup_token)
-        .ok_or_else(|| TokenError::Win32Error(unsafe { GetLastError() }))?;
-    Ok(owned_dup)
+
+    fn open_process_token(
+        &self,
+        process: &Self::Handle,
+        desired_access: u32,
+    ) -> Result<Self::Handle, u32> {
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let result = unsafe { OpenProcessToken(process.as_raw(), desired_access, &mut handle) };
+        if result == 0 {
+            Err(unsafe { GetLastError() })
+        } else {
+            OwnedHandle::from_raw(handle).ok_or_else(|| unsafe { GetLastError() })
+        }
+    }
+
+    fn duplicate_primary_token(
+        &self,
+        source_token: &Self::Handle,
+        desired_access: u32,
+    ) -> Result<Self::Handle, u32> {
+        let mut handle: HANDLE = std::ptr::null_mut();
+        let result = unsafe {
+            DuplicateTokenEx(
+                source_token.as_raw(),
+                desired_access,
+                std::ptr::null(),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut handle,
+            )
+        };
+        if result == 0 {
+            Err(unsafe { GetLastError() })
+        } else {
+            OwnedHandle::from_raw(handle).ok_or_else(|| unsafe { GetLastError() })
+        }
+    }
+}
+
+fn capture_trustedinstaller_token_with_api<A: TrustedInstallerCaptureApi>(
+    pid: u32,
+    api: &A,
+) -> TokenResult<A::Handle> {
+    let process = api
+        .open_process(pid, TRUSTED_INSTALLER_PROCESS_ACCESS)
+        .map_err(|code| TokenError::Win32Operation {
+            operation: "OpenProcess for TrustedInstaller",
+            code,
+        })?;
+    let source_token = api
+        .open_process_token(&process, TRUSTED_INSTALLER_SOURCE_TOKEN_ACCESS)
+        .map_err(|code| TokenError::Win32Operation {
+            operation: "OpenProcessToken for TrustedInstaller",
+            code,
+        })?;
+    api.duplicate_primary_token(&source_token, TRUSTED_INSTALLER_LAUNCH_TOKEN_ACCESS)
+        .map_err(|code| TokenError::Win32Operation {
+            operation: "DuplicateTokenEx for TrustedInstaller",
+            code,
+        })
 }
 
 /// Resolves the Windows system command interpreter without consulting PATH,
@@ -493,7 +635,10 @@ pub fn launch_process_with_token(
         let mut env_block: *mut c_void = std::ptr::null_mut();
         let env_res = unsafe { CreateEnvironmentBlock(&mut env_block, token.as_raw(), 0) };
         if env_res == 0 || env_block.is_null() {
-            return Err(TokenError::Win32Error(unsafe { GetLastError() }));
+            return Err(TokenError::Win32Operation {
+                operation: "CreateEnvironmentBlock for TrustedInstaller",
+                code: unsafe { GetLastError() },
+            });
         }
         let _owned_env = OwnedEnvironmentBlock::from_raw(env_block)
             .ok_or_else(|| TokenError::Win32Error(unsafe { GetLastError() }))?;
@@ -601,7 +746,10 @@ fn create_process_with_api<A: ProcessCreationApi>(
     );
 
     if proc_res == 0 {
-        return Err(TokenError::Win32Error(unsafe { GetLastError() }));
+        return Err(TokenError::Win32Operation {
+            operation: "CreateProcessWithTokenW for TrustedInstaller",
+            code: unsafe { GetLastError() },
+        });
     }
 
     let process = OwnedHandle::from_raw(pi.hProcess);
@@ -763,6 +911,7 @@ fn append_quoted_argument(command_line: &mut Vec<u16>, argument: &OsStr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::fs::File;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
@@ -888,6 +1037,168 @@ mod tests {
     impl Drop for FakeCompensatableProcess {
         fn drop(&mut self) {
             self.drop_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaptureStage {
+        OpenProcess,
+        OpenProcessToken,
+        DuplicateToken,
+    }
+
+    struct CapturingTrustedInstallerApi {
+        fail_at: Option<CaptureStage>,
+        calls: Mutex<Vec<(CaptureStage, u32, u32)>>,
+    }
+
+    impl CapturingTrustedInstallerApi {
+        fn new(fail_at: Option<CaptureStage>) -> Self {
+            Self {
+                fail_at,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(
+            &self,
+            stage: CaptureStage,
+            handle_or_pid: u32,
+            desired_access: u32,
+        ) -> Result<u32, u32> {
+            self.calls.lock().expect("capture calls lock").push((
+                stage,
+                handle_or_pid,
+                desired_access,
+            ));
+            if self.fail_at == Some(stage) {
+                Err(5)
+            } else {
+                Ok(match stage {
+                    CaptureStage::OpenProcess => 101,
+                    CaptureStage::OpenProcessToken => 102,
+                    CaptureStage::DuplicateToken => 103,
+                })
+            }
+        }
+    }
+
+    impl TrustedInstallerCaptureApi for CapturingTrustedInstallerApi {
+        type Handle = u32;
+
+        fn open_process(&self, pid: u32, desired_access: u32) -> Result<Self::Handle, u32> {
+            self.record(CaptureStage::OpenProcess, pid, desired_access)
+        }
+
+        fn open_process_token(
+            &self,
+            process: &Self::Handle,
+            desired_access: u32,
+        ) -> Result<Self::Handle, u32> {
+            self.record(CaptureStage::OpenProcessToken, *process, desired_access)
+        }
+
+        fn duplicate_primary_token(
+            &self,
+            source_token: &Self::Handle,
+            desired_access: u32,
+        ) -> Result<Self::Handle, u32> {
+            self.record(CaptureStage::DuplicateToken, *source_token, desired_access)
+        }
+    }
+
+    struct CapturingTrustedInstallerServiceApi {
+        manager_result: Result<u32, u32>,
+        service_result: Result<u32, u32>,
+        start_result: Result<(), u32>,
+        statuses: Mutex<VecDeque<Result<SERVICE_STATUS_PROCESS, u32>>>,
+        calls: Mutex<Vec<(&'static str, u32)>>,
+        waits: AtomicU64,
+    }
+
+    impl CapturingTrustedInstallerServiceApi {
+        fn with_statuses(statuses: Vec<Result<SERVICE_STATUS_PROCESS, u32>>) -> Self {
+            Self {
+                manager_result: Ok(201),
+                service_result: Ok(202),
+                start_result: Ok(()),
+                statuses: Mutex::new(statuses.into()),
+                calls: Mutex::new(Vec::new()),
+                waits: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl TrustedInstallerServiceApi for CapturingTrustedInstallerServiceApi {
+        type Handle = u32;
+
+        fn open_manager(&self, desired_access: u32) -> Result<Self::Handle, u32> {
+            self.calls
+                .lock()
+                .expect("service calls lock")
+                .push(("manager", desired_access));
+            self.manager_result
+        }
+
+        fn open_service(
+            &self,
+            _manager: &Self::Handle,
+            service_name: &[u16],
+            desired_access: u32,
+        ) -> Result<Self::Handle, u32> {
+            assert_eq!(service_name, to_wide_null(TRUSTED_INSTALLER_SERVICE));
+            self.calls
+                .lock()
+                .expect("service calls lock")
+                .push(("service", desired_access));
+            self.service_result
+        }
+
+        fn start_service(&self, _service: &Self::Handle) -> Result<(), u32> {
+            self.calls
+                .lock()
+                .expect("service calls lock")
+                .push(("start", 0));
+            self.start_result
+        }
+
+        fn query_status(&self, _service: &Self::Handle) -> Result<SERVICE_STATUS_PROCESS, u32> {
+            self.calls
+                .lock()
+                .expect("service calls lock")
+                .push(("query", 0));
+            self.statuses
+                .lock()
+                .expect("service statuses lock")
+                .pop_front()
+                .expect("configured service status")
+        }
+
+        fn wait(&self, interval: Duration) {
+            self.waits.fetch_add(1, Ordering::SeqCst);
+            self.calls
+                .lock()
+                .expect("service calls lock")
+                .push(("wait", interval.as_millis() as u32));
+        }
+    }
+
+    fn service_status(
+        state: u32,
+        process_id: u32,
+        win32_exit_code: u32,
+        service_exit_code: u32,
+    ) -> SERVICE_STATUS_PROCESS {
+        SERVICE_STATUS_PROCESS {
+            dwServiceType: 0,
+            dwCurrentState: state,
+            dwControlsAccepted: 0,
+            dwWin32ExitCode: win32_exit_code,
+            dwServiceSpecificExitCode: service_exit_code,
+            dwCheckPoint: 0,
+            dwWaitHint: 0,
+            dwProcessId: process_id,
+            dwServiceFlags: 0,
         }
     }
 
@@ -1067,6 +1378,204 @@ mod tests {
     }
 
     #[test]
+    fn trustedinstaller_capture_uses_exact_minimum_access_masks() {
+        let api = CapturingTrustedInstallerApi::new(None);
+
+        let token = capture_trustedinstaller_token_with_api(7331, &api)
+            .expect("capture TrustedInstaller token");
+
+        assert_eq!(token, 103);
+        assert_eq!(
+            *api.calls.lock().expect("capture calls lock"),
+            vec![
+                (
+                    CaptureStage::OpenProcess,
+                    7331,
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                ),
+                (CaptureStage::OpenProcessToken, 101, TOKEN_DUPLICATE),
+                (
+                    CaptureStage::DuplicateToken,
+                    102,
+                    TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn trustedinstaller_capture_reports_the_exact_failing_stage() {
+        let stages = [
+            (
+                CaptureStage::OpenProcess,
+                "OpenProcess for TrustedInstaller",
+            ),
+            (
+                CaptureStage::OpenProcessToken,
+                "OpenProcessToken for TrustedInstaller",
+            ),
+            (
+                CaptureStage::DuplicateToken,
+                "DuplicateTokenEx for TrustedInstaller",
+            ),
+        ];
+
+        for (stage, operation) in stages {
+            let api = CapturingTrustedInstallerApi::new(Some(stage));
+            let result = capture_trustedinstaller_token_with_api(7331, &api);
+            assert!(matches!(
+                result,
+                Err(TokenError::Win32Operation {
+                    operation: actual_operation,
+                    code: 5,
+                }) if actual_operation == operation
+            ));
+        }
+    }
+
+    #[test]
+    fn trustedinstaller_scm_uses_exact_masks_and_returns_running_pid() {
+        let api = CapturingTrustedInstallerServiceApi::with_statuses(vec![Ok(service_status(
+            SERVICE_RUNNING,
+            7331,
+            0,
+            0,
+        ))]);
+
+        let pid = ensure_trustedinstaller_service_running_with_api(&api)
+            .expect("TrustedInstaller running");
+
+        assert_eq!(pid, 7331);
+        assert_eq!(
+            *api.calls.lock().expect("service calls lock"),
+            vec![
+                ("manager", SC_MANAGER_CONNECT),
+                ("service", SERVICE_START | SERVICE_QUERY_STATUS),
+                ("start", 0),
+                ("query", 0),
+            ]
+        );
+        assert_eq!(api.waits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn trustedinstaller_scm_accepts_already_running_and_polls_transitional_states() {
+        let mut api = CapturingTrustedInstallerServiceApi::with_statuses(vec![
+            Ok(service_status(SERVICE_START_PENDING, 0, 0, 0)),
+            Ok(service_status(SERVICE_CONTINUE_PENDING, 0, 0, 0)),
+            Ok(service_status(SERVICE_RUNNING, 7331, 0, 0)),
+        ]);
+        api.start_result = Err(ERROR_SERVICE_ALREADY_RUNNING);
+
+        let pid = ensure_trustedinstaller_service_running_with_api(&api)
+            .expect("already running service reaches RUNNING");
+
+        assert_eq!(pid, 7331);
+        assert_eq!(api.waits.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *api.calls.lock().expect("service calls lock"),
+            vec![
+                ("manager", SC_MANAGER_CONNECT),
+                ("service", SERVICE_START | SERVICE_QUERY_STATUS),
+                ("start", 0),
+                ("query", 0),
+                ("wait", SERVICE_START_POLL_INTERVAL.as_millis() as u32),
+                ("query", 0),
+                ("wait", SERVICE_START_POLL_INTERVAL.as_millis() as u32),
+                ("query", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn trustedinstaller_scm_reports_the_exact_open_and_start_stage() {
+        let cases = [
+            ("manager", "OpenSCManagerW for TrustedInstaller"),
+            ("service", "OpenServiceW for TrustedInstaller"),
+            ("start", "StartServiceW for TrustedInstaller"),
+        ];
+
+        for (failing_stage, expected_operation) in cases {
+            let mut api = CapturingTrustedInstallerServiceApi::with_statuses(vec![]);
+            match failing_stage {
+                "manager" => api.manager_result = Err(5),
+                "service" => api.service_result = Err(5),
+                "start" => api.start_result = Err(5),
+                _ => unreachable!("test stage is exhaustive"),
+            }
+
+            let result = ensure_trustedinstaller_service_running_with_api(&api);
+            assert!(matches!(
+                result,
+                Err(TokenError::Win32Operation {
+                    operation,
+                    code: 5,
+                }) if operation == expected_operation
+            ));
+        }
+    }
+
+    #[test]
+    fn trustedinstaller_query_status_error_keeps_stage_and_win32_code() {
+        let api = CapturingTrustedInstallerServiceApi::with_statuses(vec![Err(5)]);
+
+        let result = ensure_trustedinstaller_service_running_with_api(&api);
+
+        assert!(matches!(
+            result,
+            Err(TokenError::Win32Operation {
+                operation: "QueryServiceStatusEx for TrustedInstaller",
+                code: 5,
+            })
+        ));
+        assert_eq!(api.waits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn trustedinstaller_terminal_service_state_is_diagnostic_and_not_retried() {
+        let api = CapturingTrustedInstallerServiceApi::with_statuses(vec![Ok(service_status(
+            windows_sys::Win32::System::Services::SERVICE_STOPPED,
+            0,
+            1066,
+            73,
+        ))]);
+
+        let result = ensure_trustedinstaller_service_running_with_api(&api);
+
+        assert!(matches!(
+            result,
+            Err(TokenError::TrustedInstallerServiceState {
+                state,
+                win32_exit_code: 1066,
+                service_exit_code: 73,
+                process_id: 0,
+            }) if state == windows_sys::Win32::System::Services::SERVICE_STOPPED
+        ));
+        assert_eq!(api.waits.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[ignore = "requires an elevated Windows VM and may start the TrustedInstaller service"]
+    fn live_elevated_trustedinstaller_capture_and_duplicate_without_launch() {
+        assert!(
+            crate::security::is_process_elevated().expect("query process elevation"),
+            "run this ignored oracle from an elevated test process"
+        );
+
+        let launch_token =
+            duplicate_trustedinstaller_token().expect("capture and duplicate TrustedInstaller");
+        let TrustedInstallerLaunchToken {
+            token,
+            impersonate_privilege,
+        } = launch_token;
+        assert!(!token.as_raw().is_null());
+        drop(token);
+        impersonate_privilege
+            .restore()
+            .expect("restore SeImpersonatePrivilege explicitly");
+    }
+
+    #[test]
     fn process_creation_uses_with_token_contract_and_inherits_caller_desktop() {
         let spec = ProcessLaunchSpec {
             application_path: PathBuf::from(r"C:\System Root\cmd.exe"),
@@ -1082,7 +1591,13 @@ mod tests {
         let result =
             create_process_with_api(std::ptr::null_mut(), &spec, std::ptr::null_mut(), &api);
 
-        assert!(matches!(result, Err(TokenError::Win32Error(_))));
+        assert!(matches!(
+            result,
+            Err(TokenError::Win32Operation {
+                operation: "CreateProcessWithTokenW for TrustedInstaller",
+                ..
+            })
+        ));
         let captured = api.captured.lock().expect("capture lock");
         let captured = captured.as_ref().expect("captured process call");
         assert_eq!(captured.logon_flags, 0);
