@@ -34,6 +34,7 @@ const DEFAULT_MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_ARCHIVES: usize = 5;
 const AUDIT_FILE: &str = "audit_log.jsonl";
 const EXPORT_DIR: &str = "Exports";
+const EXPORT_PENDING_SUFFIX: &str = ".pending";
 
 #[derive(Error, Debug)]
 pub enum AuditError {
@@ -284,26 +285,36 @@ impl AuditLogger {
 
     /// Creates a verified, non-overwriting export beside the protected audit directory.
     pub fn export_copy(&self) -> AuditResult<PathBuf> {
+        self.export_copy_with(std::io::copy)
+    }
+
+    fn export_copy_with<C>(&self, copy: C) -> AuditResult<PathBuf>
+    where
+        C: FnOnce(&mut File, &mut File) -> std::io::Result<u64>,
+    {
         let _storage_lock = self.storage.acquire_lock()?;
         let export_dir = self.storage.open_or_create_directory(EXPORT_DIR)?;
         let timestamp = Utc::now().format("%Y%m%dT%H%M%S%.6fZ");
         let export_name = format!("audit-{timestamp}.jsonl");
+        let pending_name = format!("{export_name}{EXPORT_PENDING_SUFFIX}");
         let export_path = export_dir.path().join(&export_name);
 
         let mut source =
             self.storage
                 .open_file(&self.log_file_name, FILE_GENERIC_READ, FILE_SHARE_READ)?;
-        let mut target = export_dir.create_file(OsStr::new(&export_name), FILE_SHARE_READ)?;
-        std::io::copy(&mut source, target.file_mut())?;
+        let source_length = source.metadata()?.len();
+        let mut target = export_dir.create_file(OsStr::new(&pending_name), FILE_SHARE_READ)?;
+        let copied_length = copy(&mut source, target.file_mut())?;
         target.file_mut().flush()?;
         target.file_mut().sync_all()?;
+        let target_length = target.file_mut().metadata()?.len();
 
-        if source.metadata()?.len() != target.file_mut().metadata()?.len() {
+        if copied_length != source_length || target_length != source_length {
             return Err(AuditError::Io(std::io::Error::other(
                 "audit export size verification failed",
             )));
         }
-        target.commit();
+        drop(target.publish(&export_dir, &export_name)?);
         Ok(export_path)
     }
 
@@ -415,6 +426,7 @@ fn load_recent_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -552,5 +564,94 @@ mod tests {
         second
             .acquire_operation_guard_with_timeout(std::time::Duration::from_millis(30))
             .expect("operation guard after release");
+    }
+
+    #[test]
+    fn failed_partial_export_never_exposes_a_final_name_and_cleans_pending_file() {
+        let test_directory = TestDirectory::new();
+        let log_path = test_directory.0.join("audit.jsonl");
+        let logger = AuditLogger::new(Some(log_path), 10).expect("create logger");
+        logger
+            .log(
+                "ExportFixture",
+                "test",
+                "audit",
+                AuditStatus::Success,
+                "content long enough for a partial copy",
+            )
+            .expect("write source audit");
+        let export_directory = test_directory.0.join(EXPORT_DIR);
+
+        let result = logger.export_copy_with(|source, target| {
+            let mut partial = source.take(8);
+            std::io::copy(&mut partial, target)?;
+            target.flush()?;
+
+            let names = directory_names(&export_directory);
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name.ends_with(EXPORT_PENDING_SUFFIX)),
+                "a partial copy must remain visibly pending"
+            );
+            assert!(
+                names.iter().all(|name| !is_final_export_name(name)),
+                "a partial copy must never expose a credible final export"
+            );
+            Err(std::io::Error::other("injected partial copy failure"))
+        });
+
+        assert!(matches!(result, Err(AuditError::Io(_))));
+        assert!(
+            directory_names(&export_directory).is_empty(),
+            "the pending export must be deleted when the call returns"
+        );
+    }
+
+    #[test]
+    fn successful_export_publishes_exact_bytes_without_pending_file() {
+        let test_directory = TestDirectory::new();
+        let log_path = test_directory.0.join("audit.jsonl");
+        let logger = AuditLogger::new(Some(log_path.clone()), 10).expect("create logger");
+        logger
+            .log(
+                "ExportFixture",
+                "test",
+                "audit",
+                AuditStatus::Success,
+                "complete export",
+            )
+            .expect("write source audit");
+
+        let export_path = logger.export_copy().expect("publish export");
+        let export_directory = test_directory.0.join(EXPORT_DIR);
+        let names = directory_names(&export_directory);
+
+        assert_eq!(
+            std::fs::read(&export_path).expect("read published export"),
+            std::fs::read(&log_path).expect("read source audit")
+        );
+        assert_eq!(names.len(), 1);
+        assert!(is_final_export_name(&names[0]));
+        assert!(names
+            .iter()
+            .all(|name| !name.ends_with(EXPORT_PENDING_SUFFIX)));
+    }
+
+    fn directory_names(path: &Path) -> Vec<String> {
+        std::fs::read_dir(path)
+            .expect("read export directory")
+            .map(|entry| {
+                entry
+                    .expect("read export entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    fn is_final_export_name(name: &str) -> bool {
+        name.starts_with("audit-") && name.ends_with(".jsonl")
     }
 }

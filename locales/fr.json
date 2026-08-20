@@ -33,7 +33,7 @@
   "status.export_success": "Journal exporté vers {path}",
   "status.audit_cleared": "Affichage du journal effacé ; historique durable conservé",
   "status.refresh_failed": "{success} ; échec du rafraîchissement de l'inventaire : {error}",
-  "status.close_blocked_repair": "Une opération sensible est en cours. Attendez la fin de la vérification, de la journalisation ou de la compensation avant de fermer WinProfile.",
+  "status.close_blocked_repair": "Une opération est en cours. Attendez la fin de l’écriture du journal, de l’export, de la vérification ou de la compensation avant de fermer WinProfile.",
   "dashboard.scan_btn": "Analyser les profils",
   "dashboard.total_profiles": "Total profils",
   "dashboard.healthy_profiles": "Sains",

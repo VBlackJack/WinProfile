@@ -233,9 +233,11 @@ impl OperationKind {
 
     fn close_policy(self) -> ClosePolicy {
         match self {
-            Self::Repair | Self::TrustedInstaller | Self::Unknown => ClosePolicy::Block,
+            Self::Scan | Self::Repair | Self::TrustedInstaller | Self::Export | Self::Unknown => {
+                ClosePolicy::Block
+            }
             Self::Migration => ClosePolicy::CancelMigration,
-            Self::Idle | Self::Scan | Self::Export => ClosePolicy::Allow,
+            Self::Idle => ClosePolicy::Allow,
         }
     }
 }
@@ -940,13 +942,16 @@ mod tests {
     }
 
     #[test]
-    fn close_policy_blocks_repair_trustedinstaller_and_unknown_state() {
-        assert_eq!(OperationKind::Repair.close_policy(), ClosePolicy::Block);
-        assert_eq!(
-            OperationKind::TrustedInstaller.close_policy(),
-            ClosePolicy::Block
-        );
-        assert_eq!(OperationKind::Unknown.close_policy(), ClosePolicy::Block);
+    fn close_policy_blocks_every_active_non_migration_operation() {
+        for operation in [
+            OperationKind::Scan,
+            OperationKind::Repair,
+            OperationKind::TrustedInstaller,
+            OperationKind::Export,
+            OperationKind::Unknown,
+        ] {
+            assert_eq!(operation.close_policy(), ClosePolicy::Block);
+        }
     }
 
     #[test]
@@ -958,13 +963,19 @@ mod tests {
     }
 
     #[test]
-    fn close_policy_allows_non_transactional_operations() {
-        for operation in [
-            OperationKind::Idle,
-            OperationKind::Scan,
-            OperationKind::Export,
-        ] {
-            assert_eq!(operation.close_policy(), ClosePolicy::Allow);
+    fn close_policy_allows_only_idle() {
+        assert_eq!(OperationKind::Idle.close_policy(), ClosePolicy::Allow);
+    }
+
+    #[test]
+    fn operation_state_blocks_scan_and_export_until_each_finishes() {
+        let state = OperationState::new();
+
+        for operation in [OperationKind::Scan, OperationKind::Export] {
+            assert!(state.try_begin(operation));
+            assert_eq!(state.active_operation().close_policy(), ClosePolicy::Block);
+            assert!(!state.finish());
+            assert_eq!(state.active_operation().close_policy(), ClosePolicy::Allow);
         }
     }
 
